@@ -42,7 +42,7 @@ switch.cmd       # launch the switcher (also auto-builds on first run)
 | ↑/↓ | move selection |
 | Enter | switch to the selected account |
 | b | best-now: switch straight to the account with the most headroom |
-| a | add an account (native OAuth: copies URL, opens browser, auto-captures) |
+| a | add an account (copies the login URL; you authorize, then paste the code) |
 | i | import an account from files (another PC) |
 | e | export the selected account to a portable file |
 | r | rename the selected account |

@@ -28,12 +28,12 @@ import {
 import { fetchUsage, leastLoaded } from './usage';
 import { findClaudeProcesses, closeProcesses, detectClaudeVersion, type ProcInfo } from './processes';
 import {
-  startAuth,
+  buildManualAuth,
   exchangeCode,
   primeIdentity,
   loginViaClaudeCli,
   DEFAULT_SCOPES,
-  type PendingAuth,
+  type ManualAuth,
   type PrimedIdentity,
 } from './oauth';
 import type { Profile, ProfilesStore } from './types';
@@ -209,8 +209,9 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const [importCands, setImportCands] = useState<ImportCandidate[]>([]);
   const [importCursor, setImportCursor] = useState(0);
   const [addLines, setAddLines] = useState<string[]>([]);
+  const [addBusy, setAddBusy] = useState(false);
   const [message, setMessage] = useState<{ title: string; lines: string[]; tone: Tone } | null>(null);
-  const pendingAuthRef = useRef<PendingAuth | null>(null);
+  const authRef = useRef<ManualAuth | null>(null);
   const cols = useTerminalSize();
 
   const persist = useCallback((s: ProfilesStore) => {
@@ -346,52 +347,61 @@ function App({ initialStore, claudeVersion }: AppProps) {
 
   const startAdd = useCallback(async () => {
     setMode('adding');
-    setAddLines(['Preparing authorization...']);
-    let pending: PendingAuth | null = null;
+    setBuffer('');
+    setAddBusy(false);
     try {
-      pending = startAuth(DEFAULT_SCOPES);
-      pendingAuthRef.current = pending;
-      await clipboard.write(pending.url).catch(() => {});
-      openUrl(pending.url);
+      const auth = buildManualAuth(DEFAULT_SCOPES);
+      authRef.current = auth;
+      await clipboard.write(auth.url).catch(() => {});
       setAddLines([
-        'Authorize the new account in your browser.',
-        'The URL was copied to your clipboard and opened automatically:',
+        'Add a Claude account — official login flow (works across machines):',
         '',
-        pending.url,
+        '1. The authorization URL was COPIED to your clipboard. Open it in any',
+        '   browser (this PC or another) and sign in with the account you want.',
+        '2. After you approve, the page shows an authorization code.',
+        '3. Copy that code and paste it below, then press Enter.',
         '',
-        'Waiting for authorization...   (Esc to cancel)',
+        auth.url,
       ]);
-      const code = await pending.waitForCode();
-      setAddLines(['Authorization received. Exchanging tokens...']);
-      const tokens = await exchangeCode(code, pending.verifier, pending.redirectUri);
+    } catch (e) {
+      showMessage('Could not start add', [String((e as Error)?.message ?? e)], 'error');
+    }
+  }, [showMessage]);
+
+  const submitAddCode = useCallback(async () => {
+    const auth = authRef.current;
+    const code = buffer.trim();
+    if (!auth || !code) return;
+    setAddBusy(true);
+    setAddLines(['Exchanging the code for tokens...']);
+    try {
+      const tokens = await exchangeCode(code, auth.verifier, auth.state);
       setAddLines(['Fetching account identity...']);
       const ident = primeIdentity(tokens, findClaudeExe(), DEFAULT_SCOPES);
       const fields = identityToFields(ident);
       const p = addOrUpdateProfile(store, fields);
       persist(store);
-      pending.close();
-      pendingAuthRef.current = null;
+      authRef.current = null;
+      setAddBusy(false);
+      setBuffer('');
       setCursor(store.profiles.findIndex((x) => x.id === p.id));
       showMessage('Account added', [`${p.label} (${p.email})`, `Plan: ${p.subscriptionType ?? 'unknown'}`], 'success');
     } catch (e) {
-      pending?.close();
-      pendingAuthRef.current = null;
+      setAddBusy(false);
       showMessage(
-        'Native add failed',
+        'Add account failed',
         [
           String((e as Error)?.message ?? e),
           '',
-          'The reverse-engineered OAuth endpoints may have changed.',
-          'Use the official login fallback instead — quit and run:',
+          'Make sure you pasted the full code from the page. If it still fails,',
+          'use the official fallback — quit and run:',
           '',
           '    switch.cmd login',
-          '',
-          '(That runs the real `claude` login in an isolated sandbox and imports it.)',
         ],
         'error',
       );
     }
-  }, [store, persist, showMessage]);
+  }, [store, buffer, persist, showMessage]);
 
   const openImportMenu = useCallback(() => {
     let cands: ImportCandidate[] = [];
@@ -566,11 +576,18 @@ function App({ initialStore, claudeVersion }: AppProps) {
     }
 
     if (mode === 'adding') {
+      if (addBusy) return;
       if (key.escape) {
-        pendingAuthRef.current?.close();
-        pendingAuthRef.current = null;
+        authRef.current = null;
+        setBuffer('');
         setMode('list');
         setStatus('Add cancelled.');
+      } else if (key.return) {
+        void submitAddCode();
+      } else if (key.backspace || key.delete) {
+        setBuffer((b) => b.slice(0, -1));
+      } else if (input && !key.ctrl && !key.meta) {
+        setBuffer((b) => (b + input).replace(/[\r\n]/g, ''));
       }
       return;
     }
@@ -714,15 +731,26 @@ function App({ initialStore, claudeVersion }: AppProps) {
           </Box>
         </Box>
       ) : mode === 'adding' ? (
-        <Box width={W} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
-          <Text bold color="cyan">
-            Add account (native OAuth)
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor={CLAUDE_ORANGE} paddingX={1}>
+          <Text bold color="cyanBright">
+            Add account
           </Text>
           {addLines.map((l, i) => (
             <Text key={i} wrap="wrap">
               {l}
             </Text>
           ))}
+          {!addBusy ? (
+            <Box marginTop={1}>
+              <Text>
+                Code: <Text color="green">{buffer}</Text>
+                <Text>▎</Text>
+              </Text>
+            </Box>
+          ) : null}
+          <Box marginTop={1}>
+            <Text dimColor>{addBusy ? 'Working…' : 'Paste the code above, then Enter · Esc to cancel'}</Text>
+          </Box>
         </Box>
       ) : mode === 'importMenu' ? (
         <Box width={W} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>

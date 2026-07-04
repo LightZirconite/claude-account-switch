@@ -1,9 +1,10 @@
-// OAuth flow to ADD a new account (native), plus refresh-grant + identity priming.
+// ADD a new account using Claude's OFFICIAL manual (paste-code) flow:
+// authorize on claude.ai -> you're redirected to console.anthropic.com/oauth/code/callback
+// which shows a code -> you paste it back here -> we exchange it for tokens.
+// This is portable: authorize in any browser, paste into the waiting tool.
 //
-// NOTE: These endpoints are reverse-engineered from Claude Code and may change.
-// If the native flow fails, the app falls back to the official `claude` login run in
-// an isolated temp CLAUDE_CONFIG_DIR (see loginViaClaudeCli), which is always correct.
-import http from 'node:http';
+// If this ever breaks, the app falls back to the official `claude` login run in an
+// isolated temp CLAUDE_CONFIG_DIR (see loginViaClaudeCli), which is always correct.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -15,13 +16,10 @@ import type { ClaudeAiOauth, OauthAccount } from './types';
 
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 export const AUTHORIZE_URL = 'https://claude.ai/oauth/authorize';
-export const DEFAULT_SCOPES = 'user:inference user:profile';
-// Candidate token endpoints (tried in order — sources disagree across versions).
-const TOKEN_URLS = [
-  'https://console.anthropic.com/v1/oauth/token',
-  'https://console.anthropic.com/api/oauth/token',
-  'https://claude.ai/v1/oauth/token',
-];
+export const MANUAL_REDIRECT = 'https://console.anthropic.com/oauth/code/callback';
+// Scopes used by the official Claude Code login (must match for the token to work).
+export const DEFAULT_SCOPES = 'org:create_api_key user:profile user:inference';
+const TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
 
 function base64url(buf: Buffer): string {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -33,107 +31,34 @@ export function makePkce(): { verifier: string; challenge: string } {
   return { verifier, challenge };
 }
 
-export interface PendingAuth {
+export interface ManualAuth {
   url: string;
   state: string;
   verifier: string;
-  redirectUri: string;
-  waitForCode: (timeoutMs?: number) => Promise<string>;
-  close: () => void;
 }
 
-/** Start a loopback server + build the authorize URL. Resolves the code automatically. */
-export function startAuth(scopes: string = DEFAULT_SCOPES): PendingAuth {
+/**
+ * Build the authorize URL for the manual paste-code flow. Returns the URL to open
+ * (copy to clipboard) plus the PKCE verifier + state needed to exchange the pasted code.
+ */
+export function buildManualAuth(scopes: string = DEFAULT_SCOPES): ManualAuth {
   const { verifier, challenge } = makePkce();
-  const state = base64url(crypto.randomBytes(16));
-
-  let resolveCode!: (c: string) => void;
-  let rejectCode!: (e: unknown) => void;
-  const codePromise = new Promise<string>((res, rej) => {
-    resolveCode = res;
-    rejectCode = rej;
-  });
-
-  const server = http.createServer((req, res) => {
-    try {
-      const u = new URL(req.url ?? '/', 'http://localhost');
-      if (u.pathname !== '/callback') {
-        res.writeHead(404);
-        res.end('Not found');
-        return;
-      }
-      const err = u.searchParams.get('error');
-      const code = u.searchParams.get('code');
-      const st = u.searchParams.get('state');
-      const respond = (title: string) => {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(
-          `<!doctype html><html><body style="font-family:system-ui;padding:3rem;text-align:center">` +
-            `<h2>${title}</h2><p>You can close this tab and return to the terminal.</p></body></html>`,
-        );
-      };
-      if (err) {
-        respond('Authorization failed');
-        rejectCode(new Error(`oauth error: ${err}`));
-        return;
-      }
-      if (st !== state) {
-        respond('State mismatch');
-        rejectCode(new Error('state mismatch'));
-        return;
-      }
-      if (!code) {
-        respond('No code received');
-        rejectCode(new Error('no code'));
-        return;
-      }
-      respond('✓ Account authorized');
-      resolveCode(code);
-    } catch (e) {
-      res.writeHead(500);
-      res.end('error');
-      rejectCode(e);
-    }
-  });
-
-  server.listen(0, '127.0.0.1');
-  const addr = server.address();
-  const port = typeof addr === 'object' && addr ? addr.port : 0;
-  const redirectUri = `http://localhost:${port}/callback`;
-
+  const state = base64url(crypto.randomBytes(32));
   const url =
     AUTHORIZE_URL +
     '?' +
     new URLSearchParams({
-      response_type: 'code',
+      code: 'true',
       client_id: CLIENT_ID,
-      redirect_uri: redirectUri,
+      response_type: 'code',
+      redirect_uri: MANUAL_REDIRECT,
       scope: scopes,
       code_challenge: challenge,
       code_challenge_method: 'S256',
       state,
     }).toString();
-
-  logger.info('oauth: started loopback auth', { port, redirectUri });
-
-  return {
-    url,
-    state,
-    verifier,
-    redirectUri,
-    waitForCode: (timeoutMs = 300_000) =>
-      Promise.race([
-        codePromise,
-        new Promise<string>((_, rej) => setTimeout(() => rej(new Error('authorization timed out')), timeoutMs)),
-      ]),
-    close: () => {
-      try {
-        server.close();
-      } catch {
-        /* ignore */
-      }
-    },
-  };
+  logger.info('oauth: built manual auth url');
+  return { url, state, verifier };
 }
 
 export interface TokenSet {
@@ -144,47 +69,44 @@ export interface TokenSet {
 }
 
 async function postToken(body: Record<string, string>): Promise<TokenSet> {
-  let lastErr: unknown;
-  for (const url of TOKEN_URLS) {
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'User-Agent': 'claude-code' },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) {
-        lastErr = new Error(`token endpoint ${url} -> HTTP ${res.status}`);
-        logger.warn('oauth: token endpoint failed', { url, status: res.status });
-        continue;
-      }
-      const d = (await res.json()) as {
-        access_token: string;
-        refresh_token: string;
-        expires_in?: number;
-        scope?: string | string[];
-      };
-      logger.info('oauth: token exchange ok', { url });
-      return {
-        accessToken: d.access_token,
-        refreshToken: d.refresh_token,
-        expiresAt: Date.now() + (d.expires_in ?? 28800) * 1000,
-        scopes: typeof d.scope === 'string' ? d.scope.split(' ') : d.scope,
-      };
-    } catch (e) {
-      lastErr = e;
-      logger.warn('oauth: token endpoint error', { url, error: String(e) });
-    }
+  const res = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    logger.warn('oauth: token endpoint failed', { status: res.status, body: text.slice(0, 300) });
+    throw new Error(`Token exchange failed (HTTP ${res.status}). ${text.slice(0, 160)}`);
   }
-  throw lastErr ?? new Error('token exchange failed on all endpoints');
+  const d = (await res.json()) as {
+    access_token: string;
+    refresh_token: string;
+    expires_in?: number;
+    scope?: string | string[];
+  };
+  logger.info('oauth: token exchange ok');
+  return {
+    accessToken: d.access_token,
+    refreshToken: d.refresh_token,
+    expiresAt: Date.now() + (d.expires_in ?? 28800) * 1000,
+    scopes: typeof d.scope === 'string' ? d.scope.split(' ') : d.scope,
+  };
 }
 
-export async function exchangeCode(code: string, verifier: string, redirectUri: string): Promise<TokenSet> {
-  const cleanCode = code.split('#')[0].split('&')[0];
+/**
+ * Exchange a pasted authorization code. The pasted string is typically "code#state";
+ * we split it and send both, exactly like Claude's official flow.
+ */
+export async function exchangeCode(pasted: string, verifier: string, state: string): Promise<TokenSet> {
+  // Pasted value is usually "code#state"; keep only the code part.
+  const code = pasted.trim().split('#')[0].split('&')[0].trim();
   return postToken({
     grant_type: 'authorization_code',
-    code: cleanCode,
-    redirect_uri: redirectUri,
+    code,
+    state, // the original state we generated (matches the reference implementation)
     client_id: CLIENT_ID,
+    redirect_uri: MANUAL_REDIRECT,
     code_verifier: verifier,
   });
 }

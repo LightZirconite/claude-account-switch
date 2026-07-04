@@ -1,5 +1,9 @@
 node_modules/
 dist/
 *.log
+# Local editor / Claude Code config — not part of the project
+.claude/
+.vscode/
+.idea/
 # Never commit anything that could contain tokens
 *.ccswitch.json
