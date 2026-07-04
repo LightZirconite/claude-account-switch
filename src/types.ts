@@ -88,6 +88,14 @@ export interface LiveAccount {
   userID?: string;
 }
 
+/** A full backup of ALL accounts in one file (for migrating a whole PC). */
+export interface PortableExportAll {
+  kind: 'claude-account-switch/export-all';
+  version: 1;
+  exportedAt: number;
+  accounts: PortableExport[];
+}
+
 /** Portable export file format (*.ccswitch.json) for moving an account between PCs. */
 export interface PortableExport {
   kind: 'claude-account-switch/export';

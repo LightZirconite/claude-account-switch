@@ -17,6 +17,7 @@ import {
   scanImportDir,
   importFromPath,
   subscriptionOf,
+  exportAllProfiles,
   type ImportCandidate,
 } from './profiles';
 import {
@@ -413,28 +414,33 @@ function App({ initialStore, claudeVersion }: AppProps) {
     [store.activeProfileId],
   );
 
-  const startAdd = useCallback(async () => {
-    setMode('adding');
-    setBuffer('');
-    setAddBusy(false);
-    try {
-      const auth = buildManualAuth(DEFAULT_SCOPES);
-      authRef.current = auth;
-      await clipboard.write(auth.url).catch(() => {});
-      setAddLines([
-        'Add a Claude account — official login flow (works across machines):',
-        '',
-        '1. The authorization URL was COPIED to your clipboard. Open it in any',
-        '   browser (this PC or another) and sign in with the account you want.',
-        '2. After you approve, the page shows an authorization code.',
-        '3. Copy that code and paste it below, then press Enter.',
-        '',
-        auth.url,
-      ]);
-    } catch (e) {
-      showMessage('Could not start add', [String((e as Error)?.message ?? e)], 'error');
-    }
-  }, [showMessage]);
+  const startAdd = useCallback(
+    async (reauthEmail?: string) => {
+      setMode('adding');
+      setBuffer('');
+      setAddBusy(false);
+      try {
+        const auth = buildManualAuth(DEFAULT_SCOPES);
+        authRef.current = auth;
+        await clipboard.write(auth.url).catch(() => {});
+        setAddLines([
+          reauthEmail
+            ? `Re-authorize "${reauthEmail}" — sign in with THAT account below.`
+            : 'Add a Claude account — official login flow (works across machines):',
+          '',
+          '1. The authorization URL was COPIED to your clipboard. Open it in any',
+          `   browser (this PC or another) and sign in${reauthEmail ? ` as ${reauthEmail}` : ' with the account you want'}.`,
+          '2. After you approve, the page shows an authorization code.',
+          '3. Copy that code and paste it below, then press Enter.',
+          '',
+          auth.url,
+        ]);
+      } catch (e) {
+        showMessage('Could not start add', [String((e as Error)?.message ?? e)], 'error');
+      }
+    },
+    [showMessage],
+  );
 
   const submitAddCode = useCallback(async () => {
     const auth = authRef.current;
@@ -485,7 +491,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
 
   const doImport = useCallback(
     (cand: ImportCandidate) => {
-      const p = addOrUpdateProfile(store, cand.fields);
+      const p = addOrUpdateProfile(store, cand.fields, cand.label);
       persist(store);
       setCursor(store.profiles.findIndex((x) => x.id === p.id));
       setMode('list');
@@ -509,6 +515,30 @@ function App({ initialStore, claudeVersion }: AppProps) {
     }
   }, [selected, showMessage]);
 
+  const exportAllAccounts = useCallback(() => {
+    if (!store.profiles.length) {
+      setStatus('No accounts to export.');
+      return;
+    }
+    try {
+      const file = exportAllProfiles(store);
+      clipboard.write(file).catch(() => {});
+      showMessage(
+        'Exported all accounts (full backup)',
+        [
+          `${store.profiles.length} account(s) written to one file (path copied):`,
+          '',
+          file,
+          '',
+          'Copy it to another PC and press "i" (Import) to restore every account.',
+        ],
+        'success',
+      );
+    } catch (e) {
+      showMessage('Export failed', [String((e as Error)?.message ?? e)], 'error');
+    }
+  }, [store, showMessage]);
+
   // ---------- input handling ----------
   useInput((input, key) => {
     if (mode === 'list') {
@@ -516,9 +546,10 @@ function App({ initialStore, claudeVersion }: AppProps) {
       else if (key.downArrow || input === 'j') setCursor((c) => (c < profiles.length - 1 ? c + 1 : 0));
       else if (key.return) {
         if (selected) beginSwitch(selected);
-      } else if (input === 'a') void startAdd();
+      } else if (input === 'a') void startAdd(selected?.needsReauth ? selected.email : undefined);
       else if (input === 'i') openImportMenu();
       else if (input === 'e') exportSelected();
+      else if (input === 'E') exportAllAccounts();
       else if (input === 'r') {
         if (selected) {
           setBuffer(selected.label);
@@ -622,7 +653,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
         if (target) {
           const cands = importFromPath(target);
           if (cands.length) {
-            cands.forEach((c) => addOrUpdateProfile(store, c.fields));
+            cands.forEach((c) => addOrUpdateProfile(store, c.fields, c.label));
             persist(store);
             setMode('list');
             setStatus(`Imported ${cands.length} account(s) from path.`);
@@ -989,7 +1020,8 @@ function App({ initialStore, claudeVersion }: AppProps) {
             </Text>
             <Text dimColor>
               <Text color="cyan">a</Text> add · <Text color="cyan">i</Text> import · <Text color="cyan">e</Text> export ·{' '}
-              <Text color="cyan">r</Text> rename · <Text color="cyan">d</Text> delete · <Text color="cyan">q</Text> quit
+              <Text color="cyan">E</Text> export-all · <Text color="cyan">r</Text> rename · <Text color="cyan">d</Text> delete ·{' '}
+              <Text color="cyan">q</Text> quit
             </Text>
           </>
         ) : null}
@@ -1008,6 +1040,7 @@ Usage:
   switch.cmd                 Launch the interactive account switcher (TUI)
   switch.cmd login           Add an account via the official 'claude' login (fallback)
   switch.cmd import <path>   Import account(s) from a file or folder
+  switch.cmd export-all      Export ALL accounts into one portable backup file
   switch.cmd --dry-run       Show exactly which keys a switch would change (no writes)
   switch.cmd restore         Roll back the last credential change from backup
   switch.cmd --help          This help
@@ -1064,10 +1097,21 @@ async function main(): Promise<void> {
     }
     const store = loadStore();
     for (const c of cands) {
-      const p = addOrUpdateProfile(store, c.fields);
+      const p = addOrUpdateProfile(store, c.fields, c.label);
       console.log(`Imported "${p.label}" (${p.email})`);
     }
     saveStore(store);
+    return;
+  }
+
+  if (args[0] === 'export-all') {
+    const store = loadStore();
+    if (!store.profiles.length) {
+      console.log('No accounts to export.');
+      return;
+    }
+    const file = exportAllProfiles(store);
+    console.log(`Exported ${store.profiles.length} account(s) to:\n${file}`);
     return;
   }
 

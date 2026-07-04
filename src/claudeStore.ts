@@ -7,7 +7,9 @@
 // .claude.json is edited SURGICALLY (jsonc-parser) so we never touch/collapse its
 // other keys (it can contain case-duplicate project keys that JSON.parse would lose).
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import {
   modify,
   applyEdits,
@@ -26,6 +28,36 @@ function readText(p: string): string | null {
   } catch {
     return null;
   }
+}
+
+// On macOS, Claude Code stores the credentials JSON in the login Keychain (service
+// "Claude Code-credentials"), not in a file. On Windows/Linux it's a plain file.
+// We abstract read/write so the rest of the code is platform-agnostic. (~/.claude.json
+// — the oauthAccount/userID side — is a plain file on every platform.)
+const CREDS_IN_KEYCHAIN = process.platform === 'darwin';
+const KEYCHAIN_SERVICE = 'Claude Code-credentials';
+
+function readCredentialsText(): string | null {
+  if (CREDS_IN_KEYCHAIN) {
+    try {
+      const out = execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'], { encoding: 'utf8' });
+      return out.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+  return readText(credentialsPath());
+}
+
+function writeCredentialsText(text: string): void {
+  if (CREDS_IN_KEYCHAIN) {
+    const user = os.userInfo().username;
+    // -U updates the entry if it already exists.
+    execFileSync('security', ['add-generic-password', '-U', '-a', user, '-s', KEYCHAIN_SERVICE, '-w', text]);
+    logger.info('wrote credentials to macOS Keychain');
+    return;
+  }
+  atomicWrite(credentialsPath(), text);
 }
 
 function detectEol(text: string): string {
@@ -58,7 +90,7 @@ function atomicWrite(target: string, content: string): void {
 // ---------- Reading ----------
 
 export function readLiveCredentials(): Record<string, unknown> | null {
-  const t = readText(credentialsPath());
+  const t = readCredentialsText();
   if (t == null) return null;
   try {
     return JSON.parse(t);
@@ -99,10 +131,10 @@ export function backupLive(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const dir = path.join(backupsDir(), stamp);
   fs.mkdirSync(dir, { recursive: true });
-  for (const src of [credentialsPath(), claudeJsonPath()]) {
-    const t = readText(src);
-    if (t != null) fs.writeFileSync(path.join(dir, path.basename(src)), t, 'utf8');
-  }
+  const credText = readCredentialsText();
+  if (credText != null) fs.writeFileSync(path.join(dir, '.credentials.json'), credText, 'utf8');
+  const cjText = readText(claudeJsonPath());
+  if (cjText != null) fs.writeFileSync(path.join(dir, '.claude.json'), cjText, 'utf8');
   logger.info('backup created', { dir });
   return dir;
 }
@@ -120,17 +152,20 @@ export function listBackups(): string[] {
 }
 
 export function restoreFromBackup(dir: string): void {
-  const map: Array<[string, string]> = [
-    ['.credentials.json', credentialsPath()],
-    ['credentials.json', credentialsPath()],
-    ['.claude.json', claudeJsonPath()],
-  ];
-  for (const [name, target] of map) {
+  // credentials (Keychain on macOS, file elsewhere)
+  for (const name of ['.credentials.json', 'credentials.json']) {
     const src = path.join(dir, name);
     if (fs.existsSync(src)) {
       const t = readText(src);
-      if (t != null) atomicWrite(target, t);
+      if (t != null) writeCredentialsText(t);
+      break;
     }
+  }
+  // ~/.claude.json (always a file)
+  const cjSrc = path.join(dir, '.claude.json');
+  if (fs.existsSync(cjSrc)) {
+    const t = readText(cjSrc);
+    if (t != null) atomicWrite(claudeJsonPath(), t);
   }
   logger.warn('restored from backup', { dir });
 }
@@ -146,8 +181,7 @@ export function restoreLatestBackup(): string | null {
 // ---------- Writing ----------
 
 function writeCredentials(claudeAiOauth: ClaudeAiOauth, organizationUuidRoot?: string): void {
-  const p = credentialsPath();
-  const t = readText(p);
+  const t = readCredentialsText();
   let obj: Record<string, unknown> = {};
   if (t) {
     try {
@@ -158,7 +192,7 @@ function writeCredentials(claudeAiOauth: ClaudeAiOauth, organizationUuidRoot?: s
   }
   obj.claudeAiOauth = claudeAiOauth; // preserves mcpOAuth and any other keys
   if (organizationUuidRoot !== undefined) obj.organizationUuid = organizationUuidRoot;
-  atomicWrite(p, JSON.stringify(obj, null, 2) + '\n');
+  writeCredentialsText(JSON.stringify(obj, null, 2) + '\n');
 }
 
 function writeClaudeJson(oauthAccount: OauthAccount, userID?: string): void {
@@ -179,8 +213,7 @@ function writeClaudeJson(oauthAccount: OauthAccount, userID?: string): void {
  * running Claude session doesn't end up holding an invalidated refresh token.
  */
 export function updateLiveCredentials(claudeAiOauth: ClaudeAiOauth, organizationUuidRoot?: string): void {
-  const p = credentialsPath();
-  const t = readText(p);
+  const t = readCredentialsText();
   let obj: Record<string, unknown> = {};
   if (t) {
     try {
@@ -192,13 +225,13 @@ export function updateLiveCredentials(claudeAiOauth: ClaudeAiOauth, organization
   }
   obj.claudeAiOauth = claudeAiOauth;
   if (organizationUuidRoot !== undefined) obj.organizationUuid = organizationUuidRoot;
-  atomicWrite(p, JSON.stringify(obj, null, 2) + '\n');
+  writeCredentialsText(JSON.stringify(obj, null, 2) + '\n');
   logger.info('synced rotated token to live credentials');
 }
 
 /** Both files must still parse as JSON after a write. */
 export function validateLiveFiles(): boolean {
-  const c = readText(credentialsPath());
+  const c = readCredentialsText();
   const j = readText(claudeJsonPath());
   try {
     if (c) JSON.parse(c);
@@ -233,7 +266,7 @@ function topLevelKeys(text: string | null): string[] {
 export function dryRunApply(p: Profile): DryRunReport {
   const orgRoot = p.organizationUuidRoot ?? p.organizationUuid;
 
-  const credKeys = topLevelKeys(readText(credentialsPath()));
+  const credKeys = topLevelKeys(readCredentialsText());
   const credWillSet = ['claudeAiOauth', ...(orgRoot !== undefined ? ['organizationUuid'] : [])];
   const credPreserved = credKeys.filter((k) => !credWillSet.includes(k));
 

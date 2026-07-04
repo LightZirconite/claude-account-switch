@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { profilesPath, ensureDataDirs, exportDir, importDir, backupsDir } from './paths';
 import { getLiveAccount } from './claudeStore';
 import { logger } from './logger';
-import type { ClaudeAiOauth, OauthAccount, PortableExport, Profile, ProfilesStore } from './types';
+import type { ClaudeAiOauth, OauthAccount, PortableExport, PortableExportAll, Profile, ProfilesStore } from './types';
 
 export function loadStore(): ProfilesStore {
   try {
@@ -240,38 +240,53 @@ export function fieldsFromRawFiles(credsFile: string, claudeJsonFile?: string): 
   };
 }
 
-export function fieldsFromPortableExport(file: string): LiveProfileFields | null {
-  try {
-    const data = JSON.parse(fs.readFileSync(file, 'utf8')) as PortableExport;
-    if (data.kind !== 'claude-account-switch/export') {
-      logger.warn('import: not a switcher export, trying raw parse', { file });
-      return fieldsFromRawFiles(file); // maybe it's a raw .credentials.json
-    }
-    return {
-      email: data.email,
-      accountUuid: data.accountUuid,
-      organizationUuid: data.organizationUuid,
-      organizationUuidRoot: data.organizationUuidRoot,
-      organizationType: data.organizationType,
-      subscriptionType: data.subscriptionType,
-      claudeAiOauth: data.claudeAiOauth,
-      oauthAccount: data.oauthAccount,
-      userID: data.userID,
-    };
-  } catch (e) {
-    logger.error('import: failed to parse portable export', e, { file });
-    return null;
-  }
+function fieldsFromExportRecord(data: PortableExport): LiveProfileFields {
+  return {
+    email: data.email,
+    accountUuid: data.accountUuid,
+    organizationUuid: data.organizationUuid,
+    organizationUuidRoot: data.organizationUuidRoot,
+    organizationType: data.organizationType,
+    subscriptionType: data.subscriptionType,
+    claudeAiOauth: data.claudeAiOauth,
+    oauthAccount: data.oauthAccount,
+    userID: data.userID,
+  };
 }
 
 export interface ImportCandidate {
   source: string; // description shown to user
   fields: LiveProfileFields;
+  label?: string; // preferred label (from an export)
+}
+
+/** Turn any *.ccswitch.json (single export OR full "export-all") into candidates. */
+function candidatesFromCcswitchFile(file: string): ImportCandidate[] {
+  const src = path.basename(file);
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (data?.kind === 'claude-account-switch/export-all' && Array.isArray(data.accounts)) {
+      return (data.accounts as PortableExport[]).map((a) => ({
+        source: `${src} → ${a.email}`,
+        fields: fieldsFromExportRecord(a),
+        label: a.label,
+      }));
+    }
+    if (data?.kind === 'claude-account-switch/export') {
+      return [{ source: src, fields: fieldsFromExportRecord(data as PortableExport), label: (data as PortableExport).label }];
+    }
+    // Unknown JSON — maybe a raw .credentials.json
+    const raw = fieldsFromRawFiles(file);
+    return raw ? [{ source: src, fields: raw }] : [];
+  } catch (e) {
+    logger.error('import: failed to parse .ccswitch.json', e, { file });
+    return [];
+  }
 }
 
 /**
  * Scan the import folder (~/.claude-switch/import) for anything importable:
- * portable *.ccswitch.json exports, or a raw .credentials.json (+ optional .claude.json).
+ * *.ccswitch.json (single or full backup), or a raw .credentials.json (+ .claude.json).
  */
 export function scanImportDir(): ImportCandidate[] {
   ensureDataDirs();
@@ -284,13 +299,10 @@ export function scanImportDir(): ImportCandidate[] {
   }
   const full = (n: string) => path.join(importDir(), n);
 
-  // 1) Portable exports
   for (const n of entries.filter((n) => n.endsWith('.ccswitch.json'))) {
-    const f = fieldsFromPortableExport(full(n));
-    if (f) out.push({ source: n, fields: f });
+    out.push(...candidatesFromCcswitchFile(full(n)));
   }
 
-  // 2) Raw credential files (pair a .credentials.json with a sibling .claude.json)
   const credFile = entries.find((n) => n === '.credentials.json' || n === 'credentials.json');
   const cjFile = entries.find((n) => n === '.claude.json');
   if (credFile) {
@@ -317,15 +329,13 @@ export function importFromPath(target: string): ImportCandidate[] {
       if (f) out.push({ source: path.basename(target), fields: f });
     }
     for (const n of fs.readdirSync(target).filter((n) => n.endsWith('.ccswitch.json'))) {
-      const f = fieldsFromPortableExport(path.join(target, n));
-      if (f) out.push({ source: n, fields: f });
+      out.push(...candidatesFromCcswitchFile(path.join(target, n)));
     }
     return out;
   }
   // single file
   if (target.endsWith('.ccswitch.json')) {
-    const f = fieldsFromPortableExport(target);
-    if (f) out.push({ source: path.basename(target), fields: f });
+    out.push(...candidatesFromCcswitchFile(target));
   } else {
     const f = fieldsFromRawFiles(target);
     if (f) out.push({ source: path.basename(target), fields: f });
@@ -338,6 +348,8 @@ export function addOrUpdateProfile(store: ProfilesStore, fields: LiveProfileFiel
   const existing = findByAccountUuid(store, fields.accountUuid);
   if (existing) {
     copyFieldsInto(existing, fields);
+    existing.needsReauth = false; // a fresh login means the account is healthy again
+    if (label) existing.label = label;
     logger.info('import: updated existing profile', { email: existing.email });
     return existing;
   }
@@ -349,9 +361,8 @@ export function addOrUpdateProfile(store: ProfilesStore, fields: LiveProfileFiel
 
 // ---------- Export (to another PC) ----------
 
-export function exportProfile(profile: Profile): string {
-  ensureDataDirs();
-  const data: PortableExport = {
+function toExportRecord(profile: Profile): PortableExport {
+  return {
     kind: 'claude-account-switch/export',
     version: 1,
     exportedAt: Date.now(),
@@ -366,10 +377,29 @@ export function exportProfile(profile: Profile): string {
     oauthAccount: profile.oauthAccount,
     userID: profile.userID,
   };
+}
+
+export function exportProfile(profile: Profile): string {
+  ensureDataDirs();
   const safeLabel = profile.label.replace(/[^\w.-]+/g, '_').slice(0, 40) || 'account';
   const file = path.join(exportDir(), `${safeLabel}.ccswitch.json`);
-  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(file, JSON.stringify(toExportRecord(profile), null, 2) + '\n', 'utf8');
   logger.info('exported profile', { email: profile.email, file });
+  return file;
+}
+
+/** Export ALL accounts into a single portable file (full backup / whole-PC migration). */
+export function exportAllProfiles(store: ProfilesStore): string {
+  ensureDataDirs();
+  const data: PortableExportAll = {
+    kind: 'claude-account-switch/export-all',
+    version: 1,
+    exportedAt: Date.now(),
+    accounts: store.profiles.map(toExportRecord),
+  };
+  const file = path.join(exportDir(), `all-accounts.ccswitch.json`);
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  logger.info('exported all profiles', { count: store.profiles.length, file });
   return file;
 }
 

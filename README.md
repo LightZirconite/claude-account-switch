@@ -45,6 +45,7 @@ switch.cmd       # launch the switcher (also auto-builds on first run)
 | a | add an account (copies the login URL; you authorize, then paste the code) |
 | i | import an account from files (another PC) |
 | e | export the selected account to a portable file |
+| E | export ALL accounts into one file (full backup / whole-PC migration) |
 | r | rename the selected account |
 | l | highlight the least-loaded account |
 | u | refresh usage/quota for all accounts |
@@ -97,7 +98,11 @@ Nothing is ever uploaded anywhere. Tokens only travel to Anthropic's own endpoin
 - If the native "add account" ever fails (endpoints changed), use `switch.cmd login`.
 - The usage endpoint is undocumented and aggressively rate-limited; values are cached ~10 min.
 - Quota is shared per organization; "least-loaded" ranks by organization.
-- Windows-first (Linux works too, same files). macOS Keychain is not yet supported.
+- Cross-platform: Windows & Linux use the plain credential files; **macOS** reads/writes
+  the Keychain entry Claude Code uses (`Claude Code-credentials`). Profiles are always
+  stored as plain JSON — no encryption.
+- An account whose refresh token has expired is flagged with a red ⚠; press `a` on it to
+  re-authorize just that account.
 
 ## License & credits
 
