@@ -4,19 +4,7 @@ A fast, keyboard-driven TUI to switch between multiple **Claude Code** accounts 
 a *true* switch, with **no re-authorization on the website** each time. Keep several
 accounts loaded, see each plan and live usage/quota, and jump between them instantly.
 
-```
-╭───────────────────────────────────────────────────────────────────────────╮
-│ ✳ Claude Account Switch v1.0                                              │
-│            ▐▛███▜▌           │  Your accounts · 2 saved                   │
-│           ▝▜█████▛▘          │  active ● Ben PRO                          │
-│             ▘▘ ▝▝            │     5h  46%  resets 20:59                  │
-│       Welcome back, Ben!     │     7d  27%  resets Jul 8, 13:59           │
-│       Claude PRO             │  most headroom: Work                       │
-╰───────────────────────────────────────────────────────────────────────────╯
-    ACCOUNT           EMAIL              PLAN  5-HOUR      7-DAY       LAST ACTIVE
-❯ ● Ben               ben@example.com    PRO    46% ███░░░  27% ██░░░░ in use
-    ○ Work            work@company.com   MAX     8% █░░░░░  12% █░░░░░ 3d ago
-```
+![Claude Account Switch preview](preview.png)
 
 > ⚠️ **Unofficial.** Not affiliated with, or endorsed by, Anthropic. It reads and writes
 > the same local credential files Claude Code already uses. The "add account" OAuth flow
