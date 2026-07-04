@@ -6,6 +6,9 @@ import clipboard from 'clipboardy';
 
 import { logFile, findClaudeExe, importDir } from './paths';
 import { logger } from './logger';
+import { checkForUpdate } from './updateCheck';
+import pkg from '../package.json';
+const APP_VERSION: string = pkg.version;
 import {
   loadStore,
   saveStore,
@@ -230,6 +233,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const [addLines, setAddLines] = useState<string[]>([]);
   const [addBusy, setAddBusy] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [newVersion, setNewVersion] = useState<string | null>(null);
   const [message, setMessage] = useState<{ title: string; lines: string[]; tone: Tone } | null>(null);
   const authRef = useRef<ManualAuth | null>(null);
   const cols = useTerminalSize();
@@ -280,6 +284,15 @@ function App({ initialStore, claudeVersion }: AppProps) {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Check for a newer published version (best-effort, silent on failure).
+  useEffect(() => {
+    checkForUpdate(APP_VERSION)
+      .then((r) => {
+        if (r.available && r.remoteVersion) setNewVersion(r.remoteVersion);
+      })
+      .catch(() => {});
   }, []);
 
   // Auto-clear transient status notifications after 5 seconds.
@@ -713,7 +726,9 @@ function App({ initialStore, claudeVersion }: AppProps) {
       {mode === 'list' ? (
         <Box width={W} borderStyle="round" borderColor={CLAUDE_ORANGE} paddingX={1} flexDirection="column">
           <Text bold>
-            <Text color={CLAUDE_ORANGE}>Claude</Text> <Text color="white">Account Switch</Text> <Text dimColor>v1.0</Text>
+            <Text color={CLAUDE_ORANGE}>Claude</Text> <Text color="white">Account Switch</Text>{' '}
+            <Text dimColor>v{APP_VERSION}</Text>
+            {newVersion ? <Text color="yellow"> · update available (v{newVersion})</Text> : null}
           </Text>
           <Box marginTop={1} width={W - 2}>
             <Box width={leftW} flexDirection="column" alignItems="center">
