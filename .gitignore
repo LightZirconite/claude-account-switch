@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.log
+# Never commit anything that could contain tokens
+*.ccswitch.json

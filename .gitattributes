@@ -1,0 +1,3 @@
+# Normalize line endings: LF in the repo, except Windows batch launchers.
+* text=auto eol=lf
+*.cmd text eol=crlf

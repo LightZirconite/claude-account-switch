@@ -1,0 +1,26 @@
+{
+  "name": "claude-account-switch",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Keyboard-driven switcher for multiple Claude Code accounts (true switch, no re-auth).",
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "dev": "node esbuild.mjs --watch",
+    "start": "node dist/cli.js",
+    "dry-run": "node dist/cli.js --dry-run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "clipboardy": "^4.0.0",
+    "ink": "^5.1.0",
+    "jsonc-parser": "^3.3.1",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2"
+  }
+}
