@@ -16,6 +16,7 @@ import {
   exportProfile,
   scanImportDir,
   importFromPath,
+  subscriptionOf,
   type ImportCandidate,
 } from './profiles';
 import {
@@ -48,7 +49,7 @@ function identityToFields(id: PrimedIdentity) {
     organizationUuid: oa.organizationUuid ?? id.organizationUuidRoot ?? '',
     organizationUuidRoot: id.organizationUuidRoot,
     organizationType: oa.organizationType,
-    subscriptionType: id.claudeAiOauth.subscriptionType as string | undefined,
+    subscriptionType: subscriptionOf(id.claudeAiOauth, oa.organizationType),
     claudeAiOauth: id.claudeAiOauth,
     oauthAccount: oa,
     userID: id.userID,
@@ -1011,6 +1012,14 @@ async function main(): Promise<void> {
     reconcileWithLive(store);
   } catch (e) {
     logger.error('startup reconcile failed', e);
+  }
+  // Backfill any profile saved before the plan-detection fix (e.g. subscriptionType
+  // was missing right after the manual add-account flow) using organizationType.
+  for (const p of store.profiles) {
+    if (!p.subscriptionType) {
+      const derived = subscriptionOf(p.claudeAiOauth, p.organizationType);
+      if (derived) p.subscriptionType = derived;
+    }
   }
   saveStore(store);
 

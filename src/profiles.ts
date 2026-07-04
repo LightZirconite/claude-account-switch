@@ -81,8 +81,21 @@ export function saveStore(store: ProfilesStore): void {
   }
 }
 
-function subscriptionOf(oauth: ClaudeAiOauth | null): string | undefined {
-  return oauth?.subscriptionType as string | undefined;
+/**
+ * The OAuth token's `subscriptionType` isn't always populated (e.g. right after the
+ * manual paste-code add-account flow). Fall back to deriving the plan from
+ * `organizationType`, which Claude always sets (e.g. "claude_pro" -> "pro",
+ * "claude_max" -> "max").
+ */
+export function subscriptionOf(oauth: ClaudeAiOauth | null, organizationType?: string): string | undefined {
+  const direct = oauth?.subscriptionType as string | undefined;
+  if (direct) return direct;
+  if (organizationType) {
+    const m = organizationType.match(/claude_(\w+)/i);
+    if (m) return m[1].toLowerCase();
+    return organizationType;
+  }
+  return undefined;
 }
 
 interface LiveProfileFields {
@@ -108,7 +121,7 @@ export function liveProfileFields(): LiveProfileFields | null {
     organizationUuid: oa.organizationUuid ?? live.organizationUuidRoot ?? '',
     organizationUuidRoot: live.organizationUuidRoot,
     organizationType: oa.organizationType,
-    subscriptionType: subscriptionOf(live.claudeAiOauth),
+    subscriptionType: subscriptionOf(live.claudeAiOauth, oa.organizationType),
     claudeAiOauth: live.claudeAiOauth,
     oauthAccount: oa,
     userID: live.userID,
@@ -220,7 +233,7 @@ export function fieldsFromRawFiles(credsFile: string, claudeJsonFile?: string): 
     organizationUuid: oauthAccount.organizationUuid ?? organizationUuidRoot ?? '',
     organizationUuidRoot,
     organizationType: oauthAccount.organizationType,
-    subscriptionType: subscriptionOf(claudeAiOauth),
+    subscriptionType: subscriptionOf(claudeAiOauth, oauthAccount.organizationType),
     claudeAiOauth,
     oauthAccount,
     userID,
