@@ -6,6 +6,7 @@ import type { Profile, UsageInfo } from './types';
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CACHE_MS = 10 * 60 * 1000; // usage only changes every few hours
+const MIN_INTERVAL_MS = 30 * 1000; // hard floor: never hit the endpoint more than once / 30s per account
 
 /** Ensure profile has a non-expired access token, refreshing (and persisting rotation) if needed. */
 async function ensureAccessToken(
@@ -21,11 +22,18 @@ async function ensureAccessToken(
     oauth.accessToken = refreshed.accessToken;
     oauth.refreshToken = refreshed.refreshToken; // rotates
     oauth.expiresAt = refreshed.expiresAt;
+    profile.needsReauth = false;
     onRotate?.(profile);
     logger.info('usage: refreshed token', { email: profile.email });
     return refreshed.accessToken;
   } catch (e) {
-    logger.warn('usage: token refresh failed', { email: profile.email, error: String(e) });
+    const msg = String(e);
+    if (/invalid_grant/i.test(msg)) {
+      profile.needsReauth = true; // dead refresh token — the account must be re-added
+      logger.warn('usage: refresh token rejected (needs re-login)', { email: profile.email });
+    } else {
+      logger.warn('usage: token refresh failed', { email: profile.email, error: msg });
+    }
     return null;
   }
 }
@@ -36,7 +44,8 @@ export async function fetchUsage(
   opts: { force?: boolean; onRotate?: (p: Profile) => void } = {},
 ): Promise<UsageInfo> {
   const now = Date.now();
-  if (!opts.force && profile.usage && profile.usage.status === 'ok' && now - profile.usage.fetchedAt < CACHE_MS) {
+  const cacheWindow = opts.force ? MIN_INTERVAL_MS : CACHE_MS;
+  if (profile.usage && profile.usage.status === 'ok' && now - profile.usage.fetchedAt < cacheWindow) {
     return profile.usage;
   }
 

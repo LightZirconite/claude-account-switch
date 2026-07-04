@@ -99,6 +99,9 @@ Nothing is ever uploaded anywhere. Tokens only travel to Anthropic's own endpoin
 - Quota is shared per organization; "least-loaded" ranks by organization.
 - Windows-first (Linux works too, same files). macOS Keychain is not yet supported.
 
-## License
+## License & credits
 
-[MIT](LICENSE)
+Created by **LightZirconite**. Licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE): free to use, modify, and share for
+**noncommercial** purposes, but you **may not sell it or use it commercially**, and you
+**must keep the attribution** to the original author. Please don't rebrand it as your own.

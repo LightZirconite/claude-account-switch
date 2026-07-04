@@ -67,6 +67,8 @@ export interface Profile {
   createdAt: number;
   lastUsedAt?: number;
   usage?: UsageInfo;
+  /** Set when the refresh token is rejected (invalid_grant) — the account must be re-added. */
+  needsReauth?: boolean;
 }
 
 export interface ProfilesStore {

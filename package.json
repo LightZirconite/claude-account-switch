@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "description": "Keyboard-driven switcher for multiple Claude Code accounts (true switch, no re-auth).",
+  "author": "LightZirconite",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
   "scripts": {
     "build": "node esbuild.mjs",

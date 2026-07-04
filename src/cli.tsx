@@ -31,6 +31,7 @@ import { findClaudeProcesses, closeProcesses, detectClaudeVersion, type ProcInfo
 import {
   buildManualAuth,
   exchangeCode,
+  refreshToken,
   primeIdentity,
   loginViaClaudeCli,
   DEFAULT_SCOPES,
@@ -111,6 +112,22 @@ const FABLE_PROMO_END = new Date('2026-07-08T00:00:00').getTime();
 const Divider = ({ width, color = 'gray' as string }: { width: number; color?: string }) => (
   <Text color={color}>{'─'.repeat(Math.max(1, width))}</Text>
 );
+
+// A tiny animated spinner (no extra dependency).
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+function Spinner({ label, color = 'cyanBright' as string }: { label?: string; color?: string }) {
+  const [i, setI] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setI((x) => (x + 1) % SPINNER_FRAMES.length), 80);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <Text color={color}>
+      {SPINNER_FRAMES[i]}
+      {label ? ` ${label}` : ''}
+    </Text>
+  );
+}
 
 // Track the terminal width so the UI fills the available space and reflows on resize.
 function currentCols(): number {
@@ -211,9 +228,12 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const [importCursor, setImportCursor] = useState(0);
   const [addLines, setAddLines] = useState<string[]>([]);
   const [addBusy, setAddBusy] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<{ title: string; lines: string[]; tone: Tone } | null>(null);
   const authRef = useRef<ManualAuth | null>(null);
   const cols = useTerminalSize();
+  const storeRef = useRef(store);
+  storeRef.current = store;
 
   const persist = useCallback((s: ProfilesStore) => {
     saveStore(s);
@@ -268,8 +288,37 @@ function App({ initialStore, claudeVersion }: AppProps) {
     return () => clearTimeout(t);
   }, [status]);
 
+  // Auto-refresh the ACTIVE account's usage every 2 minutes (one lightweight request;
+  // the 30s floor + 10min cache in fetchUsage keep us well within the rate limit).
+  useEffect(() => {
+    const t = setInterval(() => {
+      const s = storeRef.current;
+      const a = getActive(s);
+      if (!a) return;
+      void fetchUsage(a, claudeVersion, {
+        force: true,
+        onRotate: (p) => {
+          saveStore(s);
+          if (p.id === s.activeProfileId) {
+            try {
+              updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
+            } catch {
+              /* ignore */
+            }
+          }
+        },
+      })
+        .then((info) => {
+          a.usage = info;
+          persist(s);
+        })
+        .catch(() => {});
+    }, 120_000);
+    return () => clearInterval(t);
+  }, [claudeVersion, persist]);
+
   const refreshAllUsage = useCallback(async () => {
-    setStatus('Refreshing usage for all accounts...');
+    setBusy('Refreshing usage…');
     for (const p of store.profiles) {
       try {
         const info = await fetchUsage(p, claudeVersion, { force: true, onRotate });
@@ -280,24 +329,41 @@ function App({ initialStore, claudeVersion }: AppProps) {
       }
       await sleep(500); // be gentle with the rate-limited endpoint
     }
+    setBusy(null);
     setStatus('Usage updated.');
   }, [store, claudeVersion, persist, onRotate]);
 
   const doSwitch = useCallback(
     async (target: Profile, pids: ProcInfo[]) => {
       setMode('list');
-      setStatus(`Switching to ${target.label}...`);
+      setBusy(`Switching to ${target.label}…`);
       // Capture the outgoing (currently live) account's latest tokens first.
       try {
         reconcileWithLive(store);
       } catch (e) {
         logger.error('reconcile before switch failed', e);
       }
+      // Proactively refresh the target's token if it's expired, so it works instantly.
+      const oauth = target.claudeAiOauth;
+      if (oauth.expiresAt && oauth.expiresAt < Date.now() + 60_000 && oauth.refreshToken) {
+        try {
+          const r = await refreshToken(oauth.refreshToken);
+          oauth.accessToken = r.accessToken;
+          oauth.refreshToken = r.refreshToken;
+          oauth.expiresAt = r.expiresAt;
+          target.needsReauth = false;
+        } catch (e) {
+          if (/invalid_grant/i.test(String(e))) target.needsReauth = true;
+          logger.warn('proactive refresh on switch failed', { email: target.email });
+        }
+      }
       const res = applyProfile(target);
       if (!res.ok) {
+        setBusy(null);
         showMessage('Switch failed', [res.error ?? 'unknown error', 'Your previous account was restored from backup.'], 'error');
         return;
       }
+      setBusy(null);
       const autoClose = store.closeClaudeOnSwitch ?? true;
       const { closed, failed } =
         autoClose && pids.length ? closeProcesses(pids.map((p) => p.pid)) : { closed: [] as number[], failed: [] as number[] };
@@ -307,6 +373,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
       showMessage(
         `Switched to ${target.label}`,
         [
+          target.needsReauth ? '⚠ This account\'s login has expired — it may not work. Re-add it with "a".' : '',
           `Now authenticated as: ${target.email} (${target.subscriptionType ?? 'unknown plan'})`,
           '',
           'IMPORTANT — reload your open Claude Code sessions to apply the new account:',
@@ -615,8 +682,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
       {mode === 'list' ? (
         <Box width={W} borderStyle="round" borderColor={CLAUDE_ORANGE} paddingX={1} flexDirection="column">
           <Text bold>
-            <Text color={CLAUDE_ORANGE}>✳ </Text>
-            <Text color="white">Claude Account Switch</Text> <Text dimColor>v1.0</Text>
+            <Text color={CLAUDE_ORANGE}>Claude</Text> <Text color="white">Account Switch</Text> <Text dimColor>v1.0</Text>
           </Text>
           <Box marginTop={1} width={W - 2}>
             <Box width={leftW} flexDirection="column" alignItems="center">
@@ -708,9 +774,8 @@ function App({ initialStore, claudeVersion }: AppProps) {
       ) : (
         <Box flexDirection="column">
           <Box width={W} justifyContent="space-between">
-            <Text bold color="cyanBright">
-              {'⚡ '}
-              <Text color="white">Claude Account Switch</Text>
+            <Text bold>
+              <Text color={CLAUDE_ORANGE}>Claude</Text> <Text color="white">Account Switch</Text>
             </Text>
             {active ? <Text dimColor>active: {active.label}</Text> : null}
           </Box>
@@ -750,7 +815,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
             </Box>
           ) : null}
           <Box marginTop={1}>
-            <Text dimColor>{addBusy ? 'Working…' : 'Paste the code above, then Enter · Esc to cancel'}</Text>
+            {addBusy ? <Spinner label="Working…" /> : <Text dimColor>Paste the code above, then Enter · Esc to cancel</Text>}
           </Box>
         </Box>
       ) : mode === 'importMenu' ? (
@@ -840,8 +905,10 @@ function App({ initialStore, claudeVersion }: AppProps) {
                     <Text color="cyanBright" bold>
                       {isCursor ? '❯ ' : '  '}
                     </Text>
-                    <Text color={isActive ? 'green' : 'gray'}>{isActive ? '●' : '○'} </Text>
-                    <Text bold={isCursor} color={isCursor ? 'white' : undefined}>
+                    <Text color={p.needsReauth ? 'red' : isActive ? 'green' : 'gray'}>
+                      {p.needsReauth ? '⚠' : isActive ? '●' : '○'}{' '}
+                    </Text>
+                    <Text bold={isCursor} color={p.needsReauth ? 'red' : isCursor ? 'white' : undefined}>
                       {pad(p.label, 18)}
                     </Text>
                     <Text dimColor>{pad(p.email, emailW)}</Text>
@@ -913,7 +980,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
       {/* footer */}
       <Box marginTop={1} flexDirection="column">
         <Divider width={W} color="gray" />
-        {status ? <Text color="yellow">{status}</Text> : null}
+        {busy ? <Spinner label={busy} /> : status ? <Text color="yellow">{status}</Text> : null}
         {mode === 'list' ? (
           <>
             <Text dimColor>
