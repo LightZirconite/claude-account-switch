@@ -15,6 +15,7 @@ import {
   reconcileWithLive,
   getActive,
   addOrUpdateProfile,
+  captureDesktopAccount,
   deleteProfile,
   exportProfile,
   scanImportDir,
@@ -30,6 +31,7 @@ import {
   updateLiveCredentials,
   type DryRunReport,
 } from './claudeStore';
+import { applyDesktopSnapshot, isDesktopInstalled } from './desktopStore';
 import { fetchUsage, leastLoaded } from './usage';
 import { findClaudeProcesses, closeProcesses, detectClaudeVersion, type ProcInfo } from './processes';
 import {
@@ -209,7 +211,18 @@ function UsageCell({ win }: { win?: { utilization: number | null } | null }) {
   );
 }
 
-type Mode = 'list' | 'confirmSwitch' | 'confirmDelete' | 'rename' | 'importMenu' | 'importPath' | 'adding' | 'message';
+type Mode =
+  | 'list'
+  | 'confirmSwitch'
+  | 'confirmDelete'
+  | 'rename'
+  | 'importMenu'
+  | 'importPath'
+  | 'adding'
+  | 'capturingDesktopConfirm'
+  | 'capturingDesktopLabel'
+  | 'capturingDesktopEmail'
+  | 'message';
 type Tone = 'success' | 'error' | 'info';
 
 interface AppProps {
@@ -232,6 +245,8 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const [importCursor, setImportCursor] = useState(0);
   const [addLines, setAddLines] = useState<string[]>([]);
   const [addBusy, setAddBusy] = useState(false);
+  const [desktopBusy, setDesktopBusy] = useState(false);
+  const desktopLabelRef = useRef('');
   const [busy, setBusy] = useState<string | null>(null);
   const [newVersion, setNewVersion] = useState<string | null>(null);
   const [message, setMessage] = useState<{ title: string; lines: string[]; tone: Tone } | null>(null);
@@ -255,7 +270,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const onRotate = useCallback(
     (p: Profile) => {
       saveStore(store);
-      if (p.id === store.activeProfileId) {
+      if (p.id === store.activeProfileId && p.claudeAiOauth) {
         try {
           updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
         } catch (e) {
@@ -270,11 +285,26 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const selected = profiles[cursor];
   const active = getActive(store);
 
+  // The running `claude` CLI session (if any) refreshes its OWN token independently
+  // while it's alive, which rotates the refresh token server-side and can desync our
+  // cached copy for the ACTIVE profile — a background refresh attempt here would then
+  // get rejected (invalid_grant) even though the account is perfectly fine live. Re-sync
+  // from the live files first (cheap, local-only) before touching the active profile.
+  const reconcileActiveIfLive = useCallback((s: ProfilesStore, p: Profile) => {
+    if (p.id !== s.activeProfileId) return;
+    try {
+      reconcileWithLive(s);
+    } catch (e) {
+      logger.error('reconcile before usage fetch failed', e);
+    }
+  }, []);
+
   // fetch active usage on mount (best-effort, cached)
   useEffect(() => {
     (async () => {
       const a = getActive(store);
       if (!a) return;
+      reconcileActiveIfLive(store, a);
       try {
         const info = await fetchUsage(a, claudeVersion, { onRotate });
         a.usage = info;
@@ -285,6 +315,27 @@ function App({ initialStore, claudeVersion }: AppProps) {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // As you move the cursor (hover, no need to press Enter), preview that account's
+  // usage in the panel below. fetchUsage's own 10-minute cache means flicking through
+  // many rows quickly won't spam the rate-limited endpoint — it only actually fetches
+  // when that specific account's cached usage is missing or stale. The extra 250ms
+  // debounce avoids firing a request for every row you pass through while holding ↑/↓.
+  useEffect(() => {
+    const p = profiles[cursor];
+    if (!p || !p.claudeAiOauth) return;
+    const t = setTimeout(() => {
+      reconcileActiveIfLive(storeRef.current, p);
+      fetchUsage(p, claudeVersion, { onRotate })
+        .then((info) => {
+          p.usage = info;
+          persist(storeRef.current);
+        })
+        .catch(() => {});
+    }, 250);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cursor, claudeVersion, onRotate]);
 
   // Check for a newer published version (best-effort, silent on failure).
   useEffect(() => {
@@ -309,11 +360,12 @@ function App({ initialStore, claudeVersion }: AppProps) {
       const s = storeRef.current;
       const a = getActive(s);
       if (!a) return;
+      reconcileActiveIfLive(s, a);
       void fetchUsage(a, claudeVersion, {
         force: true,
         onRotate: (p) => {
           saveStore(s);
-          if (p.id === s.activeProfileId) {
+          if (p.id === s.activeProfileId && p.claudeAiOauth) {
             try {
               updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
             } catch {
@@ -329,7 +381,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
         .catch(() => {});
     }, 120_000);
     return () => clearInterval(t);
-  }, [claudeVersion, persist]);
+  }, [claudeVersion, persist, reconcileActiveIfLive]);
 
   const refreshAllUsage = useCallback(async () => {
     setBusy('Refreshing usage…');
@@ -351,56 +403,67 @@ function App({ initialStore, claudeVersion }: AppProps) {
     async (target: Profile, pids: ProcInfo[]) => {
       setMode('list');
       setBusy(`Switching to ${target.label}…`);
-      // Capture the outgoing (currently live) account's latest tokens first.
-      try {
-        reconcileWithLive(store);
-      } catch (e) {
-        logger.error('reconcile before switch failed', e);
-      }
-      // Proactively refresh the target's token if it's expired, so it works instantly.
-      const oauth = target.claudeAiOauth;
-      if (oauth.expiresAt && oauth.expiresAt < Date.now() + 60_000 && oauth.refreshToken) {
+      const lines: string[] = [];
+
+      if (target.claudeAiOauth) {
+        // Capture the outgoing (currently live) account's latest tokens first.
         try {
-          const r = await refreshToken(oauth.refreshToken);
-          oauth.accessToken = r.accessToken;
-          oauth.refreshToken = r.refreshToken;
-          oauth.expiresAt = r.expiresAt;
-          target.needsReauth = false;
+          reconcileWithLive(store);
         } catch (e) {
-          if (/invalid_grant/i.test(String(e))) target.needsReauth = true;
-          logger.warn('proactive refresh on switch failed', { email: target.email });
+          logger.error('reconcile before switch failed', e);
         }
-      }
-      const res = applyProfile(target);
-      if (!res.ok) {
-        setBusy(null);
-        showMessage('Switch failed', [res.error ?? 'unknown error', 'Your previous account was restored from backup.'], 'error');
-        return;
-      }
-      setBusy(null);
-      const autoClose = store.closeClaudeOnSwitch ?? true;
-      const { closed, failed } =
-        autoClose && pids.length ? closeProcesses(pids.map((p) => p.pid)) : { closed: [] as number[], failed: [] as number[] };
-      target.lastUsedAt = Date.now();
-      store.activeProfileId = target.id;
-      persist(store);
-      showMessage(
-        `Switched to ${target.label}`,
-        [
+        // Proactively refresh the target's token if it's expired, so it works instantly.
+        const oauth = target.claudeAiOauth;
+        if (oauth.expiresAt && oauth.expiresAt < Date.now() + 60_000 && oauth.refreshToken) {
+          try {
+            const r = await refreshToken(oauth.refreshToken);
+            oauth.accessToken = r.accessToken;
+            oauth.refreshToken = r.refreshToken;
+            oauth.expiresAt = r.expiresAt;
+            target.needsReauth = false;
+          } catch (e) {
+            if (/invalid_grant/i.test(String(e))) target.needsReauth = true;
+            logger.warn('proactive refresh on switch failed', { email: target.email });
+          }
+        }
+        const res = applyProfile(target);
+        if (!res.ok) {
+          setBusy(null);
+          showMessage('Switch failed', [res.error ?? 'unknown error', 'Your previous account was restored from backup.'], 'error');
+          return;
+        }
+        const autoClose = store.closeClaudeOnSwitch ?? true;
+        const { closed, failed } =
+          autoClose && pids.length ? closeProcesses(pids.map((p) => p.pid)) : { closed: [] as number[], failed: [] as number[] };
+        lines.push(
           target.needsReauth ? '⚠ This account\'s login has expired — it may not work. Re-add it with "a".' : '',
-          `Now authenticated as: ${target.email} (${target.subscriptionType ?? 'unknown plan'})`,
-          '',
-          'IMPORTANT — reload your open Claude Code sessions to apply the new account:',
+          `Claude Code CLI: now authenticated as ${target.email} (${target.subscriptionType ?? 'unknown plan'})`,
           autoClose
             ? closed.length
               ? `• Closed ${closed.length} running claude CLI process(es) — just relaunch \`claude\`.`
               : '• No running claude CLI process was found to close.'
             : '• Auto-close is OFF: close/relaunch your open `claude` CLI sessions yourself.',
           failed.length ? `• Could not close: ${failed.join(', ')} (close them manually).` : '',
-          '• VS Code: run "Developer: Reload Window" (or it applies on your next message).',
-          '',
-          'This switcher stays open — no web login needed.',
-        ].filter(Boolean),
+        );
+      }
+
+      if (target.desktopSnapshotDir) {
+        const res = applyDesktopSnapshot(target.desktopSnapshotDir);
+        if (!res.ok) {
+          setBusy(null);
+          showMessage('Desktop switch failed', [res.error ?? 'unknown error', 'Your previous Desktop session was restored from backup.'], 'error');
+          return;
+        }
+        lines.push('', `Claude Desktop: session swapped to ${target.email}. Reopen Claude Desktop when ready.`);
+      }
+
+      setBusy(null);
+      target.lastUsedAt = Date.now();
+      store.activeProfileId = target.id;
+      persist(store);
+      showMessage(
+        `Switched to ${target.label}`,
+        [...lines, '', 'This switcher stays open — no web login needed.'].filter(Boolean),
         'success',
       );
     },
@@ -453,6 +516,43 @@ function App({ initialStore, claudeVersion }: AppProps) {
       }
     },
     [showMessage],
+  );
+
+  const startCaptureDesktop = useCallback(() => {
+    if (!isDesktopInstalled()) {
+      setStatus('Claude Desktop data folder was not found on this machine.');
+      return;
+    }
+    setBuffer('');
+    setMode('capturingDesktopConfirm');
+  }, []);
+
+  const finalizeDesktopCapture = useCallback(
+    (email: string) => {
+      setDesktopBusy(true);
+      try {
+        const p = captureDesktopAccount(store, desktopLabelRef.current, email);
+        persist(store);
+        setCursor(store.profiles.findIndex((x) => x.id === p.id));
+        setMode('list');
+        showMessage(
+          'Desktop session captured',
+          [
+            `${p.label} (${p.email})`,
+            '',
+            'Usage/quota is not available for Desktop accounts (tokens are OS-encrypted).',
+            'This session is tied to this machine — it cannot be exported/imported to another PC.',
+          ],
+          'success',
+        );
+      } catch (e) {
+        showMessage('Capture failed', [String((e as Error)?.message ?? e)], 'error');
+      } finally {
+        setDesktopBusy(false);
+        setBuffer('');
+      }
+    },
+    [store, persist, showMessage],
   );
 
   const submitAddCode = useCallback(async () => {
@@ -560,6 +660,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
       else if (key.return) {
         if (selected) beginSwitch(selected);
       } else if (input === 'a') void startAdd(selected?.needsReauth ? selected.email : undefined);
+      else if (input === 'A') startCaptureDesktop();
       else if (input === 'i') openImportMenu();
       else if (input === 'e') exportSelected();
       else if (input === 'E') exportAllAccounts();
@@ -704,6 +805,48 @@ function App({ initialStore, claudeVersion }: AppProps) {
       return;
     }
 
+    if (mode === 'capturingDesktopConfirm') {
+      if (key.escape) {
+        setMode('list');
+        setStatus('Desktop capture cancelled.');
+      } else if (key.return) {
+        setBuffer('');
+        setMode('capturingDesktopLabel');
+      }
+      return;
+    }
+
+    if (mode === 'capturingDesktopLabel') {
+      if (key.escape) {
+        setMode('list');
+        setStatus('Desktop capture cancelled.');
+      } else if (key.return) {
+        desktopLabelRef.current = buffer.trim();
+        setBuffer('');
+        setMode('capturingDesktopEmail');
+      } else if (key.backspace || key.delete) {
+        setBuffer((b) => b.slice(0, -1));
+      } else if (input && !key.ctrl && !key.meta) {
+        setBuffer((b) => b + input);
+      }
+      return;
+    }
+
+    if (mode === 'capturingDesktopEmail') {
+      if (desktopBusy) return;
+      if (key.escape) {
+        setMode('list');
+        setStatus('Desktop capture cancelled.');
+      } else if (key.return) {
+        finalizeDesktopCapture(buffer.trim());
+      } else if (key.backspace || key.delete) {
+        setBuffer((b) => b.slice(0, -1));
+      } else if (input && !key.ctrl && !key.meta) {
+        setBuffer((b) => b + input);
+      }
+      return;
+    }
+
     if (mode === 'message') {
       if (key.return || key.escape || input === 'q') {
         setMessage(null);
@@ -716,7 +859,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
   // ---------- rendering ----------
   const tone = message?.tone === 'success' ? 'green' : message?.tone === 'error' ? 'red' : 'cyan';
   const W = Math.max(72, Math.min(cols - 1, 150));
-  const emailW = Math.max(16, W - (4 + 18 + 6 + 12 + 12 + 11));
+  const emailW = Math.max(16, W - (4 + 18 + 8 + 6 + 12 + 12 + 11));
   const leftW = Math.min(42, Math.max(24, Math.floor((W - 4) * 0.4)));
   const least = leastLoaded(profiles);
   const leastName = least ? least.label : null;
@@ -766,33 +909,36 @@ function App({ initialStore, claudeVersion }: AppProps) {
               <Text bold color="white">
                 Your accounts <Text dimColor>· {profiles.length} saved</Text>
               </Text>
-              {active ? (
+              {selected ? (
                 <Box marginTop={1} flexDirection="column">
                   <Text>
-                    <Text dimColor>active </Text>
-                    <Text color="green">●</Text> <Text bold color="white">{active.label}</Text>{' '}
-                    <Text color={planColor(active.subscriptionType)}>{(active.subscriptionType ?? '').toUpperCase()}</Text>
+                    <Text dimColor>{selected.id === store.activeProfileId ? 'active ' : 'viewing '}</Text>
+                    <Text color={selected.id === store.activeProfileId ? 'green' : 'cyanBright'}>●</Text>{' '}
+                    <Text bold color="white">{selected.label}</Text>{' '}
+                    <Text color={planColor(selected.subscriptionType)}>{(selected.subscriptionType ?? '').toUpperCase()}</Text>
                   </Text>
-                  {active.usage?.status === 'ok' ? (
+                  {!selected.claudeAiOauth ? (
+                    <Text dimColor>{'   Desktop-only account — usage not available'}</Text>
+                  ) : selected.usage?.status === 'ok' ? (
                     <>
                       <Text>
                         {'   5h  '}
-                        <Text color={utilColor(active.usage.five_hour?.utilization ?? null)}>
-                          {fmtPct(active.usage.five_hour?.utilization).padEnd(5)}
+                        <Text color={utilColor(selected.usage.five_hour?.utilization ?? null)}>
+                          {fmtPct(selected.usage.five_hour?.utilization).padEnd(5)}
                         </Text>
-                        <Text dimColor>resets {resetAt(active.usage.five_hour?.resets_at)}</Text>
+                        <Text dimColor>resets {resetAt(selected.usage.five_hour?.resets_at)}</Text>
                       </Text>
                       <Text>
                         {'   7d  '}
-                        <Text color={utilColor(active.usage.seven_day?.utilization ?? null)}>
-                          {fmtPct(active.usage.seven_day?.utilization).padEnd(5)}
+                        <Text color={utilColor(selected.usage.seven_day?.utilization ?? null)}>
+                          {fmtPct(selected.usage.seven_day?.utilization).padEnd(5)}
                         </Text>
-                        <Text dimColor>resets {resetAt(active.usage.seven_day?.resets_at)}</Text>
+                        <Text dimColor>resets {resetAt(selected.usage.seven_day?.resets_at)}</Text>
                       </Text>
                       {/* PROMO: Fable 50% until 2026-07-07 — auto-hidden after FABLE_PROMO_END; safe to delete this block after the promo. */}
                       {(() => {
                         if (Date.now() >= FABLE_PROMO_END) return null;
-                        const fable = active.usage.models?.find((m) => /fable/i.test(m.name));
+                        const fable = selected.usage.models?.find((m) => /fable/i.test(m.name));
                         if (!fable) return null;
                         return (
                           <Text>
@@ -862,6 +1008,56 @@ function App({ initialStore, claudeVersion }: AppProps) {
           ) : null}
           <Box marginTop={1}>
             {addBusy ? <Spinner label="Working…" /> : <Text dimColor>Paste the code above, then Enter · Esc to cancel</Text>}
+          </Box>
+        </Box>
+      ) : mode === 'capturingDesktopConfirm' ? (
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor={CLAUDE_ORANGE} paddingX={1}>
+          <Text bold color="cyanBright">
+            Add a Claude Desktop account (capture)
+          </Text>
+          <Box marginTop={1} flexDirection="column">
+            <Text wrap="wrap">
+              Desktop's login can't be done remotely (no code to paste) — it must happen once, right here on this machine:
+            </Text>
+            <Text>
+              {'  1. '}Open Claude Desktop and log in with the account you want to add.
+            </Text>
+            <Text>
+              {'  2. '}Once connected, <Text bold>fully close Claude Desktop</Text> (quit it — check the tray too).
+            </Text>
+            <Text>{'  3. '}Come back here and press Enter. We'll save this session as a new account.</Text>
+          </Box>
+          <Box marginTop={1}>
+            <Text dimColor>Not portable to another PC (session is tied to this machine).</Text>
+          </Box>
+          <Box marginTop={1}>
+            <Text dimColor>Enter when Desktop is closed and ready · Esc to cancel</Text>
+          </Box>
+        </Box>
+      ) : mode === 'capturingDesktopLabel' ? (
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
+          <Text bold color="cyan">
+            Label for this account
+          </Text>
+          <Text>
+            Label: <Text color="green">{buffer}</Text>
+            <Text>▎</Text>
+          </Text>
+          <Box marginTop={1}>
+            <Text dimColor>Enter to continue · Esc to cancel</Text>
+          </Box>
+        </Box>
+      ) : mode === 'capturingDesktopEmail' ? (
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
+          <Text bold color="cyan">
+            Email for this account (used to link with a CLI profile, optional)
+          </Text>
+          <Text>
+            Email: <Text color="green">{buffer}</Text>
+            <Text>▎</Text>
+          </Text>
+          <Box marginTop={1}>
+            {desktopBusy ? <Spinner label="Capturing Desktop session…" /> : <Text dimColor>Enter to save · Esc to cancel</Text>}
           </Box>
         </Box>
       ) : mode === 'importMenu' ? (
@@ -937,6 +1133,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
               <Text dimColor>
                 {'    '}
                 {pad('ACCOUNT', 18)}
+                {pad('LINKED', 8)}
                 {pad('EMAIL', emailW)}
                 {pad('PLAN', 6)}
                 {pad('5-HOUR', 12)}
@@ -946,6 +1143,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
               {profiles.map((p, i) => {
                 const isActive = p.id === store.activeProfileId;
                 const isCursor = i === cursor;
+                const linked = [p.claudeAiOauth ? 'CLI' : null, p.desktopSnapshotDir ? 'DSK' : null].filter(Boolean).join('+');
                 return (
                   <Box key={p.id}>
                     <Text color="cyanBright" bold>
@@ -957,6 +1155,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
                     <Text bold={isCursor} color={p.needsReauth ? 'red' : isCursor ? 'white' : undefined}>
                       {pad(p.label, 18)}
                     </Text>
+                    <Text dimColor>{pad(linked, 8)}</Text>
                     <Text dimColor>{pad(p.email, emailW)}</Text>
                     <Text color={planColor(p.subscriptionType)}>{pad((p.subscriptionType ?? '?').toUpperCase(), 6)}</Text>
                     <UsageCell win={p.usage?.five_hour} />
@@ -977,19 +1176,26 @@ function App({ initialStore, claudeVersion }: AppProps) {
               <Text bold color="yellow">
                 Switch to "{pendingSwitch.profile.label}" ({pendingSwitch.profile.email})?
               </Text>
-              {(store.closeClaudeOnSwitch ?? true) ? (
-                pendingSwitch.pids.length ? (
-                  <Text>
-                    Will close {pendingSwitch.pids.length} running claude process(es):{' '}
-                    <Text color="yellow">{pendingSwitch.pids.map((p) => p.pid).join(', ')}</Text>{' '}
-                    <Text dimColor>(this terminal stays open)</Text>
-                  </Text>
+              {pendingSwitch.profile.claudeAiOauth ? (
+                (store.closeClaudeOnSwitch ?? true) ? (
+                  pendingSwitch.pids.length ? (
+                    <Text>
+                      Will close {pendingSwitch.pids.length} running claude process(es):{' '}
+                      <Text color="yellow">{pendingSwitch.pids.map((p) => p.pid).join(', ')}</Text>{' '}
+                      <Text dimColor>(this terminal stays open)</Text>
+                    </Text>
+                  ) : (
+                    <Text dimColor>No running claude processes detected.</Text>
+                  )
                 ) : (
-                  <Text dimColor>No running claude processes detected.</Text>
+                  <Text dimColor>Auto-close is OFF — you'll reload your Claude Code sessions yourself.</Text>
                 )
-              ) : (
-                <Text dimColor>Auto-close is OFF — you'll reload your Claude Code sessions yourself.</Text>
-              )}
+              ) : null}
+              {pendingSwitch.profile.desktopSnapshotDir ? (
+                <Text color="yellow">
+                  ⚠ Make sure Claude Desktop is fully closed (quit it — check the tray) before confirming.
+                </Text>
+              ) : null}
               <Text dimColor>A backup is taken automatically before any change.</Text>
               <Box marginTop={1}>
                 <Text color="yellow">[y]</Text>
@@ -1034,9 +1240,9 @@ function App({ initialStore, claudeVersion }: AppProps) {
               best-now · <Text color="cyan">l</Text> least-loaded · <Text color="cyan">u</Text> refresh
             </Text>
             <Text dimColor>
-              <Text color="cyan">a</Text> add · <Text color="cyan">i</Text> import · <Text color="cyan">e</Text> export ·{' '}
-              <Text color="cyan">E</Text> export-all · <Text color="cyan">r</Text> rename · <Text color="cyan">d</Text> delete ·{' '}
-              <Text color="cyan">q</Text> quit
+              <Text color="cyan">a</Text> add · <Text color="cyan">A</Text> add Desktop · <Text color="cyan">i</Text> import ·{' '}
+              <Text color="cyan">e</Text> export · <Text color="cyan">E</Text> export-all · <Text color="cyan">r</Text> rename ·{' '}
+              <Text color="cyan">d</Text> delete · <Text color="cyan">q</Text> quit
             </Text>
           </>
         ) : null}
@@ -1142,7 +1348,7 @@ async function main(): Promise<void> {
   // Backfill any profile saved before the plan-detection fix (e.g. subscriptionType
   // was missing right after the manual add-account flow) using organizationType.
   for (const p of store.profiles) {
-    if (!p.subscriptionType) {
+    if (!p.subscriptionType && p.claudeAiOauth) {
       const derived = subscriptionOf(p.claudeAiOauth, p.organizationType);
       if (derived) p.subscriptionType = derived;
     }

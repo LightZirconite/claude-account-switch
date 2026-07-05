@@ -2,7 +2,7 @@
 // Aggressively rate-limited: cache hard, degrade gracefully.
 import { logger } from './logger';
 import { refreshToken } from './oauth';
-import type { Profile, UsageInfo } from './types';
+import { hasCliAuth, type Profile, type UsageInfo } from './types';
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CACHE_MS = 10 * 60 * 1000; // usage only changes every few hours
@@ -14,8 +14,18 @@ async function ensureAccessToken(
   onRotate?: (p: Profile) => void,
 ): Promise<string | null> {
   const now = Date.now();
+  if (!hasCliAuth(profile)) return null;
   const oauth = profile.claudeAiOauth;
-  if (oauth.expiresAt && oauth.expiresAt > now + 60_000) return oauth.accessToken;
+  if (oauth.expiresAt && oauth.expiresAt > now + 60_000) {
+    // Token is still valid — if it was previously flagged needsReauth (e.g. a
+    // transient invalid_grant during a refresh race), a valid token proves the
+    // account is fine again, so clear the flag instead of leaving it stuck.
+    if (profile.needsReauth) {
+      profile.needsReauth = false;
+      onRotate?.(profile);
+    }
+    return oauth.accessToken;
+  }
   if (!oauth.refreshToken) return oauth.accessToken ?? null;
   try {
     const refreshed = await refreshToken(oauth.refreshToken);
@@ -44,6 +54,7 @@ export async function fetchUsage(
   opts: { force?: boolean; onRotate?: (p: Profile) => void } = {},
 ): Promise<UsageInfo> {
   const now = Date.now();
+  if (!hasCliAuth(profile)) return { fetchedAt: now, status: 'never' };
   const cacheWindow = opts.force ? MIN_INTERVAL_MS : CACHE_MS;
   if (profile.usage && profile.usage.status === 'ok' && now - profile.usage.fetchedAt < cacheWindow) {
     return profile.usage;

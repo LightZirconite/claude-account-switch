@@ -20,7 +20,7 @@ import {
 } from 'jsonc-parser';
 import { credentialsPath, claudeJsonPath, backupsDir, ensureDataDirs } from './paths';
 import { logger } from './logger';
-import type { ClaudeAiOauth, LiveAccount, OauthAccount, Profile } from './types';
+import { hasCliAuth, type ClaudeAiOauth, type LiveAccount, type OauthAccount, type Profile } from './types';
 
 function readText(p: string): string | null {
   try {
@@ -264,6 +264,12 @@ function topLevelKeys(text: string | null): string[] {
 }
 
 export function dryRunApply(p: Profile): DryRunReport {
+  if (!hasCliAuth(p)) {
+    return {
+      credentials: { willSet: [], preserved: [] },
+      claudeJson: { willSet: [], preserved: [], stillValid: true },
+    };
+  }
   const orgRoot = p.organizationUuidRoot ?? p.organizationUuid;
 
   const credKeys = topLevelKeys(readCredentialsText());
@@ -306,6 +312,9 @@ export function dryRunApply(p: Profile): DryRunReport {
 
 /** Swap in a profile: backup -> write -> validate -> rollback on failure. */
 export function applyProfile(p: Profile, opts: { dryRun?: boolean } = {}): ApplyResult {
+  if (!hasCliAuth(p)) {
+    return { ok: false, error: 'This profile has no Claude Code credentials captured.' };
+  }
   if (opts.dryRun) {
     return { ok: true, dryRun: dryRunApply(p) };
   }

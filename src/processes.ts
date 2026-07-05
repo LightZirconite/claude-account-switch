@@ -52,7 +52,7 @@ function selfAncestry(procs: RawProc[]): Set<number> {
 }
 
 export function findClaudeProcesses(): ProcInfo[] {
-  if (process.platform !== 'win32') return findClaudeUnix();
+  if (process.platform !== 'win32') return findClaudeUnix(/claude/i);
   try {
     const procs = snapshotWindows();
     const anc = selfAncestry(procs);
@@ -65,7 +65,7 @@ export function findClaudeProcesses(): ProcInfo[] {
   }
 }
 
-function findClaudeUnix(): ProcInfo[] {
+function findClaudeUnix(namePattern: RegExp): ProcInfo[] {
   try {
     const out = execFileSync('bash', ['-c', "ps -eo pid=,comm= | grep -i claude || true"], { encoding: 'utf8' });
     const res: ProcInfo[] = [];
@@ -73,7 +73,8 @@ function findClaudeUnix(): ProcInfo[] {
       const m = line.trim().match(/^(\d+)\s+(.*)$/);
       if (m) {
         const pid = parseInt(m[1], 10);
-        if (pid && pid !== process.pid && pid !== process.ppid) res.push({ pid, name: m[2] });
+        const name = m[2];
+        if (pid && pid !== process.pid && pid !== process.ppid && namePattern.test(name)) res.push({ pid, name });
       }
     }
     return res;

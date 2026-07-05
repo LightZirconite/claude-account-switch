@@ -4,8 +4,17 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { profilesPath, ensureDataDirs, exportDir, importDir, backupsDir } from './paths';
 import { getLiveAccount } from './claudeStore';
+import { snapshotLiveDesktopInto, newDesktopProfileId, deleteDesktopSnapshot } from './desktopStore';
 import { logger } from './logger';
-import type { ClaudeAiOauth, OauthAccount, PortableExport, PortableExportAll, Profile, ProfilesStore } from './types';
+import {
+  hasCliAuth,
+  type ClaudeAiOauth,
+  type OauthAccount,
+  type PortableExport,
+  type PortableExportAll,
+  type Profile,
+  type ProfilesStore,
+} from './types';
 
 export function loadStore(): ProfilesStore {
   try {
@@ -154,6 +163,36 @@ export function copyFieldsInto(profile: Profile, fields: LiveProfileFields): Pro
 export function findByAccountUuid(store: ProfilesStore, accountUuid?: string): Profile | undefined {
   if (!accountUuid) return undefined;
   return store.profiles.find((p) => p.accountUuid === accountUuid);
+}
+
+export function findByEmail(store: ProfilesStore, email?: string): Profile | undefined {
+  const key = email?.trim().toLowerCase();
+  if (!key) return undefined;
+  return store.profiles.find((p) => p.email.trim().toLowerCase() === key);
+}
+
+/**
+ * Capture Claude Desktop's currently-live (already logged-in) session as a profile.
+ * Merges into an existing profile with the same email if one exists, so one person
+ * ends up as one row carrying both a CLI and a Desktop capability.
+ */
+export function captureDesktopAccount(store: ProfilesStore, label: string, email: string): Profile {
+  const existing = findByEmail(store, email);
+  const profile: Profile =
+    existing ??
+    {
+      id: newDesktopProfileId(),
+      label: label || email || 'Desktop account',
+      email: email || label || '(desktop account)',
+      createdAt: Date.now(),
+    };
+  const dir = snapshotLiveDesktopInto(profile.id);
+  profile.desktopSnapshotDir = dir;
+  profile.desktopCapturedAt = Date.now();
+  if (label) profile.label = label;
+  if (!existing) store.profiles.push(profile);
+  logger.info(existing ? 'desktop: linked to existing profile' : 'desktop: captured new profile', { email: profile.email });
+  return profile;
 }
 
 export function getActive(store: ProfilesStore): Profile | undefined {
@@ -343,9 +382,12 @@ export function importFromPath(target: string): ImportCandidate[] {
   return out;
 }
 
-/** Add a candidate as a profile, merging if the account already exists. */
+/**
+ * Add a candidate as a profile, merging if the account already exists. Also merges
+ * into a Desktop-only profile with the same email, so one person stays one row.
+ */
 export function addOrUpdateProfile(store: ProfilesStore, fields: LiveProfileFields, label?: string): Profile {
-  const existing = findByAccountUuid(store, fields.accountUuid);
+  const existing = findByAccountUuid(store, fields.accountUuid) ?? findByEmail(store, fields.email);
   if (existing) {
     copyFieldsInto(existing, fields);
     existing.needsReauth = false; // a fresh login means the account is healthy again
@@ -361,7 +403,9 @@ export function addOrUpdateProfile(store: ProfilesStore, fields: LiveProfileFiel
 
 // ---------- Export (to another PC) ----------
 
-function toExportRecord(profile: Profile): PortableExport {
+/** Null when the profile has no claude-code credentials (e.g. Desktop-only) — nothing portable to write. */
+function toExportRecord(profile: Profile): PortableExport | null {
+  if (!hasCliAuth(profile)) return null;
   return {
     kind: 'claude-account-switch/export',
     version: 1,
@@ -380,22 +424,24 @@ function toExportRecord(profile: Profile): PortableExport {
 }
 
 export function exportProfile(profile: Profile): string {
+  const record = toExportRecord(profile);
+  if (!record) throw new Error('This profile has no Claude Code credentials to export (Desktop-only accounts are not portable).');
   ensureDataDirs();
   const safeLabel = profile.label.replace(/[^\w.-]+/g, '_').slice(0, 40) || 'account';
   const file = path.join(exportDir(), `${safeLabel}.ccswitch.json`);
-  fs.writeFileSync(file, JSON.stringify(toExportRecord(profile), null, 2) + '\n', 'utf8');
+  fs.writeFileSync(file, JSON.stringify(record, null, 2) + '\n', 'utf8');
   logger.info('exported profile', { email: profile.email, file });
   return file;
 }
 
-/** Export ALL accounts into a single portable file (full backup / whole-PC migration). */
+/** Export ALL accounts into a single portable file (full backup / whole-PC migration). Desktop-only accounts are skipped. */
 export function exportAllProfiles(store: ProfilesStore): string {
   ensureDataDirs();
   const data: PortableExportAll = {
     kind: 'claude-account-switch/export-all',
     version: 1,
     exportedAt: Date.now(),
-    accounts: store.profiles.map(toExportRecord),
+    accounts: store.profiles.map(toExportRecord).filter((r): r is PortableExport => r != null),
   };
   const file = path.join(exportDir(), `all-accounts.ccswitch.json`);
   fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', 'utf8');
@@ -404,6 +450,8 @@ export function exportAllProfiles(store: ProfilesStore): string {
 }
 
 export function deleteProfile(store: ProfilesStore, id: string): void {
+  const profile = store.profiles.find((p) => p.id === id);
+  if (profile?.desktopSnapshotDir) deleteDesktopSnapshot(id);
   store.profiles = store.profiles.filter((p) => p.id !== id);
   if (store.activeProfileId === id) store.activeProfileId = null;
 }

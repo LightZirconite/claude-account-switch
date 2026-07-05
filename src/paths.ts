@@ -56,11 +56,51 @@ export function exportDir(): string {
   return path.join(dataDir(), 'exports');
 }
 
+/** Where the switcher stores captured Claude Desktop session bundles (one subdir per profile). */
+export function desktopStoreDir(): string {
+  return path.join(dataDir(), 'desktop');
+}
+
+/**
+ * Claude Desktop's own userData directory (its session/config lives here — a
+ * different structure from Claude Code CLI). Tries the classic name first, then
+ * the newer "-3p" build.
+ */
+export function desktopUserDataDir(): string | null {
+  const base =
+    process.platform === 'darwin'
+      ? path.join(os.homedir(), 'Library', 'Application Support')
+      : process.platform === 'win32'
+        ? (process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming'))
+        : path.join(os.homedir(), '.config');
+  for (const name of ['Claude', 'Claude-3p']) {
+    const dir = path.join(base, name);
+    if (fs.existsSync(dir)) return dir;
+  }
+  return null;
+}
+
+/**
+ * The session-identifying entries inside Desktop's userData dir that we snapshot/restore
+ * as one bundle. Everything else (logs, MCP config, window position, telemetry id) is
+ * left untouched.
+ */
+export const DESKTOP_BUNDLE_ENTRIES = [
+  'config.json',
+  'Local State',
+  path.join('Network', 'Cookies'),
+  path.join('Network', 'Cookies-journal'),
+  'Local Storage',
+  'Session Storage',
+  'IndexedDB',
+] as const;
+
 export function ensureDataDirs(): void {
   fs.mkdirSync(path.join(dataDir(), 'logs'), { recursive: true });
   fs.mkdirSync(backupsDir(), { recursive: true });
   fs.mkdirSync(importDir(), { recursive: true });
   fs.mkdirSync(exportDir(), { recursive: true });
+  fs.mkdirSync(desktopStoreDir(), { recursive: true });
 }
 
 /** Locate the `claude` executable for version detection / identity priming. */

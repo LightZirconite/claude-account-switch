@@ -50,25 +50,49 @@ export interface UsageInfo {
   error?: string;
 }
 
-/** A saved account ("profile") that can be swapped in. */
+/**
+ * A saved account ("profile") that can be swapped in. One profile = one person.
+ * A profile can carry a claude-code capability (token-level swap, plaintext),
+ * a claude-desktop capability (opaque session-folder swap, since Desktop's tokens
+ * are OS-encrypted and can't be read/written field by field), or both — in which
+ * case switching to this profile swaps BOTH surfaces at once, since there's always
+ * exactly one active profile ("one account active everywhere").
+ */
 export interface Profile {
   id: string;
   label: string; // user-editable display name
   email: string;
-  accountUuid: string;
-  organizationUuid: string;
+  // --- claude-code capability (present once this account has been added/imported for the CLI) ---
+  accountUuid?: string;
+  organizationUuid?: string;
   /** organizationUuid found at the root of .credentials.json (kept in sync) */
   organizationUuidRoot?: string;
   organizationType?: string;
   subscriptionType?: string;
-  claudeAiOauth: ClaudeAiOauth;
-  oauthAccount: OauthAccount;
+  claudeAiOauth?: ClaudeAiOauth;
+  oauthAccount?: OauthAccount;
   userID?: string;
-  createdAt: number;
-  lastUsedAt?: number;
   usage?: UsageInfo;
   /** Set when the refresh token is rejected (invalid_grant) — the account must be re-added. */
   needsReauth?: boolean;
+  // --- claude-desktop capability (present once this account has been captured from Desktop) ---
+  /** Directory under ~/.claude-switch/desktop/ holding this account's captured session bundle. */
+  desktopSnapshotDir?: string;
+  desktopCapturedAt?: number;
+  createdAt: number;
+  lastUsedAt?: number;
+}
+
+/** Narrows a Profile to one with its claude-code fields present (added/imported for the CLI). */
+export function hasCliAuth(
+  p: Profile,
+): p is Profile & { claudeAiOauth: ClaudeAiOauth; oauthAccount: OauthAccount; accountUuid: string; organizationUuid: string } {
+  return !!p.claudeAiOauth && !!p.oauthAccount;
+}
+
+/** Whether this profile has a captured Claude Desktop session bundle. */
+export function hasDesktopAuth(p: Profile): p is Profile & { desktopSnapshotDir: string } {
+  return !!p.desktopSnapshotDir;
 }
 
 export interface ProfilesStore {
