@@ -297,6 +297,11 @@ function App({ initialStore, claudeVersion }: AppProps) {
     } catch (e) {
       logger.error('reconcile before usage fetch failed', e);
     }
+    // Validate needsReauth directly instead of only via the usage-cache-gated refresh
+    // path below (fetchUsage short-circuits on a warm cache and would never reach it).
+    if (p.needsReauth && p.claudeAiOauth && p.claudeAiOauth.expiresAt > Date.now() + 60_000) {
+      p.needsReauth = false;
+    }
   }, []);
 
   // fetch active usage on mount (best-effort, cached)
@@ -1351,6 +1356,13 @@ async function main(): Promise<void> {
     if (!p.subscriptionType && p.claudeAiOauth) {
       const derived = subscriptionOf(p.claudeAiOauth, p.organizationType);
       if (derived) p.subscriptionType = derived;
+    }
+    // A needsReauth flag can get stuck true from a transient invalid_grant (e.g. a
+    // refresh-token rotation race with a live `claude` session) even after the token
+    // is valid again. Validate it right away instead of waiting on the lazy,
+    // usage-cache-gated refresh path — otherwise the UI shows stale red for minutes.
+    if (p.needsReauth && p.claudeAiOauth && p.claudeAiOauth.expiresAt > Date.now() + 60_000) {
+      p.needsReauth = false;
     }
   }
   saveStore(store);
