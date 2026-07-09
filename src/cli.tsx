@@ -1,8 +1,7 @@
 // Keyboard-driven TUI for switching Claude Code accounts. UI is in English.
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { render, Box, Text, useApp, useInput } from 'ink';
-import { spawn, spawnSync } from 'node:child_process';
-import path from 'node:path';
+import { spawn } from 'node:child_process';
 import clipboard from 'clipboardy';
 
 import { logFile, findClaudeExe, importDir } from './paths';
@@ -35,6 +34,17 @@ import {
 import { applyDesktopSnapshot, isDesktopInstalled } from './desktopStore';
 import { ensureFreshToken, fetchUsage, keepTokenAlive, leastLoaded } from './usage';
 import { findClaudeProcesses, closeProcesses, detectClaudeVersion, type ProcInfo } from './processes';
+import {
+  installAll,
+  uninstallAll,
+  installState,
+  shouldOfferSetup,
+  markSetupOffered,
+  schedulerOnlyInstall,
+  schedulerOnlyUninstall,
+  APP_NAME,
+  type InstallReport,
+} from './installer';
 import {
   buildManualAuth,
   exchangeCode,
@@ -222,6 +232,7 @@ type Mode =
   | 'capturingDesktopConfirm'
   | 'capturingDesktopLabel'
   | 'capturingDesktopEmail'
+  | 'setup'
   | 'message';
 type Tone = 'success' | 'error' | 'info';
 
@@ -249,6 +260,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const desktopLabelRef = useRef('');
   const [busy, setBusy] = useState<string | null>(null);
   const [newVersion, setNewVersion] = useState<string | null>(null);
+  const [setupReport, setSetupReport] = useState<InstallReport | null>(null);
   const [message, setMessage] = useState<{ title: string; lines: string[]; tone: Tone } | null>(null);
   const authRef = useRef<ManualAuth | null>(null);
   const cols = useTerminalSize();
@@ -263,6 +275,31 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const showMessage = useCallback((title: string, lines: string[], tone: Tone) => {
     setMessage({ title, lines, tone });
     setMode('message');
+  }, []);
+
+  const openSetup = useCallback(() => {
+    setSetupReport(null);
+    setMode('setup');
+  }, []);
+
+  // installAll/uninstallAll shell out (schtasks/PowerShell/launchctl/cron) and block
+  // briefly; paint the busy line first, then run on the next tick.
+  const runInstall = useCallback(() => {
+    setBusy(`Setting up ${APP_NAME}…`);
+    markSetupOffered();
+    setTimeout(() => {
+      const rep = installAll();
+      setSetupReport(rep);
+      setBusy(null);
+    }, 30);
+  }, []);
+  const runUninstall = useCallback(() => {
+    setBusy('Removing shortcuts & scheduled job…');
+    setTimeout(() => {
+      const rep = uninstallAll();
+      setSetupReport(rep);
+      setBusy(null);
+    }, 30);
   }, []);
 
   // When a usage refresh rotates a token, persist it. If it's the ACTIVE account,
@@ -398,6 +435,15 @@ function App({ initialStore, claudeVersion }: AppProps) {
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cursor, claudeVersion, onRotate]);
+
+  // First run: offer the one-click setup (shortcuts + auto keep-alive) exactly once.
+  useEffect(() => {
+    if (shouldOfferSetup()) {
+      markSetupOffered();
+      setMode('setup');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Check for a newer published version (best-effort, silent on failure).
   useEffect(() => {
@@ -747,7 +793,19 @@ function App({ initialStore, claudeVersion }: AppProps) {
         else if (target.id === store.activeProfileId) setStatus('Active account already has the most headroom.');
         else beginSwitch(target);
       } else if (input === 'u') void refreshAllUsage();
+      else if (input === 'S') openSetup();
       else if (input === 'q' || key.escape) exit();
+      return;
+    }
+
+    if (mode === 'setup') {
+      if (busy) return;
+      if (input === 'i') runInstall();
+      else if (input === 'x') runUninstall();
+      else if (input === 'q' || key.escape || key.return) {
+        setSetupReport(null);
+        setMode('list');
+      }
       return;
     }
 
@@ -1053,6 +1111,55 @@ function App({ initialStore, claudeVersion }: AppProps) {
             <Text dimColor>[Enter] back</Text>
           </Box>
         </Box>
+      ) : mode === 'setup' ? (
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor={CLAUDE_ORANGE} paddingX={1}>
+          <Text bold color={CLAUDE_ORANGE}>
+            Set up {APP_NAME}
+          </Text>
+          <Box marginTop={1} flexDirection="column">
+            <Text wrap="wrap">
+              Make this feel like a real app and keep your accounts logged in forever:
+            </Text>
+            <Text>
+              {'  • '}A <Text bold>Desktop + menu shortcut</Text> to launch the switcher.
+            </Text>
+            <Text>
+              {'  • '}An <Text bold>automatic keep-alive</Text> (every 6h) so saved accounts never expire —
+            </Text>
+            <Text>{'    '}even when this window is closed. Works on Windows, macOS and Linux.</Text>
+          </Box>
+          <Box marginTop={1} flexDirection="column">
+            {(() => {
+              const st = installState();
+              return (
+                <Text dimColor>
+                  Current: shortcuts {st.shortcuts ? '✓' : '—'} · auto keep-alive {st.scheduler ? '✓' : '—'}
+                </Text>
+              );
+            })()}
+          </Box>
+          {setupReport ? (
+            <Box marginTop={1} flexDirection="column">
+              {setupReport.steps.map((s, i) => (
+                <Text key={i} color={s.ok ? 'green' : 'red'}>
+                  {s.ok ? '✓' : '✗'} {s.name}
+                  {s.detail ? <Text dimColor> — {s.detail}</Text> : null}
+                </Text>
+              ))}
+            </Box>
+          ) : null}
+          <Box marginTop={1}>
+            {busy ? (
+              <Spinner label={busy} />
+            ) : (
+              <Text dimColor>
+                <Text color="green">[i]</Text> install ·{' '}
+                <Text color="yellow">[x]</Text> uninstall ·{' '}
+                <Text color="cyan">[Esc]</Text> {setupReport ? 'close' : 'skip'}
+              </Text>
+            )}
+          </Box>
+        </Box>
       ) : mode === 'adding' ? (
         <Box width={W} flexDirection="column" borderStyle="round" borderColor={CLAUDE_ORANGE} paddingX={1}>
           <Text bold color="cyanBright">
@@ -1307,7 +1414,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
             <Text dimColor>
               <Text color="cyan">a</Text> add · <Text color="cyan">A</Text> add Desktop · <Text color="cyan">i</Text> import ·{' '}
               <Text color="cyan">e</Text> export · <Text color="cyan">E</Text> export-all · <Text color="cyan">r</Text> rename ·{' '}
-              <Text color="cyan">d</Text> delete · <Text color="cyan">q</Text> quit
+              <Text color="cyan">d</Text> delete · <Text color="cyan">S</Text> setup · <Text color="cyan">q</Text> quit
             </Text>
           </>
         ) : null}
@@ -1329,9 +1436,10 @@ Usage:
   switch.cmd export-all      Export ALL accounts into one portable backup file
   switch.cmd --dry-run       Show exactly which keys a switch would change (no writes)
   switch.cmd restore         Roll back the last credential change from backup
+  switch.cmd install         Set up shortcuts + auto keep-alive (feels like a real app)
+  switch.cmd uninstall       Remove shortcuts + the scheduled keep-alive job
   switch.cmd keep-alive          Refresh all accounts' tokens now (keeps logins alive)
-  switch.cmd keep-alive install  Schedule keep-alive every 6h (accounts never expire)
-  switch.cmd keep-alive uninstall  Remove the scheduled keep-alive job
+  switch.cmd keep-alive install  Schedule keep-alive only (no shortcuts)
   switch.cmd --help          This help
 
 Data & logs live in ~/.claude-switch/`);
@@ -1347,13 +1455,6 @@ function printDryRun(target: Profile, rep: DryRunReport): void {
   console.log(`  preserved  : ${rep.claudeJson.preserved.length} other top-level keys (untouched)`);
   console.log('  still valid:', rep.claudeJson.stillValid ? 'yes' : 'NO');
   console.log('\nNo files were written.');
-}
-
-const KEEPALIVE_TASK = 'ClaudeAccountSwitch-KeepAlive';
-
-/** Absolute path to this running script (dist/cli.js), for the scheduler to invoke. */
-function scriptEntry(): string {
-  return path.resolve(process.argv[1] ?? '');
 }
 
 /**
@@ -1412,38 +1513,12 @@ async function runKeepAliveOnce(): Promise<void> {
   console.log(`keep-alive: refreshed ${refreshed} token(s)${dead ? `, ${dead} account(s) need re-add` : ''}.`);
 }
 
-/** Register an OS scheduled job that runs `keep-alive` every 6 hours (Windows Task Scheduler). */
-function keepAliveInstall(): void {
-  const entry = scriptEntry();
-  if (process.platform !== 'win32') {
-    console.log('Add this to your crontab (macOS/Linux) to keep accounts alive while the app is closed:');
-    console.log(`  0 */6 * * *  "${process.execPath}" "${entry}" keep-alive`);
-    return;
+/** Print an install/uninstall report to the console. */
+function printReport(title: string, report: InstallReport): void {
+  console.log(title);
+  for (const s of report.steps) {
+    console.log(`  ${s.ok ? '✓' : '✗'} ${s.name}${s.detail ? ` — ${s.detail}` : ''}`);
   }
-  const tr = `"${process.execPath}" "${entry}" keep-alive`;
-  const r = spawnSync(
-    'schtasks',
-    ['/Create', '/F', '/SC', 'HOURLY', '/MO', '6', '/TN', KEEPALIVE_TASK, '/TR', tr],
-    { encoding: 'utf8' },
-  );
-  if (r.status === 0) {
-    console.log(`✓ Installed scheduled task "${KEEPALIVE_TASK}" (runs every 6h).`);
-    console.log('  Your saved accounts now stay logged in even when the switcher is closed.');
-    console.log(`  Remove it any time with:  switch.cmd keep-alive uninstall`);
-  } else {
-    console.log('Could not install the scheduled task (try an elevated terminal).');
-    console.log((r.stderr || r.stdout || '').trim());
-  }
-}
-
-/** Remove the scheduled keep-alive job. */
-function keepAliveUninstall(): void {
-  if (process.platform !== 'win32') {
-    console.log('Remove the cron line you added for `keep-alive`.');
-    return;
-  }
-  const r = spawnSync('schtasks', ['/Delete', '/F', '/TN', KEEPALIVE_TASK], { encoding: 'utf8' });
-  console.log(r.status === 0 ? `✓ Removed scheduled task "${KEEPALIVE_TASK}".` : 'No scheduled task to remove.');
 }
 
 async function main(): Promise<void> {
@@ -1460,13 +1535,26 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === 'install') {
+    printReport(`Setting up ${APP_NAME}…`, installAll());
+    console.log('\nDone. Undo any time with:  switch.cmd uninstall');
+    return;
+  }
+  if (args[0] === 'uninstall') {
+    printReport(`Removing ${APP_NAME} shortcuts & scheduled job…`, uninstallAll());
+    console.log('\nYour saved accounts were NOT touched.');
+    return;
+  }
+
   if (args[0] === 'keep-alive') {
     if (args[1] === 'install') {
-      keepAliveInstall();
+      const s = schedulerOnlyInstall();
+      console.log(`${s.ok ? '✓' : '✗'} ${s.name}${s.detail ? ` — ${s.detail}` : ''}`);
       return;
     }
     if (args[1] === 'uninstall') {
-      keepAliveUninstall();
+      const s = schedulerOnlyUninstall();
+      console.log(`${s.ok ? '✓' : '✗'} ${s.name}${s.detail ? ` — ${s.detail}` : ''}`);
       return;
     }
     await runKeepAliveOnce();

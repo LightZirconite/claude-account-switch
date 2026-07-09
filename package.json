@@ -1,6 +1,6 @@
 {
   "name": "claude-account-switch",
-  "version": "1.0.0",
+  "version": "1.5.0",
   "private": true,
   "description": "Keyboard-driven switcher for multiple Claude Code accounts (true switch, no re-auth).",
   "author": "LightZirconite",

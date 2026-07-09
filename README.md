@@ -35,6 +35,25 @@ setup.cmd        # npm install + build (first run only)
 switch.cmd       # launch the switcher (also auto-builds on first run)
 ```
 
+On the very first launch the switcher offers a **one-click setup** (press `i`): it adds a
+Desktop + menu shortcut and schedules an automatic **keep-alive** so your saved accounts
+**never expire**, even when the app is closed. You can open this any time with `S`, or from
+the command line:
+
+```
+switch.cmd install     # shortcuts + auto keep-alive (Windows, macOS & Linux)
+switch.cmd uninstall   # remove them again (never touches your accounts)
+```
+
+### Never lose an account
+
+Once added, an account is meant to stay logged in **forever** — like a normal `claude`
+login. The switcher keeps each account's OAuth token refreshed *before* it expires (in-app
+every 10 min, and via the scheduled job every 6 h even when closed), and it never lets a
+concurrent refresh burn a token. Your `profiles.json` is mirrored to a last-known-good copy
+on every save and auto-recovered if it's ever corrupted, so a crash or power cut can't wipe
+your accounts.
+
 ## Keys
 
 | Key | Action |
@@ -50,6 +69,7 @@ switch.cmd       # launch the switcher (also auto-builds on first run)
 | l | highlight the least-loaded account |
 | u | refresh usage/quota for all accounts |
 | d | delete the selected account |
+| S | setup: install/remove shortcuts + auto keep-alive |
 | q | quit |
 
 Switching optionally auto-closes running `claude` CLI processes (toggle on the confirm
@@ -76,6 +96,9 @@ switch.cmd login          # add an account via the official `claude` login (robu
 switch.cmd import <path>   # import from a file or folder
 switch.cmd --dry-run       # show exactly which keys a switch would change (no writes)
 switch.cmd restore         # roll back the last credential change from backup
+switch.cmd install         # set up shortcuts + auto keep-alive
+switch.cmd uninstall       # remove shortcuts + the scheduled keep-alive
+switch.cmd keep-alive      # refresh every account's token now (run by the scheduler)
 switch.cmd --help
 ```
 
@@ -84,6 +107,7 @@ switch.cmd --help
 Everything lives in `~/.claude-switch/` (outside this repo — **never committed**):
 
 - `profiles.json` — your saved accounts (plain JSON, **no encryption** — keep it private)
+- `profiles.json.bak` — last-known-good mirror, used to auto-recover a corrupted `profiles.json`
 - `backups/<timestamp>/` — the live Claude files, backed up before every switch
 - `backups/profiles/` — a snapshot of `profiles.json` before every account change
   (add / delete / rename), last 40 kept — so an account can never be lost
