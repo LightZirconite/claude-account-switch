@@ -1,4 +1,17 @@
-// Shared type definitions for the Claude Account Switcher.
+// Shared type definitions for the Claude + Codex Account Switcher.
+
+export type ProviderId = 'claude' | 'codex';
+
+export interface BaseProfile {
+  id: string;
+  provider: ProviderId;
+  label: string;
+  email: string;
+  createdAt: number;
+  updatedAt?: number;
+  lastUsedAt?: number;
+  needsReauth?: boolean;
+}
 
 /** The `claudeAiOauth` block stored in ~/.claude/.credentials.json */
 export interface ClaudeAiOauth {
@@ -69,7 +82,8 @@ export interface UsageInfo {
  * case switching to this profile swaps BOTH surfaces at once, since there's always
  * exactly one active profile ("one account active everywhere").
  */
-export interface Profile {
+export interface Profile extends BaseProfile {
+  provider: 'claude';
   id: string;
   label: string; // user-editable display name
   email: string;
@@ -94,6 +108,66 @@ export interface Profile {
   lastUsedAt?: number;
 }
 
+export type ClaudeProfile = Profile;
+
+export interface CodexAuthFile {
+  auth_mode: 'chatgpt' | string;
+  OPENAI_API_KEY?: string | null;
+  tokens: {
+    id_token: string;
+    access_token: string;
+    refresh_token: string;
+    account_id: string;
+    [key: string]: unknown;
+  };
+  last_refresh?: string;
+  [key: string]: unknown;
+}
+
+export interface CodexQuotaWindow {
+  usedPercent: number;
+  windowDurationMins: number;
+  resetsAt: number;
+}
+
+export interface CodexRateLimitBucket {
+  limitId: string;
+  limitName?: string | null;
+  primary?: CodexQuotaWindow | null;
+  secondary?: CodexQuotaWindow | null;
+  planType?: string | null;
+  rateLimitReachedType?: string | null;
+  credits?: {
+    hasCredits?: boolean;
+    unlimited?: boolean;
+    balance?: number | null;
+  } | null;
+}
+
+export interface CodexUsageInfo {
+  fetchedAt: number;
+  status: UsageStatus;
+  bucket?: CodexRateLimitBucket | null;
+  buckets?: Record<string, CodexRateLimitBucket>;
+  resetCredits?: number | null;
+  error?: string;
+}
+
+export interface CodexProfile extends BaseProfile {
+  provider: 'codex';
+  accountId: string;
+  planType?: string;
+  usage?: CodexUsageInfo;
+}
+
+export type AccountProfile = ClaudeProfile | CodexProfile;
+
+export interface ProfileTombstone {
+  id: string;
+  provider: ProviderId;
+  deletedAt: number;
+}
+
 /** Narrows a Profile to one with its claude-code fields present (added/imported for the CLI). */
 export function hasCliAuth(
   p: Profile,
@@ -108,11 +182,22 @@ export function hasDesktopAuth(p: Profile): p is Profile & { desktopSnapshotDir:
 
 export interface ProfilesStore {
   version: number;
+  revision?: number;
   activeProfileId: string | null;
+  activeProfileIds?: { claude: string | null; codex: string | null };
+  tombstones?: ProfileTombstone[];
   claudeVersion?: string;
   /** Whether a switch auto-closes running `claude` processes (default true). */
   closeClaudeOnSwitch?: boolean;
   profiles: Profile[];
+}
+
+export interface CodexProfilesStore {
+  version: number;
+  revision: number;
+  activeProfileId: string | null;
+  profiles: CodexProfile[];
+  tombstones: ProfileTombstone[];
 }
 
 /** The snapshot of the currently-active live Claude account read from disk. */
@@ -126,7 +211,8 @@ export interface LiveAccount {
 /** A full backup of ALL accounts in one file (for migrating a whole PC). */
 export interface PortableExportAll {
   kind: 'claude-account-switch/export-all';
-  version: 1;
+  version: 1 | 2;
+  provider?: 'claude';
   exportedAt: number;
   accounts: PortableExport[];
 }
@@ -134,7 +220,8 @@ export interface PortableExportAll {
 /** Portable export file format (*.ccswitch.json) for moving an account between PCs. */
 export interface PortableExport {
   kind: 'claude-account-switch/export';
-  version: 1;
+  version: 1 | 2;
+  provider?: 'claude';
   exportedAt: number;
   label: string;
   email: string;

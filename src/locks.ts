@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { dataDir, ensureDataDirs } from './paths';
 import { logger } from './logger';
 
@@ -23,19 +24,51 @@ function lockPath(name: string): string {
   return path.join(dataDir(), 'locks', `${safeName(name)}.lock`);
 }
 
-function tryAcquire(name: string, staleMs: number): string | null {
+interface HeldLock {
+  path: string;
+  ownerId: string;
+}
+
+interface LockOwner {
+  pid: number;
+  ownerId: string;
+  at: number;
+  name: string;
+}
+
+function readOwner(p: string): LockOwner | null {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(p, 'owner.json'), 'utf8')) as LockOwner;
+  } catch {
+    return null;
+  }
+}
+
+function processAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function tryAcquire(name: string, staleMs: number): HeldLock | null {
   ensureDataDirs();
   const p = lockPath(name);
+  const ownerId = crypto.randomUUID();
   fs.mkdirSync(path.dirname(p), { recursive: true });
   try {
     fs.mkdirSync(p);
-    fs.writeFileSync(path.join(p, 'owner.json'), JSON.stringify({ pid: process.pid, at: Date.now(), name }) + '\n', 'utf8');
-    return p;
+    fs.writeFileSync(path.join(p, 'owner.json'), JSON.stringify({ pid: process.pid, ownerId, at: Date.now(), name }) + '\n', 'utf8');
+    return { path: p, ownerId };
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
     try {
       const age = Date.now() - fs.statSync(p).mtimeMs;
-      if (age > staleMs) {
+      const owner = readOwner(p);
+      if (age > staleMs && (!owner || !processAlive(owner.pid))) {
         fs.rmSync(p, { recursive: true, force: true });
         logger.warn('removed stale lock', { name, ageMs: Math.round(age) });
       }
@@ -46,9 +79,12 @@ function tryAcquire(name: string, staleMs: number): string | null {
   }
 }
 
-function release(p: string): void {
+function release(held: HeldLock): void {
   try {
-    fs.rmSync(p, { recursive: true, force: true });
+    const owner = readOwner(held.path);
+    if (owner?.ownerId === held.ownerId) {
+      fs.rmSync(held.path, { recursive: true, force: true });
+    }
   } catch {
     /* best effort */
   }
@@ -62,7 +98,7 @@ export function withFileLockSync<T>(
   const staleMs = opts.staleMs ?? DEFAULT_STALE_MS;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
-  let held: string | null = null;
+  let held: HeldLock | null = null;
   while (!held) {
     held = tryAcquire(name, staleMs);
     if (held) break;
@@ -84,16 +120,29 @@ export async function withFileLock<T>(
   const staleMs = opts.staleMs ?? DEFAULT_STALE_MS;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
-  let held: string | null = null;
+  let held: HeldLock | null = null;
   while (!held) {
     held = tryAcquire(name, staleMs);
     if (held) break;
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for lock: ${name}`);
     await sleep(POLL_MS);
   }
+  const heartbeat = setInterval(() => {
+    try {
+      const owner = readOwner(held!.path);
+      if (owner?.ownerId === held!.ownerId) {
+        const now = new Date();
+        fs.utimesSync(held!.path, now, now);
+      }
+    } catch {
+      /* ownership verification in release remains authoritative */
+    }
+  }, Math.max(1_000, Math.floor(staleMs / 3)));
+  heartbeat.unref();
   try {
     return await fn();
   } finally {
+    clearInterval(heartbeat);
     release(held);
   }
 }

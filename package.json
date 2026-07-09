@@ -1,8 +1,8 @@
 {
-  "name": "claude-account-switch",
-  "version": "1.5.0",
+  "name": "claude-codex-account-switch",
+  "version": "2.0.0",
   "private": true,
-  "description": "Keyboard-driven switcher for multiple Claude Code accounts (true switch, no re-auth).",
+  "description": "Keyboard-driven account switcher for Claude Code and Codex with isolated auth stores and rollback.",
   "author": "LightZirconite",
   "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
@@ -11,6 +11,7 @@
     "dev": "node esbuild.mjs --watch",
     "start": "node dist/cli.js",
     "dry-run": "node dist/cli.js --dry-run",
+    "test": "tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -22,7 +23,8 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.12",
-    "esbuild": "^0.24.2",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.23.0",
     "typescript": "^5.7.2"
   }
 }

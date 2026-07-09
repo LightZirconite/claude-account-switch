@@ -38,7 +38,38 @@ export function credentialsPath(): string {
 
 /** The switcher's own data home (profiles, backups, logs, import/export). */
 export function dataDir(): string {
-  return path.join(os.homedir(), '.claude-switch');
+  const override = process.env.CLAUDE_SWITCH_HOME;
+  return override && override.trim() ? override.trim() : path.join(os.homedir(), '.claude-switch');
+}
+
+/** Codex's shared local state. Only auth.json is switched; config/history stay shared. */
+export function codexHome(): string {
+  const override = process.env.CODEX_HOME;
+  return override && override.trim() ? override.trim() : path.join(os.homedir(), '.codex');
+}
+
+export function codexAuthPath(home = codexHome()): string {
+  return path.join(home, 'auth.json');
+}
+
+export function codexProfilesPath(): string {
+  return path.join(dataDir(), 'codex-profiles.json');
+}
+
+export function codexCredentialsRoot(): string {
+  return path.join(dataDir(), 'credentials', 'codex');
+}
+
+export function claudeCredentialsRoot(): string {
+  return path.join(dataDir(), 'credentials', 'claude');
+}
+
+export function claudeProfileCredentialsPath(profileId: string): string {
+  return path.join(claudeCredentialsRoot(), profileId, 'credentials.json');
+}
+
+export function codexProfileHome(profileId: string): string {
+  return path.join(codexCredentialsRoot(), profileId);
 }
 export function profilesPath(): string {
   return path.join(dataDir(), 'profiles.json');
@@ -101,6 +132,8 @@ export function ensureDataDirs(): void {
   fs.mkdirSync(importDir(), { recursive: true });
   fs.mkdirSync(exportDir(), { recursive: true });
   fs.mkdirSync(desktopStoreDir(), { recursive: true });
+  fs.mkdirSync(claudeCredentialsRoot(), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(codexCredentialsRoot(), { recursive: true, mode: 0o700 });
 }
 
 /** Locate the `claude` executable for version detection / identity priming. */

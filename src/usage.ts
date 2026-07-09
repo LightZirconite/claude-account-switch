@@ -3,7 +3,7 @@
 import { logger } from './logger';
 import { withFileLock } from './locks';
 import { refreshToken, type TokenSet } from './oauth';
-import { findByAccountUuid, findByEmail, loadStore, saveStore } from './profiles';
+import { findByAccountUuid, findByEmail, loadStore, mutateStore } from './profiles';
 import { hasCliAuth, type Profile, type UsageInfo } from './types';
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
@@ -47,7 +47,7 @@ function refreshLockName(profile: Profile): string {
 /**
  * Ensure profile has a non-expired access token, refreshing (and persisting rotation) if
  * needed. `refreshLeadMs` is how far before expiry we proactively refresh (default 60s;
- * the keep-alive passes a larger lead so parked accounts never actually reach expiry).
+ * the keep-alive passes a larger lead so parked access tokens are refreshed on time).
  */
 async function ensureAccessToken(
   profile: Profile,
@@ -57,22 +57,16 @@ async function ensureAccessToken(
   const now = Date.now();
   if (!hasCliAuth(profile)) return null;
   const oauth = profile.claudeAiOauth;
+  // A still-live access token says nothing about whether its rotating refresh-token
+  // chain is healthy. Preserve the explicit re-auth state and show cached quotas stale.
+  if (profile.needsReauth) return null;
   if (oauth.accessToken && oauth.expiresAt && oauth.expiresAt > now + refreshLeadMs) {
-    // Token is still valid — if it was previously flagged needsReauth (e.g. a
-    // transient invalid_grant during a refresh race), a valid token proves the
-    // account is fine again, so clear the flag instead of leaving it stuck.
-    if (profile.needsReauth) {
-      profile.needsReauth = false;
-      onRotate?.(profile);
-    }
     return oauth.accessToken;
   }
   if (!oauth.refreshToken) return oauth.accessToken ?? null;
 
   // A known-dead account must be re-added. Retrying the same rejected refresh token only
   // hammers the endpoint and can overwrite live state via unrelated persistence paths.
-  if (profile.needsReauth) return null;
-
   // Back off repeated attempts from stale UI paths. A healthy account whose access token
   // merely expired is still allowed to refresh after the hard floor.
   const last = lastRefreshAttempt.get(profile.id) ?? 0;
@@ -103,19 +97,43 @@ async function ensureAccessToken(
       const tokenAtStart = lockedOauth.refreshToken;
       lastRefreshAttempt.set(profile.id, Date.now());
       try {
-        return await refreshToken(tokenAtStart);
+        const refreshed = await refreshToken(tokenAtStart);
+        lockedOauth.accessToken = refreshed.accessToken;
+        lockedOauth.refreshToken = refreshed.refreshToken;
+        lockedOauth.expiresAt = refreshed.expiresAt;
+        profile.needsReauth = false;
+
+        // Persist the rotated refresh token before releasing the cross-process lock.
+        // Releasing first leaves a window where a second process can reuse the now-dead
+        // token and incorrectly mark the account as needing re-authentication.
+        mutateStore((disk) => {
+          const latest = disk.profiles.find((p) => p.id === profile.id)
+            ?? findByAccountUuid(disk, profile.accountUuid)
+            ?? findByEmail(disk, profile.email);
+          if (latest) copyAuthState(profile, latest);
+        });
+        return refreshed;
       } catch (e) {
         const msg = String(e);
         if (/invalid_grant/i.test(msg)) {
+          profile.needsReauth = true;
+          try {
+            mutateStore((disk) => {
+              const latest = disk.profiles.find((p) => p.id === profile.id)
+                ?? findByAccountUuid(disk, profile.accountUuid)
+                ?? findByEmail(disk, profile.email);
+              if (latest) latest.needsReauth = true;
+            });
+          } catch {
+            /* the caller persists the in-memory flag as a second line of defense */
+          }
           logger.warn('usage: refresh token rejected (needs re-login)', { email: profile.email });
           throw new InvalidGrantError(msg);
         }
         logger.warn('usage: token refresh failed', { email: profile.email, error: msg });
         throw e;
-      } finally {
-        inFlightRefresh.delete(profile.id);
       }
-    });
+    }).finally(() => inFlightRefresh.delete(profile.id));
     inFlightRefresh.set(profile.id, pending);
   }
 
@@ -129,16 +147,6 @@ async function ensureAccessToken(
     currentOauth.refreshToken = refreshed.refreshToken; // rotates
     currentOauth.expiresAt = refreshed.expiresAt;
     profile.needsReauth = false;
-    try {
-      const disk = loadStore();
-      const diskProfile = disk.profiles.find((p) => p.id === profile.id) ?? findByAccountUuid(disk, profile.accountUuid) ?? findByEmail(disk, profile.email);
-      if (diskProfile && hasCliAuth(diskProfile)) {
-        copyAuthState(profile, diskProfile);
-        saveStore(disk);
-      }
-    } catch (e) {
-      logger.warn('usage: failed to persist refreshed token from locked path', { email: profile.email, error: String(e) });
-    }
     onRotate?.(profile); // persist the rotation immediately so it's never lost
     logger.info('usage: refreshed token', { email: profile.email });
     return refreshed.accessToken;
@@ -241,6 +249,9 @@ export async function fetchUsage(
     }
     if (!res.ok) {
       logger.warn('usage: http error', { email: profile.email, status: res.status });
+      if (profile.usage && (profile.usage.status === 'ok' || profile.usage.status === 'stale')) {
+        return { ...profile.usage, status: 'stale', error: `HTTP ${res.status}` };
+      }
       return { fetchedAt: now, status: 'error', error: `HTTP ${res.status}` };
     }
     const data = (await res.json()) as Record<string, unknown>;
@@ -267,6 +278,9 @@ export async function fetchUsage(
     return info;
   } catch (e) {
     logger.error('usage: fetch error', e, { email: profile.email });
+    if (profile.usage && (profile.usage.status === 'ok' || profile.usage.status === 'stale')) {
+      return { ...profile.usage, status: 'stale', error: (e as Error).message };
+    }
     return { fetchedAt: now, status: 'error', error: (e as Error).message };
   }
 }

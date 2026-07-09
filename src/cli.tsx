@@ -11,7 +11,7 @@ import pkg from '../package.json';
 const APP_VERSION: string = pkg.version;
 import {
   loadStore,
-  saveStore,
+  mutateStore,
   reconcileWithLive,
   getActive,
   addOrUpdateProfile,
@@ -47,15 +47,32 @@ import {
   type InstallReport,
 } from './installer';
 import {
-  buildManualAuth,
-  exchangeCode,
-  primeIdentity,
   loginViaClaudeCli,
-  DEFAULT_SCOPES,
-  type ManualAuth,
   type PrimedIdentity,
 } from './oauth';
 import { hasCliAuth, hasRefreshableOauth, type Profile, type ProfilesStore } from './types';
+import type { CodexProfile, CodexProfilesStore, ProviderId } from './types';
+import {
+  addCodexAccount,
+  deleteCodexProfile,
+  exportAllCodexProfiles,
+  exportCodexProfile,
+  importCodexFromPath,
+  leastLoadedCodex,
+  loadCodexStore,
+  reconcileLiveCodex,
+  refreshAllCodexProfiles,
+  renameCodexProfile,
+} from './codexProfiles';
+import { detectCodexVersion, inspectCodexHome } from './codexAppServer';
+import { codexHome } from './paths';
+import {
+  findCodexProcesses,
+  runCodexSwitchWorker,
+  startCodexSwitchWorker,
+  waitForCodexSwitchResult,
+} from './codexSwitch';
+import { switchProviderTab } from './navigation';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -77,7 +94,7 @@ function identityToFields(id: PrimedIdentity) {
 function openUrl(url: string): void {
   try {
     if (process.platform === 'win32') {
-      spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' }).unref();
+      spawn('rundll32.exe', ['url.dll,FileProtocolHandler', url], { detached: true, stdio: 'ignore' }).unref();
     } else if (process.platform === 'darwin') {
       spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
     } else {
@@ -123,6 +140,7 @@ function relTime(ms?: number): string {
 }
 
 const CLAUDE_ORANGE = '#D97757'; // Claude brand coral/orange
+const CODEX_GREEN = '#10A37F';
 // Fable promo: show the Fable per-model bucket only until this date, then it auto-hides.
 const FABLE_PROMO_END = new Date('2026-07-08T00:00:00').getTime();
 
@@ -234,17 +252,29 @@ type Mode =
   | 'capturingDesktopLabel'
   | 'capturingDesktopEmail'
   | 'setup'
+  | 'codexAdding'
+  | 'codexConfirmSwitch'
+  | 'codexConfirmDelete'
+  | 'codexRename'
+  | 'codexImportPath'
   | 'message';
 type Tone = 'success' | 'error' | 'info';
 
 interface AppProps {
   initialStore: ProfilesStore;
+  initialCodexStore: CodexProfilesStore;
   claudeVersion: string;
 }
 
-function App({ initialStore, claudeVersion }: AppProps) {
+function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const { exit } = useApp();
   const [store, setStore] = useState<ProfilesStore>(initialStore);
+  const [provider, setProvider] = useState<ProviderId>('claude');
+  const [codexStore, setCodexStore] = useState<CodexProfilesStore>(initialCodexStore);
+  const [codexCursor, setCodexCursor] = useState(() => {
+    const i = initialCodexStore.profiles.findIndex((p) => p.id === initialCodexStore.activeProfileId);
+    return i >= 0 ? i : 0;
+  });
   const [cursor, setCursor] = useState(() => {
     const i = initialStore.profiles.findIndex((p) => p.id === initialStore.activeProfileId);
     return i >= 0 ? i : 0;
@@ -253,24 +283,45 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const [status, setStatus] = useState<string>('');
   const [buffer, setBuffer] = useState<string>('');
   const [pendingSwitch, setPendingSwitch] = useState<{ profile: Profile; pids: ProcInfo[] } | null>(null);
+  const [pendingCodexSwitch, setPendingCodexSwitch] = useState<CodexProfile | null>(null);
   const [importCands, setImportCands] = useState<ImportCandidate[]>([]);
   const [importCursor, setImportCursor] = useState(0);
   const [addLines, setAddLines] = useState<string[]>([]);
   const [addBusy, setAddBusy] = useState(false);
+  const [codexAddLines, setCodexAddLines] = useState<string[]>([]);
   const [desktopBusy, setDesktopBusy] = useState(false);
   const desktopLabelRef = useRef('');
   const [busy, setBusy] = useState<string | null>(null);
   const [newVersion, setNewVersion] = useState<string | null>(null);
   const [setupReport, setSetupReport] = useState<InstallReport | null>(null);
   const [message, setMessage] = useState<{ title: string; lines: string[]; tone: Tone } | null>(null);
-  const authRef = useRef<ManualAuth | null>(null);
   const cols = useTerminalSize();
   const storeRef = useRef(store);
   storeRef.current = store;
 
-  const persist = useCallback((s: ProfilesStore, opts: { allowAccountRemoval?: boolean } = {}) => {
-    saveStore(s, opts);
-    setStore({ ...s });
+  const reloadClaudeStore = useCallback(() => {
+    const next = loadStore();
+    storeRef.current = next;
+    setStore(next);
+    setCursor((current) => Math.max(0, Math.min(current, next.profiles.length - 1)));
+    return next;
+  }, []);
+
+  const persistUsage = useCallback((profileId: string, usage: Profile['usage']) => {
+    const next = mutateStore((fresh) => {
+      const profile = fresh.profiles.find((candidate) => candidate.id === profileId);
+      if (profile) profile.usage = usage;
+    });
+    storeRef.current = next;
+    setStore(next);
+    return next;
+  }, []);
+
+  const reloadCodexStore = useCallback(() => {
+    const next = loadCodexStore();
+    setCodexStore(next);
+    setCodexCursor((cursor) => Math.max(0, Math.min(cursor, next.profiles.length - 1)));
+    return next;
   }, []);
 
   const showMessage = useCallback((title: string, lines: string[], tone: Tone) => {
@@ -307,21 +358,112 @@ function App({ initialStore, claudeVersion }: AppProps) {
   // also sync it into the live credentials so Claude's running session stays valid.
   const onRotate = useCallback(
     (p: Profile) => {
-      saveStore(store);
-      if (p.id === store.activeProfileId && hasCliAuth(p) && !p.needsReauth) {
+      // usage.ts has already persisted the rotation while holding the account lock.
+      // Reload instead of writing a potentially stale React snapshot over that token.
+      const current = reloadClaudeStore();
+      const persisted = current.profiles.find((candidate) => candidate.id === p.id) ?? p;
+      if (persisted.id === current.activeProfileId && hasCliAuth(persisted) && !persisted.needsReauth) {
         try {
-          updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
+          updateLiveCredentials(persisted.claudeAiOauth, persisted.organizationUuidRoot ?? persisted.organizationUuid);
         } catch (e) {
           logger.error('sync rotated active token to live failed', e);
         }
       }
     },
-    [store],
+    [reloadClaudeStore],
   );
 
   const profiles = store.profiles;
   const selected = profiles[cursor];
   const active = getActive(store);
+  const codexProfiles = codexStore.profiles;
+  const codexSelected = codexProfiles[codexCursor];
+  const codexActive = codexProfiles.find((p) => p.id === codexStore.activeProfileId);
+
+  const startCodexAdd = useCallback(async () => {
+    setMode('codexAdding');
+    setBusy('Waiting for ChatGPT login…');
+    setCodexAddLines(['Starting the official Codex ChatGPT login…']);
+    try {
+      const result = await addCodexAccount((url) => {
+        openUrl(url);
+        setCodexAddLines([
+          'The official ChatGPT login page has been opened in your browser.',
+          'Sign in with the Codex account you want to add, then return here.',
+          '',
+          url,
+        ]);
+      });
+      setCodexStore(result.store);
+      setCodexCursor(result.store.profiles.findIndex((p) => p.id === result.profile.id));
+      setBusy(null);
+      setMode('list');
+      setStatus(`Added Codex account "${result.profile.label}".`);
+    } catch (e) {
+      setBusy(null);
+      showMessage('Codex login failed', [String((e as Error).message ?? e)], 'error');
+    }
+  }, [showMessage]);
+
+  const refreshCodexUsage = useCallback(async () => {
+    setBusy('Refreshing Codex usage…');
+    try {
+      setCodexStore(await refreshAllCodexProfiles());
+      setStatus('Codex usage updated.');
+    } catch (e) {
+      setStatus(`Codex refresh failed: ${String((e as Error).message ?? e)}`);
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const beginCodexSwitch = useCallback((target: CodexProfile) => {
+    if (target.id === codexStore.activeProfileId) {
+      setStatus(`"${target.label}" is already the active Codex account.`);
+      return;
+    }
+    if (target.needsReauth) {
+      setStatus(`"${target.label}" needs to be re-added before switching.`);
+      return;
+    }
+    setPendingCodexSwitch(target);
+    setMode('codexConfirmSwitch');
+  }, [codexStore.activeProfileId]);
+
+  const doCodexSwitch = useCallback(async (target: CodexProfile) => {
+    setMode('list');
+    setBusy(`Switching Codex to ${target.label}…`);
+    try {
+      const job = startCodexSwitchWorker(target.id);
+      const result = await waitForCodexSwitchResult(job.resultPath);
+      reloadCodexStore();
+      setPendingCodexSwitch(null);
+      setBusy(null);
+      showMessage(result.ok ? `Switched Codex to ${target.label}` : 'Codex switch failed', [result.message], result.ok ? 'success' : 'error');
+    } catch (e) {
+      setBusy(null);
+      showMessage('Codex switch failed', [String((e as Error).message ?? e)], 'error');
+    }
+  }, [reloadCodexStore, showMessage]);
+
+  const exportSelectedCodex = useCallback(() => {
+    if (!codexSelected) return;
+    try {
+      const file = exportCodexProfile(codexSelected);
+      showMessage('Codex account exported', [file, '', 'This file contains login secrets. Keep it private.'], 'success');
+    } catch (e) {
+      showMessage('Codex export failed', [String((e as Error).message ?? e)], 'error');
+    }
+  }, [codexSelected, showMessage]);
+
+  const exportAllCodex = useCallback(() => {
+    try {
+      const file = exportAllCodexProfiles(codexStore);
+      showMessage('All Codex accounts exported', [file, '', 'This file contains login secrets. Keep it private.'], 'success');
+    } catch (e) {
+      showMessage('Codex export failed', [String((e as Error).message ?? e)], 'error');
+    }
+  }, [codexStore, showMessage]);
 
   // The running `claude` CLI session (if any) refreshes its OWN token independently
   // while it's alive, which rotates the refresh token server-side and can desync our
@@ -331,14 +473,15 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const reconcileActiveIfLive = useCallback((s: ProfilesStore, p: Profile) => {
     if (p.id !== s.activeProfileId) return;
     try {
-      reconcileWithLive(s);
+      const next = mutateStore((fresh) => {
+        reconcileWithLive(fresh);
+      });
+      storeRef.current = next;
+      const persisted = next.profiles.find((candidate) => candidate.id === p.id);
+      if (persisted) Object.assign(p, persisted);
+      setStore(next);
     } catch (e) {
       logger.error('reconcile before usage fetch failed', e);
-    }
-    // Validate needsReauth directly instead of only via the usage-cache-gated refresh
-    // path below (fetchUsage short-circuits on a warm cache and would never reach it).
-    if (p.needsReauth && hasCliAuth(p) && p.claudeAiOauth.expiresAt > Date.now() + 60_000) {
-      p.needsReauth = false;
     }
   }, []);
 
@@ -354,8 +497,8 @@ function App({ initialStore, claudeVersion }: AppProps) {
       if (a) {
         reconcileActiveIfLive(s, a);
         try {
-          a.usage = await fetchUsage(a, claudeVersion, { onRotate });
-          persist(s);
+          const info = await fetchUsage(a, claudeVersion, { onRotate });
+          persistUsage(a.id, info);
         } catch (e) {
           logger.error('mount usage fetch failed', e);
         }
@@ -363,8 +506,8 @@ function App({ initialStore, claudeVersion }: AppProps) {
       for (const p of s.profiles) {
         if (p.id === s.activeProfileId || !hasCliAuth(p)) continue;
         try {
-          p.usage = await fetchUsage(p, claudeVersion, { onRotate });
-          persist(storeRef.current);
+          const info = await fetchUsage(p, claudeVersion, { onRotate });
+          persistUsage(p.id, info);
         } catch (e) {
           logger.error('mount usage fetch failed', e, { email: p.email });
         }
@@ -376,21 +519,20 @@ function App({ initialStore, claudeVersion }: AppProps) {
 
   // Keep-alive: every 10 minutes, proactively refresh the OAuth token of ANY account whose
   // token expires within the next ~30 minutes — parked accounts included. This only touches
-  // the (non-rate-limited) token endpoint, rotating and persisting before expiry, so an
-  // account that's just sitting there never dies. This is what makes saved accounts as
-  // durable as a normal `claude login`: as long as the switcher runs periodically, the
-  // token chain never breaks. (needs-reauth accounts are skipped — their token is dead.)
+  // the token endpoint, rotating and persisting before access expiry. Anthropic's finite
+  // login lifetime and server-side revocations still require an official login renewal.
   useEffect(() => {
     const KEEP_ALIVE_LEAD_MS = 30 * 60 * 1000;
     // Stable rotate handler (reads live store via ref) so this effect doesn't re-subscribe
     // on every persist. Persists the rotation and, if the rotated account is the active one,
     // syncs it into the live credentials so a running `claude` session stays valid.
     const rotate = (p: Profile) => {
-      const s = storeRef.current;
-      saveStore(s);
-      if (p.id === s.activeProfileId && hasCliAuth(p) && !p.needsReauth) {
+      const s = loadStore();
+      storeRef.current = s;
+      const persisted = s.profiles.find((candidate) => candidate.id === p.id) ?? p;
+      if (persisted.id === s.activeProfileId && hasCliAuth(persisted) && !persisted.needsReauth) {
         try {
-          updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
+          updateLiveCredentials(persisted.claudeAiOauth, persisted.organizationUuidRoot ?? persisted.organizationUuid);
         } catch {
           /* ignore */
         }
@@ -407,7 +549,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
           if (p.id === storeRef.current.activeProfileId) continue;
           await keepTokenAlive(p, KEEP_ALIVE_LEAD_MS, rotate);
         }
-        persist(storeRef.current);
+        reloadClaudeStore();
       })().catch((e) => logger.error('keep-alive failed', e));
     };
     run(); // once shortly after open, then on the interval
@@ -428,14 +570,13 @@ function App({ initialStore, claudeVersion }: AppProps) {
       reconcileActiveIfLive(storeRef.current, p);
       fetchUsage(p, claudeVersion, { onRotate })
         .then((info) => {
-          p.usage = info;
-          persist(storeRef.current);
+          persistUsage(p.id, info);
         })
         .catch(() => {});
     }, 250);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cursor, claudeVersion, onRotate]);
+  }, [cursor, claudeVersion, reconcileActiveIfLive, persistUsage, onRotate]);
 
   // First run: offer the one-click setup (shortcuts + auto keep-alive) exactly once.
   useEffect(() => {
@@ -473,10 +614,12 @@ function App({ initialStore, claudeVersion }: AppProps) {
       void fetchUsage(a, claudeVersion, {
         force: true,
         onRotate: (p) => {
-          saveStore(s);
-          if (p.id === s.activeProfileId && hasCliAuth(p) && !p.needsReauth) {
+          const current = loadStore();
+          storeRef.current = current;
+          const persisted = current.profiles.find((candidate) => candidate.id === p.id) ?? p;
+          if (persisted.id === current.activeProfileId && hasCliAuth(persisted) && !persisted.needsReauth) {
             try {
-              updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
+              updateLiveCredentials(persisted.claudeAiOauth, persisted.organizationUuidRoot ?? persisted.organizationUuid);
             } catch {
               /* ignore */
             }
@@ -484,21 +627,19 @@ function App({ initialStore, claudeVersion }: AppProps) {
         },
       })
         .then((info) => {
-          a.usage = info;
-          persist(s);
+          persistUsage(a.id, info);
         })
         .catch(() => {});
     }, 120_000);
     return () => clearInterval(t);
-  }, [claudeVersion, persist, reconcileActiveIfLive]);
+  }, [claudeVersion, persistUsage, reconcileActiveIfLive]);
 
   const refreshAllUsage = useCallback(async () => {
     setBusy('Refreshing usage…');
     for (const p of store.profiles) {
       try {
         const info = await fetchUsage(p, claudeVersion, { force: true, onRotate });
-        p.usage = info;
-        persist(store);
+        persistUsage(p.id, info);
       } catch (e) {
         logger.error('usage refresh failed', e, { email: p.email });
       }
@@ -506,7 +647,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
     }
     setBusy(null);
     setStatus('Usage updated.');
-  }, [store, claudeVersion, persist, onRotate]);
+  }, [store, claudeVersion, persistUsage, onRotate]);
 
   const doSwitch = useCallback(
     async (target: Profile, pids: ProcInfo[]) => {
@@ -567,16 +708,23 @@ function App({ initialStore, claudeVersion }: AppProps) {
       }
 
       setBusy(null);
-      target.lastUsedAt = Date.now();
-      store.activeProfileId = target.id;
-      persist(store);
+      const next = mutateStore((fresh) => {
+        const persisted = fresh.profiles.find((profile) => profile.id === target.id);
+        if (persisted) {
+          persisted.lastUsedAt = Date.now();
+          persisted.updatedAt = Date.now();
+          fresh.activeProfileId = persisted.id;
+        }
+      });
+      storeRef.current = next;
+      setStore(next);
       showMessage(
         `Switched to ${target.label}`,
         [...lines, '', 'This switcher stays open — no web login needed.'].filter(Boolean),
         'success',
       );
     },
-    [store, persist, showMessage],
+    [store, showMessage],
   );
 
   const beginSwitch = useCallback(
@@ -607,25 +755,37 @@ function App({ initialStore, claudeVersion }: AppProps) {
     async (reauthEmail?: string) => {
       setMode('adding');
       setBuffer('');
-      setAddBusy(false);
+      setAddBusy(true);
+      setAddLines([
+        reauthEmail
+          ? `Re-authorizing "${reauthEmail}" with the official Claude CLI…`
+          : 'Starting the official Claude login in an isolated profile…',
+        '',
+        'Complete the Claude login in the terminal/browser. Your current live account is not modified.',
+      ]);
+      const wasRaw = process.stdin.isRaw;
       try {
-        const auth = buildManualAuth(DEFAULT_SCOPES);
-        authRef.current = auth;
-        await clipboard.write(auth.url).catch(() => {});
-        setAddLines([
-          reauthEmail
-            ? `Re-authorize "${reauthEmail}" — sign in with THAT account below.`
-            : 'Add a Claude account — official login flow (works across machines):',
-          '',
-          '1. The authorization URL was COPIED to your clipboard. Open it in any',
-          `   browser (this PC or another) and sign in${reauthEmail ? ` as ${reauthEmail}` : ' with the account you want'}.`,
-          '2. After you approve, the page shows an authorization code.',
-          '3. Copy that code and paste it below, then press Enter.',
-          '',
-          auth.url,
-        ]);
+        if (wasRaw) process.stdin.setRawMode?.(false);
+        const ident = await loginViaClaudeCli(findClaudeExe(), reauthEmail);
+        if (!ident || !hasRefreshableOauth(ident.claudeAiOauth)) {
+          throw new Error('Claude login was cancelled or did not produce reusable credentials.');
+        }
+        const fields = identityToFields(ident);
+        let p: Profile | undefined;
+        const next = mutateStore((fresh) => {
+          p = addOrUpdateProfile(fresh, fields);
+        });
+        if (!p) throw new Error('Claude account was not added after login.');
+        storeRef.current = next;
+        setStore(next);
+        setCursor(next.profiles.findIndex((candidate) => candidate.id === p!.id));
+        setAddBusy(false);
+        showMessage('Claude account added', [`${p.label} (${p.email})`, `Plan: ${p.subscriptionType ?? 'unknown'}`], 'success');
       } catch (e) {
-        showMessage('Could not start add', [String((e as Error)?.message ?? e)], 'error');
+        setAddBusy(false);
+        showMessage('Claude login failed', [String((e as Error)?.message ?? e)], 'error');
+      } finally {
+        if (wasRaw) process.stdin.setRawMode?.(true);
       }
     },
     [showMessage],
@@ -644,9 +804,14 @@ function App({ initialStore, claudeVersion }: AppProps) {
     (email: string) => {
       setDesktopBusy(true);
       try {
-        const p = captureDesktopAccount(store, desktopLabelRef.current, email);
-        persist(store);
-        setCursor(store.profiles.findIndex((x) => x.id === p.id));
+        let p: Profile | undefined;
+        const next = mutateStore((fresh) => {
+          p = captureDesktopAccount(fresh, desktopLabelRef.current, email);
+        });
+        if (!p) throw new Error('Desktop account was not captured.');
+        storeRef.current = next;
+        setStore(next);
+        setCursor(next.profiles.findIndex((x) => x.id === p!.id));
         setMode('list');
         showMessage(
           'Desktop session captured',
@@ -665,43 +830,8 @@ function App({ initialStore, claudeVersion }: AppProps) {
         setBuffer('');
       }
     },
-    [store, persist, showMessage],
+    [showMessage],
   );
-
-  const submitAddCode = useCallback(async () => {
-    const auth = authRef.current;
-    const code = buffer.trim();
-    if (!auth || !code) return;
-    setAddBusy(true);
-    setAddLines(['Exchanging the code for tokens...']);
-    try {
-      const tokens = await exchangeCode(code, auth.verifier, auth.state);
-      setAddLines(['Fetching account identity...']);
-      const ident = primeIdentity(tokens, findClaudeExe(), DEFAULT_SCOPES);
-      const fields = identityToFields(ident);
-      const p = addOrUpdateProfile(store, fields);
-      persist(store);
-      authRef.current = null;
-      setAddBusy(false);
-      setBuffer('');
-      setCursor(store.profiles.findIndex((x) => x.id === p.id));
-      showMessage('Account added', [`${p.label} (${p.email})`, `Plan: ${p.subscriptionType ?? 'unknown'}`], 'success');
-    } catch (e) {
-      setAddBusy(false);
-      showMessage(
-        'Add account failed',
-        [
-          String((e as Error)?.message ?? e),
-          '',
-          'Make sure you pasted the full code from the page. If it still fails,',
-          'use the official fallback — quit and run:',
-          '',
-          '    switch.cmd login',
-        ],
-        'error',
-      );
-    }
-  }, [store, buffer, persist, showMessage]);
 
   const openImportMenu = useCallback(() => {
     let cands: ImportCandidate[] = [];
@@ -718,16 +848,21 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const doImport = useCallback(
     (cand: ImportCandidate) => {
       try {
-        const p = addOrUpdateProfile(store, cand.fields, cand.label);
-        persist(store);
-        setCursor(store.profiles.findIndex((x) => x.id === p.id));
+        let p: Profile | undefined;
+        const next = mutateStore((fresh) => {
+          p = addOrUpdateProfile(fresh, cand.fields, cand.label);
+        });
+        if (!p) throw new Error('Claude account was not imported.');
+        storeRef.current = next;
+        setStore(next);
+        setCursor(next.profiles.findIndex((x) => x.id === p!.id));
         setMode('list');
         setStatus(`Imported "${p.label}" (${p.email}).`);
       } catch (e) {
         showMessage('Import failed', [String((e as Error)?.message ?? e)], 'error');
       }
     },
-    [store, persist, showMessage],
+    [showMessage],
   );
 
   const exportSelected = useCallback(() => {
@@ -772,6 +907,47 @@ function App({ initialStore, claudeVersion }: AppProps) {
   // ---------- input handling ----------
   useInput((input, key) => {
     if (mode === 'list') {
+      if (key.leftArrow) {
+        setProvider(switchProviderTab({ provider, cursors: { claude: cursor, codex: codexCursor } }, 'left').provider);
+        setStatus('Claude accounts');
+        return;
+      }
+      if (key.rightArrow) {
+        setProvider(switchProviderTab({ provider, cursors: { claude: cursor, codex: codexCursor } }, 'right').provider);
+        setStatus('Codex accounts');
+        return;
+      }
+      if (provider === 'codex') {
+        if (key.upArrow || input === 'k') {
+          setCodexCursor((c) => codexProfiles.length ? (c > 0 ? c - 1 : codexProfiles.length - 1) : 0);
+        } else if (key.downArrow || input === 'j') {
+          setCodexCursor((c) => codexProfiles.length ? (c < codexProfiles.length - 1 ? c + 1 : 0) : 0);
+        } else if (key.return && codexSelected) beginCodexSwitch(codexSelected);
+        else if (input === 'a') void startCodexAdd();
+        else if (input === 'i') {
+          setBuffer('');
+          setMode('codexImportPath');
+        } else if (input === 'e') exportSelectedCodex();
+        else if (input === 'E') exportAllCodex();
+        else if (input === 'r' && codexSelected) {
+          setBuffer(codexSelected.label);
+          setMode('codexRename');
+        } else if (input === 'd' && codexSelected) {
+          if (codexSelected.id === codexStore.activeProfileId) setStatus('Cannot delete the active Codex account. Switch away first.');
+          else setMode('codexConfirmDelete');
+        } else if (input === 'l' || input === 'b') {
+          const target = leastLoadedCodex(codexProfiles);
+          if (!target) setStatus('No Codex usage data yet. Press "u" to refresh.');
+          else if (input === 'b' && target.id !== codexStore.activeProfileId) beginCodexSwitch(target);
+          else {
+            setCodexCursor(codexProfiles.findIndex((p) => p.id === target.id));
+            setStatus(input === 'b' ? 'Active Codex account already has the most headroom.' : `Most Codex headroom: ${target.label}.`);
+          }
+        } else if (input === 'u') void refreshCodexUsage();
+        else if (input === 'S') openSetup();
+        else if (input === 'q' || key.escape) exit();
+        return;
+      }
       if (key.upArrow || input === 'k') setCursor((c) => (c > 0 ? c - 1 : profiles.length - 1));
       else if (key.downArrow || input === 'j') setCursor((c) => (c < profiles.length - 1 ? c + 1 : 0));
       else if (key.return) {
@@ -824,12 +1000,66 @@ function App({ initialStore, claudeVersion }: AppProps) {
       return;
     }
 
+    if (mode === 'codexAdding') {
+      // The browser login owns cancellation; keep the TUI stable until it completes.
+      return;
+    }
+
+    if (mode === 'codexConfirmSwitch') {
+      if ((input === 'y' || key.return) && pendingCodexSwitch) void doCodexSwitch(pendingCodexSwitch);
+      else if (input === 'n' || key.escape) {
+        setPendingCodexSwitch(null);
+        setMode('list');
+      }
+      return;
+    }
+
+    if (mode === 'codexConfirmDelete') {
+      if (input === 'y' && codexSelected) {
+        const label = codexSelected.label;
+        setCodexStore(deleteCodexProfile(codexSelected.id));
+        setCodexCursor((c) => Math.max(0, Math.min(c, codexProfiles.length - 2)));
+        setStatus(`Deleted Codex profile "${label}".`);
+        setMode('list');
+      } else if (input === 'n' || key.escape) setMode('list');
+      return;
+    }
+
+    if (mode === 'codexRename') {
+      if (key.return) {
+        if (codexSelected && buffer.trim()) setCodexStore(renameCodexProfile(codexSelected.id, buffer.trim()));
+        setMode('list');
+      } else if (key.escape) setMode('list');
+      else if (key.backspace || key.delete) setBuffer((value) => value.slice(0, -1));
+      else if (input && !key.ctrl && !key.meta) setBuffer((value) => value + input);
+      return;
+    }
+
+    if (mode === 'codexImportPath') {
+      if (key.return) {
+        try {
+          const imported = importCodexFromPath(buffer.trim());
+          reloadCodexStore();
+          setMode('list');
+          setStatus(`Imported ${imported.length} Codex account(s).`);
+        } catch (e) {
+          setStatus(`Codex import failed: ${String((e as Error).message ?? e)}`);
+        }
+      } else if (key.escape) setMode('list');
+      else if (key.backspace || key.delete) setBuffer((value) => value.slice(0, -1));
+      else if (input && !key.ctrl && !key.meta) setBuffer((value) => value + input);
+      return;
+    }
+
     if (mode === 'confirmSwitch') {
       if (input === 'y' || key.return) {
         if (pendingSwitch) void doSwitch(pendingSwitch.profile, pendingSwitch.pids);
       } else if (input === 'c') {
-        store.closeClaudeOnSwitch = !(store.closeClaudeOnSwitch ?? true);
-        persist(store);
+        const next = mutateStore((fresh) => {
+          fresh.closeClaudeOnSwitch = !(fresh.closeClaudeOnSwitch ?? true);
+        });
+        storeRef.current = next;
+        setStore(next);
       } else if (input === 'n' || key.escape) {
         setPendingSwitch(null);
         setMode('list');
@@ -841,9 +1071,10 @@ function App({ initialStore, claudeVersion }: AppProps) {
       if (input === 'y') {
         if (selected) {
           const label = selected.label;
-          deleteProfile(store, selected.id);
-          persist(store, { allowAccountRemoval: true });
-          setCursor((c) => Math.max(0, Math.min(c, store.profiles.length - 1)));
+          const next = mutateStore((fresh) => deleteProfile(fresh, selected.id));
+          storeRef.current = next;
+          setStore(next);
+          setCursor((c) => Math.max(0, Math.min(c, next.profiles.length - 1)));
           setStatus(`Deleted "${label}".`);
         }
         setMode('list');
@@ -856,8 +1087,15 @@ function App({ initialStore, claudeVersion }: AppProps) {
     if (mode === 'rename') {
       if (key.return) {
         if (selected && buffer.trim()) {
-          selected.label = buffer.trim();
-          persist(store);
+          const next = mutateStore((fresh) => {
+            const profile = fresh.profiles.find((candidate) => candidate.id === selected.id);
+            if (profile) {
+              profile.label = buffer.trim();
+              profile.updatedAt = Date.now();
+            }
+          });
+          storeRef.current = next;
+          setStore(next);
           setStatus('Renamed.');
         }
         setMode('list');
@@ -897,8 +1135,11 @@ function App({ initialStore, claudeVersion }: AppProps) {
           const cands = importFromPath(target);
           if (cands.length) {
             try {
-              cands.forEach((c) => addOrUpdateProfile(store, c.fields, c.label));
-              persist(store);
+              const next = mutateStore((fresh) => {
+                cands.forEach((c) => addOrUpdateProfile(fresh, c.fields, c.label));
+              });
+              storeRef.current = next;
+              setStore(next);
               setMode('list');
               setStatus(`Imported ${cands.length} account(s) from path.`);
             } catch (e) {
@@ -922,19 +1163,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
     }
 
     if (mode === 'adding') {
-      if (addBusy) return;
-      if (key.escape) {
-        authRef.current = null;
-        setBuffer('');
-        setMode('list');
-        setStatus('Add cancelled.');
-      } else if (key.return) {
-        void submitAddCode();
-      } else if (key.backspace || key.delete) {
-        setBuffer((b) => b.slice(0, -1));
-      } else if (input && !key.ctrl && !key.meta) {
-        setBuffer((b) => (b + input).replace(/[\r\n]/g, ''));
-      }
+      // The official Claude child process owns the terminal until login completes.
       return;
     }
 
@@ -996,10 +1225,18 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const leftW = Math.min(42, Math.max(24, Math.floor((W - 4) * 0.4)));
   const least = leastLoaded(profiles);
   const leastName = least ? least.label : null;
+  const codexLeast = leastLoadedCodex(codexProfiles);
+  const providerColor = provider === 'claude' ? CLAUDE_ORANGE : CODEX_GREEN;
+  const providerName = provider === 'claude' ? 'Claude' : 'Codex';
 
   return (
     <Box flexDirection="column">
-      {mode === 'list' ? (
+      <Box width={W} justifyContent="center">
+        <Text dimColor={provider !== 'claude'} color={provider === 'claude' ? CLAUDE_ORANGE : undefined}>← Claude</Text>
+        <Text dimColor>  │  </Text>
+        <Text dimColor={provider !== 'codex'} color={provider === 'codex' ? CODEX_GREEN : undefined}>Codex →</Text>
+      </Box>
+      {mode === 'list' ? (provider === 'claude' ? (
         <Box width={W} borderStyle="round" borderColor={CLAUDE_ORANGE} paddingX={1} flexDirection="column">
           <Text bold>
             <Text color={CLAUDE_ORANGE}>Claude</Text> <Text color="white">Account Switch</Text>{' '}
@@ -1075,7 +1312,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
                       {selected.needsReauth ? (
                         <Text color="red">{'   ⚠ login expired — press "a" to re-add (numbers are last-known)'}</Text>
                       ) : selected.usage.status === 'stale' ? (
-                        <Text dimColor>{'   (cached — refreshing…)'}</Text>
+                        <Text dimColor>{selected.needsReauth ? '   (cached — login renewal required)' : '   (cached — live refresh unavailable)'}</Text>
                       ) : null}
                       {/* PROMO: Fable 50% until 2026-07-07 — auto-hidden after FABLE_PROMO_END; safe to delete this block after the promo. */}
                       {(() => {
@@ -1110,12 +1347,42 @@ function App({ initialStore, claudeVersion }: AppProps) {
           </Box>
         </Box>
       ) : (
+        <Box width={W} borderStyle="round" borderColor={CODEX_GREEN} paddingX={1} flexDirection="column">
+          <Text bold><Text color={CODEX_GREEN}>Codex</Text> <Text color="white">Account Switch</Text>{' '}<Text dimColor>v{APP_VERSION}</Text></Text>
+          <Box marginTop={1} width={W - 2}>
+            <Box width={leftW} flexDirection="column" alignItems="center">
+              <Text bold color={CODEX_GREEN}>{'{ }'}</Text>
+              <Box marginTop={1} flexDirection="column" alignItems="center">
+                <Text>Welcome back, <Text bold>{codexActive?.label ?? 'there'}</Text>!</Text>
+                {codexActive ? <Text><Text color={planColor(codexActive.planType)}>Codex {(codexActive.planType ?? '').toUpperCase()}</Text><Text dimColor> · {codexActive.email}</Text></Text> : <Text dimColor>No Codex account selected</Text>}
+              </Box>
+            </Box>
+            <Box flexDirection="column" flexGrow={1} borderStyle="single" borderColor="gray" borderTop={false} borderRight={false} borderBottom={false} paddingLeft={2}>
+              <Text bold>Your Codex accounts <Text dimColor>· {codexProfiles.length} saved</Text></Text>
+              {codexSelected ? (
+                <Box marginTop={1} flexDirection="column">
+                  <Text><Text dimColor>{codexSelected.id === codexStore.activeProfileId ? 'active ' : 'viewing '}</Text><Text color={codexSelected.id === codexStore.activeProfileId ? 'green' : 'cyanBright'}>●</Text>{' '}<Text bold>{codexSelected.label}</Text>{' '}<Text color={planColor(codexSelected.planType)}>{(codexSelected.planType ?? '').toUpperCase()}</Text></Text>
+                  {codexSelected.usage?.bucket ? (
+                    <>
+                      <Text>{'   5h  '}<Text color={utilColor(codexSelected.usage.bucket.primary?.usedPercent ?? null)}>{fmtPct(codexSelected.usage.bucket.primary?.usedPercent).padEnd(5)}</Text><Text dimColor>resets {resetAt(codexSelected.usage.bucket.primary?.resetsAt ? new Date(codexSelected.usage.bucket.primary.resetsAt * 1000).toISOString() : null)}</Text></Text>
+                      <Text>{'   7d  '}<Text color={utilColor(codexSelected.usage.bucket.secondary?.usedPercent ?? null)}>{fmtPct(codexSelected.usage.bucket.secondary?.usedPercent).padEnd(5)}</Text><Text dimColor>resets {resetAt(codexSelected.usage.bucket.secondary?.resetsAt ? new Date(codexSelected.usage.bucket.secondary.resetsAt * 1000).toISOString() : null)}</Text></Text>
+                      {codexSelected.usage.status === 'stale' ? <Text dimColor>{'   cached — live refresh unavailable'}</Text> : null}
+                    </>
+                  ) : codexSelected.needsReauth ? <Text color="red">{'   ⚠ login expired — press "a" to add the account again'}</Text> : <Text dimColor>{'   press u to load Codex usage'}</Text>}
+                </Box>
+              ) : null}
+              {codexLeast ? <Text><Text dimColor>most headroom: </Text><Text color="green">{codexLeast.label}</Text></Text> : null}
+            </Box>
+          </Box>
+        </Box>
+      )) : (
         <Box flexDirection="column">
           <Box width={W} justifyContent="space-between">
             <Text bold>
-              <Text color={CLAUDE_ORANGE}>Claude</Text> <Text color="white">Account Switch</Text>
+              <Text color={providerColor}>{providerName}</Text> <Text color="white">Account Switch</Text>
             </Text>
-            {active ? <Text dimColor>active: {active.label}</Text> : null}
+            {provider === 'claude' && active ? <Text dimColor>active: {active.label}</Text> : null}
+            {provider === 'codex' && codexActive ? <Text dimColor>active: {codexActive.label}</Text> : null}
           </Box>
           <Divider width={W} color="gray" />
         </Box>
@@ -1183,6 +1450,12 @@ function App({ initialStore, claudeVersion }: AppProps) {
             )}
           </Box>
         </Box>
+      ) : mode === 'codexAdding' ? (
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor={CODEX_GREEN} paddingX={1}>
+          <Text bold color={CODEX_GREEN}>Add Codex account</Text>
+          {codexAddLines.map((line, i) => <Text key={i} wrap="wrap">{line}</Text>)}
+          <Box marginTop={1}>{busy ? <Spinner label={busy} color={CODEX_GREEN} /> : null}</Box>
+        </Box>
       ) : mode === 'adding' ? (
         <Box width={W} flexDirection="column" borderStyle="round" borderColor={CLAUDE_ORANGE} paddingX={1}>
           <Text bold color="cyanBright">
@@ -1193,16 +1466,8 @@ function App({ initialStore, claudeVersion }: AppProps) {
               {l}
             </Text>
           ))}
-          {!addBusy ? (
-            <Box marginTop={1}>
-              <Text>
-                Code: <Text color="green">{buffer}</Text>
-                <Text>▎</Text>
-              </Text>
-            </Box>
-          ) : null}
           <Box marginTop={1}>
-            {addBusy ? <Spinner label="Working…" /> : <Text dimColor>Paste the code above, then Enter · Esc to cancel</Text>}
+            <Spinner label={addBusy ? 'Waiting for official Claude login…' : 'Finishing…'} />
           </Box>
         </Box>
       ) : mode === 'capturingDesktopConfirm' ? (
@@ -1300,6 +1565,12 @@ function App({ initialStore, claudeVersion }: AppProps) {
             <Text dimColor>↑/↓ select · ⏎ import · o open folder · r rescan · p type path · Esc back</Text>
           </Box>
         </Box>
+      ) : mode === 'codexImportPath' ? (
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor={CODEX_GREEN} paddingX={1}>
+          <Text bold color={CODEX_GREEN}>Import Codex account</Text>
+          <Text>Path: <Text color="green">{buffer}</Text><Text>▎</Text></Text>
+          <Box marginTop={1}><Text dimColor>Enter to import an auth.json or .codexswitch.json · Esc to cancel</Text></Box>
+        </Box>
       ) : mode === 'importPath' ? (
         <Box width={W} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
           <Text bold color="cyan">
@@ -1312,6 +1583,58 @@ function App({ initialStore, claudeVersion }: AppProps) {
           <Box marginTop={1}>
             <Text dimColor>Enter to import · Esc to go back</Text>
           </Box>
+        </Box>
+      ) : provider === 'codex' ? (
+        <Box flexDirection="column" marginTop={1}>
+          {codexProfiles.length === 0 ? (
+            <Box marginY={1}>
+              <Text dimColor>No Codex accounts yet. Press </Text><Text color={CODEX_GREEN}>a</Text><Text dimColor> to add one.</Text>
+            </Box>
+          ) : (
+            <>
+              <Text dimColor>
+                {'    '}{pad('ACCOUNT', 18)}{pad('LINKED', 8)}{pad('EMAIL', emailW)}{pad('PLAN', 6)}{pad('5-HOUR', 12)}{pad('7-DAY', 12)}{'LAST ACTIVE'}
+              </Text>
+              {codexProfiles.map((profile, i) => {
+                const isActive = profile.id === codexStore.activeProfileId;
+                const isCursor = i === codexCursor;
+                return (
+                  <Box key={profile.id}>
+                    <Text color={CODEX_GREEN} bold>{isCursor ? '❯ ' : '  '}</Text>
+                    <Text color={profile.needsReauth ? 'red' : isActive ? 'green' : 'gray'}>{profile.needsReauth ? '⚠' : isActive ? '●' : '○'}{' '}</Text>
+                    <Text bold={isCursor} color={profile.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(profile.label, 18)}</Text>
+                    <Text dimColor>{pad('APP+CLI', 8)}</Text>
+                    <Text dimColor>{pad(profile.email, emailW)}</Text>
+                    <Text color={planColor(profile.planType)}>{pad((profile.planType ?? '?').toUpperCase(), 6)}</Text>
+                    <UsageCell win={profile.usage?.bucket?.primary ? { utilization: profile.usage.bucket.primary.usedPercent } : null} />
+                    <UsageCell win={profile.usage?.bucket?.secondary ? { utilization: profile.usage.bucket.secondary.usedPercent } : null} />
+                    {isActive ? <Text color="green">{pad('in use', 11)}</Text> : <Text dimColor>{pad(relTime(profile.lastUsedAt), 11)}</Text>}
+                  </Box>
+                );
+              })}
+            </>
+          )}
+
+          {mode === 'codexConfirmSwitch' && pendingCodexSwitch ? (
+            <Box marginTop={1} flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
+              <Text bold color="yellow">Switch Codex to "{pendingCodexSwitch.label}" ({pendingCodexSwitch.email})?</Text>
+              <Text>Codex Desktop will be closed gracefully, validated, switched and reopened.</Text>
+              <Text dimColor>Running standalone Codex CLI sessions must be closed manually. No force-kill is used.</Text>
+              <Box marginTop={1}><Text color="yellow">[y/Enter]</Text><Text dimColor> confirm · [n/Esc] cancel</Text></Box>
+            </Box>
+          ) : null}
+
+          {mode === 'codexConfirmDelete' && codexSelected ? (
+            <Box marginTop={1} borderStyle="round" borderColor="red" paddingX={1}>
+              <Text color="red">Delete Codex profile "{codexSelected.label}" ({codexSelected.email})? [y] yes · [n] no</Text>
+            </Box>
+          ) : null}
+
+          {mode === 'codexRename' ? (
+            <Box marginTop={1} borderStyle="round" borderColor={CODEX_GREEN} paddingX={1}>
+              <Text>Rename Codex profile to: <Text color="green">{buffer}</Text><Text>▎</Text> <Text dimColor>(Enter to save · Esc to cancel)</Text></Text>
+            </Box>
+          ) : null}
         </Box>
       ) : (
         <Box flexDirection="column" marginTop={1}>
@@ -1434,11 +1757,19 @@ function App({ initialStore, claudeVersion }: AppProps) {
               <Text color="cyan">↑/↓</Text> move · <Text color="cyan">⏎</Text> switch · <Text color="cyan">b</Text>{' '}
               best-now · <Text color="cyan">l</Text> least-loaded · <Text color="cyan">u</Text> refresh
             </Text>
-            <Text dimColor>
-              <Text color="cyan">a</Text> add · <Text color="cyan">A</Text> add Desktop · <Text color="cyan">i</Text> import ·{' '}
-              <Text color="cyan">e</Text> export · <Text color="cyan">E</Text> export-all · <Text color="cyan">r</Text> rename ·{' '}
-              <Text color="cyan">d</Text> delete · <Text color="cyan">S</Text> setup · <Text color="cyan">q</Text> quit
-            </Text>
+            {provider === 'claude' ? (
+              <Text dimColor>
+                <Text color="cyan">a</Text> add · <Text color="cyan">A</Text> add Desktop · <Text color="cyan">i</Text> import ·{' '}
+                <Text color="cyan">e</Text> export · <Text color="cyan">E</Text> export-all · <Text color="cyan">r</Text> rename ·{' '}
+                <Text color="cyan">d</Text> delete · <Text color="cyan">S</Text> setup · <Text color="cyan">q</Text> quit
+              </Text>
+            ) : (
+              <Text dimColor>
+                <Text color={CODEX_GREEN}>a</Text> add · <Text color={CODEX_GREEN}>i</Text> import · <Text color={CODEX_GREEN}>e</Text> export ·{' '}
+                <Text color={CODEX_GREEN}>E</Text> export-all · <Text color={CODEX_GREEN}>r</Text> rename · <Text color={CODEX_GREEN}>d</Text> delete ·{' '}
+                <Text color={CODEX_GREEN}>S</Text> setup · <Text color={CODEX_GREEN}>q</Text> quit
+              </Text>
+            )}
           </>
         ) : null}
         <Text dimColor>log: {logFile()}</Text>
@@ -1450,14 +1781,14 @@ function App({ initialStore, claudeVersion }: AppProps) {
 // ---------- non-interactive commands + entry ----------
 
 function printHelp(): void {
-  console.log(`Claude Account Switch
+  console.log(`Claude + Codex Account Switch
 
 Usage:
   switch.cmd                 Launch the interactive account switcher (TUI)
-  switch.cmd login           Add an account via the official 'claude' login (fallback)
-  switch.cmd import <path>   Import account(s) from a file or folder
-  switch.cmd export-all      Export ALL accounts into one portable backup file
-  switch.cmd doctor          Diagnose saved accounts and live Claude auth (no secrets)
+  switch.cmd login [provider] Add an account via the official Claude/Codex login
+  switch.cmd import [--provider claude|codex] <path>
+  switch.cmd export-all [claude|codex]
+  switch.cmd doctor [all|claude|codex]  Diagnose accounts without printing secrets
   switch.cmd --dry-run       Show exactly which keys a switch would change (no writes)
   switch.cmd restore         Roll back the last credential change from backup
   switch.cmd install         Set up shortcuts + auto keep-alive (feels like a real app)
@@ -1491,12 +1822,12 @@ function relMs(ms: number | null): string {
 
 function usageAge(p: Profile): string {
   if (!p.usage?.fetchedAt) return 'none';
-  return `${p.usage.status}, ${relMs(p.usage.fetchedAt)} old`;
+  return `${p.usage.status}, fetched ${relMs(p.usage.fetchedAt)}`;
 }
 
-function printDoctor(): void {
+function printClaudeDoctor(): void {
   const store = loadStore();
-  console.log(`Claude Account Switch doctor`);
+  console.log(`Claude provider`);
   console.log(`Claude Code version: ${detectClaudeVersion()}`);
   console.log(`Profiles: ${store.profiles.length}`);
   console.log(`Active profile id: ${store.activeProfileId ?? '(none)'}`);
@@ -1528,6 +1859,28 @@ function printDoctor(): void {
   }
 }
 
+async function printCodexDoctor(): Promise<void> {
+  const store = loadCodexStore();
+  console.log(`Codex`);
+  console.log(`Codex version: ${detectCodexVersion()}`);
+  console.log(`Profiles: ${store.profiles.length}`);
+  console.log(`Active profile id: ${store.activeProfileId ?? '(none)'}`);
+  try {
+    const live = await inspectCodexHome(codexHome(), false);
+    console.log(`Live account: ${live.account?.type === 'chatgpt' ? `${live.account.email ?? '(unknown)'} (${live.account.planType ?? 'unknown plan'})` : 'not logged in with ChatGPT'}`);
+  } catch (e) {
+    console.log(`Live account: unavailable (${String((e as Error).message ?? e)})`);
+  }
+  console.log('Saved profiles:');
+  for (const profile of store.profiles) {
+    const bucket = profile.usage?.bucket;
+    const flags = [profile.id === store.activeProfileId ? 'active' : null, profile.needsReauth ? 'needs re-add' : null]
+      .filter(Boolean).join(', ') || 'saved';
+    console.log(`  - ${profile.label} <${profile.email}> [${flags}] plan=${profile.planType ?? 'unknown'}`);
+    console.log(`    usage: ${profile.usage?.status ?? 'never'}; 5h=${bucket?.primary?.usedPercent ?? '?'}%; 7d=${bucket?.secondary?.usedPercent ?? '?'}%`);
+  }
+}
+
 function printDryRun(target: Profile, rep: DryRunReport): void {
   console.log(`Dry-run: simulate switching to "${target.label}" (${target.email})\n`);
   console.log('.credentials.json');
@@ -1547,7 +1900,7 @@ function printDryRun(target: Profile, rep: DryRunReport): void {
  * session if one is live (it manages its own token); otherwise we reconcile + refresh it too.
  */
 async function runKeepAliveOnce(): Promise<void> {
-  const store = loadStore();
+  let store = loadStore();
   if (!store.profiles.length) {
     console.log('keep-alive: no accounts saved.');
     return;
@@ -1559,11 +1912,21 @@ async function runKeepAliveOnce(): Promise<void> {
   } catch {
     /* treat as not running */
   }
+  if (!claudeRunning && getActive(store)) {
+    try {
+      store = mutateStore((fresh) => {
+        reconcileWithLive(fresh);
+      });
+    } catch {
+      /* continue with saved credentials */
+    }
+  }
   const onRotate = (p: Profile) => {
-    saveStore(store);
-    if (p.id === store.activeProfileId && hasCliAuth(p) && !p.needsReauth) {
+    const fresh = loadStore();
+    const persisted = fresh.profiles.find((candidate) => candidate.id === p.id) ?? p;
+    if (persisted.id === fresh.activeProfileId && hasCliAuth(persisted) && !persisted.needsReauth) {
       try {
-        updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
+        updateLiveCredentials(persisted.claudeAiOauth, persisted.organizationUuidRoot ?? persisted.organizationUuid);
       } catch {
         /* ignore */
       }
@@ -1579,19 +1942,12 @@ async function runKeepAliveOnce(): Promise<void> {
     if (!hasCliAuth(p)) continue;
     const isActive = p.id === store.activeProfileId;
     if (isActive && claudeRunning) continue; // the live session owns its own token
-    if (isActive) {
-      try {
-        reconcileWithLive(store);
-      } catch {
-        /* keep going */
-      }
-    }
     const before = p.claudeAiOauth.refreshToken;
     await keepTokenAlive(p, LEAD_MS, onRotate);
     if (p.claudeAiOauth.refreshToken !== before) refreshed++;
     if (p.needsReauth) dead++;
   }
-  saveStore(store);
+  store = loadStore();
   logger.info('keep-alive run complete', { refreshed, dead, total: store.profiles.length });
   console.log(`keep-alive: refreshed ${refreshed} token(s)${dead ? `, ${dead} account(s) need re-add` : ''}.`);
 }
@@ -1612,8 +1968,17 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === 'codex-switch-worker' && args[1] && args[2]) {
+    await runCodexSwitchWorker(args[1], args[2]);
+    return;
+  }
+
   if (args[0] === 'doctor') {
-    printDoctor();
+    const scope = args[1] ?? 'all';
+    console.log('Claude + Codex Account Switch doctor\n');
+    if (scope === 'all' || scope === 'claude') printClaudeDoctor();
+    if (scope === 'all') console.log('');
+    if (scope === 'all' || scope === 'codex') await printCodexDoctor();
     return;
   }
 
@@ -1646,44 +2011,83 @@ async function main(): Promise<void> {
       return;
     }
     await runKeepAliveOnce();
+    try {
+      const codexRunning = findCodexProcesses().length > 0;
+      const codex = await refreshAllCodexProfiles({ refreshLiveActive: !codexRunning });
+      const dead = codex.profiles.filter((profile) => profile.needsReauth).length;
+      console.log(`codex keep-alive: checked ${codex.profiles.length} account(s)${dead ? `, ${dead} need re-add` : ''}.`);
+    } catch (e) {
+      console.log(`codex keep-alive failed: ${String((e as Error).message ?? e)}`);
+    }
     return;
   }
 
   if (args[0] === 'login') {
+    if (args[1] === 'codex') {
+      console.log('Starting official Codex ChatGPT login...\n');
+      const result = await addCodexAccount((url) => {
+        console.log(`Open this URL if the browser does not open automatically:\n${url}\n`);
+        openUrl(url);
+      });
+      console.log(`Added Codex account "${result.profile.label}" (${result.profile.email}).`);
+      return;
+    }
     console.log('Starting official claude login in an isolated sandbox...\n');
     const ident = await loginViaClaudeCli(findClaudeExe());
     if (!ident || !hasRefreshableOauth(ident.claudeAiOauth)) {
       console.log('\nLogin did not complete. Nothing imported.');
       return;
     }
-    const store = loadStore();
     const fields = identityToFields(ident);
-    const p = addOrUpdateProfile(store, fields);
-    saveStore(store);
+    let p: Profile | undefined;
+    mutateStore((store) => {
+      p = addOrUpdateProfile(store, fields);
+    });
+    if (!p) throw new Error('Claude account was not imported after login.');
     console.log(`\n✓ Added "${p.label}" (${p.email}). Launch the switcher to use it.`);
     return;
   }
 
-  if (args[0] === 'import' && args[1]) {
-    const cands = importFromPath(args[1]);
-    if (!cands.length) {
-      console.log(`Nothing importable at: ${args[1]}`);
+  if (args[0] === 'import') {
+    const providerArg = args[1] === '--provider' ? args[2] : args[1] === 'codex' || args[1] === 'claude' ? args[1] : 'claude';
+    const target = args[1] === '--provider' ? args[3] : args[1] === 'codex' || args[1] === 'claude' ? args[2] : args[1];
+    if (!target) {
+      console.log('Import path is required.');
       return;
     }
-    const store = loadStore();
-    for (const c of cands) {
-      try {
-        const p = addOrUpdateProfile(store, c.fields, c.label);
-        console.log(`Imported "${p.label}" (${p.email})`);
-      } catch (e) {
-        console.log(`Skipped invalid account from ${c.source}: ${(e as Error).message}`);
-      }
+    if (providerArg === 'codex') {
+      const imported = importCodexFromPath(target);
+      for (const profile of imported) console.log(`Imported Codex "${profile.label}" (${profile.email})`);
+      return;
     }
-    saveStore(store);
+    const cands = importFromPath(target);
+    if (!cands.length) {
+      console.log(`Nothing importable at: ${target}`);
+      return;
+    }
+    mutateStore((store) => {
+      for (const c of cands) {
+        try {
+          const p = addOrUpdateProfile(store, c.fields, c.label);
+          console.log(`Imported "${p.label}" (${p.email})`);
+        } catch (e) {
+          console.log(`Skipped invalid account from ${c.source}: ${(e as Error).message}`);
+        }
+      }
+    });
     return;
   }
 
   if (args[0] === 'export-all') {
+    if (args[1] === 'codex') {
+      const codexStore = loadCodexStore();
+      if (!codexStore.profiles.length) {
+        console.log('No Codex accounts to export.');
+        return;
+      }
+      console.log(`Exported ${codexStore.profiles.length} Codex account(s) to:\n${exportAllCodexProfiles(codexStore)}`);
+      return;
+    }
     const store = loadStore();
     if (!store.profiles.length) {
       console.log('No accounts to export.');
@@ -1695,30 +2099,29 @@ async function main(): Promise<void> {
   }
 
   // Load + reconcile with the live account before doing anything interactive.
-  const store = loadStore();
+  let store = loadStore();
   const claudeVersion = detectClaudeVersion();
-  store.claudeVersion = claudeVersion;
   try {
-    reconcileWithLive(store);
+    store = mutateStore((fresh) => {
+      fresh.claudeVersion = claudeVersion;
+      reconcileWithLive(fresh);
+      for (const p of fresh.profiles) {
+        if (!p.subscriptionType && p.claudeAiOauth) {
+          const derived = subscriptionOf(p.claudeAiOauth, p.organizationType);
+          if (derived) p.subscriptionType = derived;
+        }
+      }
+    });
   } catch (e) {
     logger.error('startup reconcile failed', e);
   }
-  // Backfill any profile saved before the plan-detection fix (e.g. subscriptionType
-  // was missing right after the manual add-account flow) using organizationType.
-  for (const p of store.profiles) {
-    if (!p.subscriptionType && p.claudeAiOauth) {
-      const derived = subscriptionOf(p.claudeAiOauth, p.organizationType);
-      if (derived) p.subscriptionType = derived;
-    }
-    // A needsReauth flag can get stuck true from a transient invalid_grant (e.g. a
-    // refresh-token rotation race with a live `claude` session) even after the token
-    // is valid again. Validate it right away instead of waiting on the lazy,
-    // usage-cache-gated refresh path — otherwise the UI shows stale red for minutes.
-    if (p.needsReauth && hasCliAuth(p) && p.claudeAiOauth.expiresAt > Date.now() + 60_000) {
-      p.needsReauth = false;
-    }
+
+  let codexStore = loadCodexStore();
+  try {
+    codexStore = (await reconcileLiveCodex()).store;
+  } catch (e) {
+    logger.warn('startup Codex reconcile failed', { error: String(e) });
   }
-  saveStore(store);
 
   if (args.includes('--dry-run')) {
     const target = store.profiles.find((p) => p.id !== store.activeProfileId) ?? getActive(store);
@@ -1730,7 +2133,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  render(<App initialStore={store} claudeVersion={claudeVersion} />);
+  render(<App initialStore={store} initialCodexStore={codexStore} claudeVersion={claudeVersion} />);
 }
 
 main().catch((e) => {

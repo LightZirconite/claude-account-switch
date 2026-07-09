@@ -1,6 +1,6 @@
 @echo off
 setlocal
-rem Launch the Claude Account Switcher from anywhere (path-independent).
+rem Launch the Claude + Codex Account Switcher from anywhere (path-independent).
 cd /d "%~dp0"
 
 if not exist "node_modules" (

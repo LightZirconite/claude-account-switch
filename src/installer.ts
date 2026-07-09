@@ -8,7 +8,8 @@ import { spawnSync } from 'node:child_process';
 import { dataDir, ensureDataDirs } from './paths';
 import { logger } from './logger';
 
-export const APP_NAME = 'Claude Account Switch';
+export const APP_NAME = 'Claude + Codex Account Switch';
+const LEGACY_APP_NAME = 'Claude Account Switch';
 const TASK_ID = 'ClaudeAccountSwitch-KeepAlive'; // Windows task / launchd label / cron marker
 const KEEPALIVE_INTERVAL_HOURS = 6;
 
@@ -113,6 +114,8 @@ function winShortcutsInstall(): StepResult {
     `$dirs = @($W.SpecialFolders.Item('Desktop'), $W.SpecialFolders.Item('Programs'))`,
     `foreach ($d in $dirs) {`,
     `  if (-not $d) { continue }`,
+    `  $old = Join-Path $d ${psQuote(LEGACY_APP_NAME + '.lnk')}`,
+    `  if (Test-Path $old) { Remove-Item -Force $old }`,
     `  $lnk = Join-Path $d ${psQuote(APP_NAME + '.lnk')}`,
     `  $s = $W.CreateShortcut($lnk)`,
     `  $s.TargetPath = ${psQuote(target)}`,
@@ -130,8 +133,10 @@ function winShortcutsUninstall(): StepResult {
     `$W = New-Object -ComObject WScript.Shell`,
     `foreach ($d in @($W.SpecialFolders.Item('Desktop'), $W.SpecialFolders.Item('Programs'))) {`,
     `  if (-not $d) { continue }`,
-    `  $lnk = Join-Path $d ${psQuote(APP_NAME + '.lnk')}`,
-    `  if (Test-Path $lnk) { Remove-Item -Force $lnk }`,
+    `  foreach ($name in @(${psQuote(APP_NAME + '.lnk')}, ${psQuote(LEGACY_APP_NAME + '.lnk')})) {`,
+    `    $lnk = Join-Path $d $name`,
+    `    if (Test-Path $lnk) { Remove-Item -Force $lnk }`,
+    `  }`,
     `}`,
   ].join('\n');
   run('powershell', ['-NoProfile', '-NonInteractive', '-Command', script]);
@@ -182,6 +187,7 @@ function macShortcutsInstall(): StepResult {
   const cmd = macCommandPath();
   const body = `#!/bin/bash\ncd ${JSON.stringify(cwd)}\n${JSON.stringify(exe)} ${args.map((a) => JSON.stringify(a)).join(' ')}\n`;
   try {
+    fs.rmSync(path.join(os.homedir(), 'Desktop', `${LEGACY_APP_NAME}.command`), { force: true });
     fs.writeFileSync(cmd, body, { mode: 0o755 });
     fs.chmodSync(cmd, 0o755);
     return { name: 'Desktop launcher (.command)', ok: true, detail: 'created' };
@@ -192,6 +198,7 @@ function macShortcutsInstall(): StepResult {
 function macShortcutsUninstall(): StepResult {
   try {
     if (fs.existsSync(macCommandPath())) fs.unlinkSync(macCommandPath());
+    fs.rmSync(path.join(os.homedir(), 'Desktop', `${LEGACY_APP_NAME}.command`), { force: true });
   } catch {
     /* ignore */
   }
@@ -218,10 +225,10 @@ function linuxSchedulerUninstall(): StepResult {
   run('crontab', ['-'], lines.length ? lines.join('\n') + '\n' : '\n');
   return { name: 'Auto keep-alive (cron)', ok: true, detail: 'removed' };
 }
-function linuxDesktopFiles(): string[] {
+function linuxDesktopFiles(appName = APP_NAME): string[] {
   return [
     path.join(os.homedir(), '.local', 'share', 'applications', `${TASK_ID}.desktop`),
-    path.join(os.homedir(), 'Desktop', `${APP_NAME}.desktop`),
+    path.join(os.homedir(), 'Desktop', `${appName}.desktop`),
   ];
 }
 function linuxShortcutsInstall(): StepResult {
@@ -230,13 +237,14 @@ function linuxShortcutsInstall(): StepResult {
   const content = `[Desktop Entry]
 Type=Application
 Name=${APP_NAME}
-Comment=Switch between Claude Code accounts
+Comment=Switch between Claude Code and Codex accounts
 Exec=${execLine}
 Path=${cwd}
 Terminal=true
 Categories=Utility;Development;
 `;
   let ok = false;
+  fs.rmSync(path.join(os.homedir(), 'Desktop', `${LEGACY_APP_NAME}.desktop`), { force: true });
   for (const f of linuxDesktopFiles()) {
     try {
       fs.mkdirSync(path.dirname(f), { recursive: true });
@@ -250,7 +258,7 @@ Categories=Utility;Development;
   return { name: 'App menu + Desktop shortcut (.desktop)', ok, detail: ok ? 'created' : 'could not write .desktop files' };
 }
 function linuxShortcutsUninstall(): StepResult {
-  for (const f of linuxDesktopFiles()) {
+  for (const f of [...linuxDesktopFiles(), path.join(os.homedir(), 'Desktop', `${LEGACY_APP_NAME}.desktop`)]) {
     try {
       if (fs.existsSync(f)) fs.unlinkSync(f);
     } catch {

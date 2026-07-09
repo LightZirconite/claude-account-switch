@@ -1,139 +1,137 @@
-# Claude Account Switch
+# Claude + Codex Account Switch
 
-A fast, keyboard-driven TUI to switch between multiple **Claude Code** accounts —
-a *true* switch, with **no re-authorization on the website** each time. Keep several
-accounts loaded, see each plan and live usage/quota, and jump between them instantly.
+A keyboard-driven TUI for keeping independent sets of **Claude Code** and **Codex**
+ChatGPT accounts. Use `Left` and `Right` to change provider, inspect cached/live quotas,
+and switch only the selected provider's authentication.
 
-![Claude Account Switch preview](preview.png)
+![Claude + Codex Account Switch preview](preview.png)
 
-> ⚠️ **Unofficial.** Not affiliated with, or endorsed by, Anthropic. It reads and writes
-> the same local credential files Claude Code already uses. The "add account" OAuth flow
-> and the usage endpoint rely on **reverse-engineered** behavior that may change at any
-> time. Use with accounts **you own**, at your own risk.
+> **Unofficial.** This project is not affiliated with Anthropic or OpenAI. Claude account
+> creation uses the official Claude CLI; Codex authentication and quotas use the official
+> Codex App Server. Claude's quota endpoint remains undocumented and is therefore
+> best-effort. Use only accounts you own.
 
-## How it works
+## Provider isolation
 
-A logged-in Claude account is really two blobs on disk:
+| Behavior | Claude | Codex |
+| --- | --- | --- |
+| Active credentials | Claude credential/config files | `~/.codex/auth.json` only |
+| Add account | isolated `claude auth login` | App Server `account/login/start` |
+| Identity | Claude live files/status | App Server `account/read` + `account_id` |
+| Quotas | cached best-effort Claude usage | App Server `account/rateLimits/read` |
+| Maintenance | serialized OAuth rotation | forced App Server token refresh |
+| Shared data | Claude projects/settings preserved | all of `~/.codex` except `auth.json` preserved |
 
-- `~/.claude/.credentials.json` → `claudeAiOauth` (the OAuth tokens + plan)
-- `~/.claude.json` → `oauthAccount` (+ root `userID`) (identity metadata)
-
-This tool snapshots those into named **profiles** and swaps them in on demand.
-Everything else in your Claude config (MCP tokens, projects, settings) is preserved.
-Every change is **backed up first and validated, with automatic rollback** if anything
-looks wrong. `~/.claude.json` is edited surgically so nothing else in it is touched.
-
-Because the OAuth tokens aren't tied to the machine, you can also **move accounts
-between PCs** (see Import/Export) — no need to install this tool on the other machine.
+Claude and Codex have separate stores, active profile IDs, credentials, tombstones and
+locks. A Codex operation never writes Claude files, and a Claude operation never writes
+`~/.codex`.
 
 ## Setup
 
-Requires [Node.js](https://nodejs.org) 20+.
+Requires Node.js 20+ and the official Claude/Codex CLIs for the providers you use.
 
-```
-setup.cmd        # npm install + build (first run only)
-switch.cmd       # launch the switcher (also auto-builds on first run)
-```
-
-On the very first launch the switcher offers a **one-click setup** (press `i`): it adds a
-Desktop + menu shortcut and schedules an automatic **keep-alive** so saved access tokens
-are refreshed before access expiry, even when the app is closed. You can open this any time with `S`, or from
-the command line:
-
-```
-switch.cmd install     # shortcuts + auto keep-alive (Windows, macOS & Linux)
-switch.cmd uninstall   # remove them again (never touches your accounts)
+```text
+setup.cmd        # install dependencies and build
+switch.cmd       # launch; also builds automatically when needed
 ```
 
-### Never silently lose an account
+On first launch, the setup screen can create Desktop/menu shortcuts and schedule a
+cross-platform maintenance run every six hours. Open it later with `S`.
 
-Once added, an account should never disappear from the switcher. The switcher keeps each
-account's OAuth access token refreshed before access expiry (in-app every 10 min, and via
-the scheduled job every 6 h even when closed), serializes refreshes across processes, and
-refuses to overwrite a newer token with a stale in-memory copy. Anthropic can still revoke
-or expire the underlying login; when that happens, the account remains listed and is marked
-for re-authentication instead of being deleted. Your `profiles.json` is mirrored to a
-last-known-good copy on every save and auto-recovered if it's ever corrupted, so a crash or
-power cut can't wipe your accounts.
+```text
+switch.cmd install
+switch.cmd uninstall
+```
 
 ## Keys
 
+The account actions apply only to the visible provider.
+
 | Key | Action |
 | --- | --- |
-| ↑/↓ | move selection |
+| Left/Right | switch between Claude and Codex tabs |
+| Up/Down | move that provider's independent cursor |
 | Enter | switch to the selected account |
-| b | best-now: switch straight to the account with the most headroom |
-| a | add an account (copies the login URL; you authorize, then paste the code) |
-| i | import an account from files (another PC) |
-| e | export the selected account to a portable file |
-| E | export ALL accounts into one file (full backup / whole-PC migration) |
+| a | add or re-authorize through the provider's official login |
+| i | import provider-tagged credentials |
+| e / E | export selected / all accounts for the visible provider |
 | r | rename the selected account |
-| l | highlight the least-loaded account |
-| u | refresh usage/quota for all accounts |
-| d | delete the selected account |
-| S | setup: install/remove shortcuts + auto keep-alive |
+| d | delete the selected non-active account |
+| l | highlight the account with the most quota headroom |
+| b | switch to the account with the most quota headroom |
+| u | refresh quotas for the visible provider |
+| S | setup shortcuts and scheduled maintenance |
 | q | quit |
 
-Switching optionally auto-closes running `claude` CLI processes (toggle on the confirm
-screen with `c`) so the next launch uses the new account — **this switcher stays open**.
-In VS Code, run **Developer: Reload Window** afterwards (or it applies on your next
-message). The header shows the active account's 5-hour / 7-day usage with local reset
-times, and "most headroom" to pick the freshest account.
+Codex switching is performed by a detached worker. It validates the target first, refuses
+to continue while a Codex CLI is active, asks the desktop app to close gracefully, swaps
+`auth.json` atomically, validates the result through App Server, and rolls back on failure.
+No process is force-killed.
 
-## Import an account from another PC
+## Reliability model
 
-You don't need this tool on the other computer. On the source PC, either:
+- OAuth refreshes are single-flight in-process and locked across processes.
+- A rotated token is persisted before its account lock is released.
+- The active Claude account is reconciled to disk before any refresh, preventing a live
+  Claude session from racing a stale cached refresh token.
+- Stores use atomic writes, last-known-good mirrors, account-set snapshots and deletion
+  tombstones. A stale writer cannot silently remove or resurrect a profile.
+- Last known quotas remain visible as `stale` when a live refresh fails.
+- Each Claude/Codex account has a separate credential envelope under
+  `~/.claude-switch/credentials/`.
 
-- Run this tool there and press **e** (export) to get a small `*.ccswitch.json` file, **or**
-- Copy `~/.claude/.credentials.json` **and** `~/.claude.json`.
-
-On this PC, press **i** — it shows the exact steps, opens the drop folder
-(`~/.claude-switch/import/`) with **o**, rescans with **r**, and imports. You're logged
-in — no web login.
+Maintenance cannot guarantee a login forever. Anthropic documents a finite Claude login
+lifetime, and either provider may revoke a login server-side. In those cases the local
+profile and cached quota remain present, but the row is marked for re-authentication.
 
 ## Command line
 
-```
-switch.cmd login          # add an account via the official `claude` login (robust fallback)
-switch.cmd import <path>   # import from a file or folder
-switch.cmd doctor          # diagnose saved accounts + live Claude auth (no secrets)
-switch.cmd --dry-run       # show exactly which keys a switch would change (no writes)
-switch.cmd restore         # roll back the last credential change from backup
-switch.cmd install         # set up shortcuts + auto keep-alive
-switch.cmd uninstall       # remove shortcuts + the scheduled keep-alive
-switch.cmd keep-alive      # refresh due tokens now and report accounts needing renewal
+```text
+switch.cmd login claude
+switch.cmd login codex
+switch.cmd import --provider claude <path>
+switch.cmd import --provider codex <path>
+switch.cmd export-all claude
+switch.cmd export-all codex
+switch.cmd doctor all
+switch.cmd keep-alive
+switch.cmd --dry-run
+switch.cmd restore
 switch.cmd --help
 ```
 
-## Files, logs & privacy
+`doctor all` reports both providers without printing tokens. `keep-alive` runs Claude and
+Codex sequentially, while each provider/account still uses its own lock.
 
-Everything lives in `~/.claude-switch/` (outside this repo — **never committed**):
+## Files and privacy
 
-- `profiles.json` — your saved accounts (plain JSON, **no encryption** — keep it private)
-- `profiles.json.bak` — last-known-good mirror, used to auto-recover a corrupted `profiles.json`
-- `backups/<timestamp>/` — the live Claude files, backed up before every switch
-- `backups/profiles/` — a snapshot of `profiles.json` before every account change
-  (add / delete / rename), last 40 kept — so an account can never be lost
-- `logs/switch.log` — full activity log (tokens are always **redacted**)
-- `import/`, `exports/` — transfer folders
+Everything managed by the switcher lives under `~/.claude-switch/`:
 
-Nothing is ever uploaded anywhere. Tokens only travel to Anthropic's own endpoints
-(the same ones Claude Code uses).
+- `profiles.json` / `.bak`: Claude metadata, active account and tombstones (no OAuth token)
+- `codex-profiles.json` / `.bak`: Codex metadata, active account and tombstones
+- `credentials/claude/<id>/credentials.json`: one Claude OAuth envelope per account
+- `credentials/codex/<id>/auth.json`: one Codex ChatGPT auth file per account
+- `backups/`: account-set, deleted-account and pre-switch rollback snapshots
+- `logs/switch.log`: activity log with secret values redacted
+- `import/` and `exports/`: portable files containing secrets; protect them like passwords
 
-## Notes & caveats
+Credential envelopes are plain JSON protected by user-directory permissions, not
+application-level encryption. Never commit or share them. Existing v1 files and backups
+are migrated atomically and retained for recovery.
 
-- If the native "add account" ever fails (endpoints changed), use `switch.cmd login`.
-- The usage endpoint is undocumented and aggressively rate-limited; values are cached ~10 min.
-- Quota is shared per organization; "least-loaded" ranks by organization.
-- Cross-platform: Windows & Linux use the plain credential files; **macOS** reads/writes
-  the Keychain entry Claude Code uses (`Claude Code-credentials`). Profiles are always
-  stored as plain JSON — no encryption.
-- An account whose refresh token has expired is flagged with a red ⚠; press `a` on it to
-  re-authorize just that account.
+## Development
 
-## License & credits
+```text
+npm test
+npm run typecheck
+npm run build
+switch.cmd doctor all
+```
+
+The test suite covers legacy three-profile recovery, credential extraction, concurrent
+mutations, tombstones, provider isolation, cursor independence and Codex auth rollback.
+
+## License
 
 Created by **LightZirconite**. Licensed under the
-[PolyForm Noncommercial License 1.0.0](LICENSE): free to use, modify, and share for
-**noncommercial** purposes, but you **may not sell it or use it commercially**, and you
-**must keep the attribution** to the original author. Please don't rebrand it as your own.
+[PolyForm Noncommercial License 1.0.0](LICENSE). Attribution must be retained.

@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { profilesPath, ensureDataDirs, exportDir, importDir, backupsDir } from './paths';
+import { claudeProfileCredentialsPath, profilesPath, ensureDataDirs, exportDir, importDir, backupsDir } from './paths';
 import { getLiveAccount } from './claudeStore';
 import { snapshotLiveDesktopInto, newDesktopProfileId, deleteDesktopSnapshot } from './desktopStore';
 import { logger } from './logger';
@@ -23,16 +23,106 @@ function lastGoodPath(): string {
   return profilesPath() + '.bak';
 }
 
+const STORE_VERSION = 3;
+
+interface ClaudeCredentialEnvelope {
+  kind: 'claude-codex-account-switch/claude-credentials';
+  version: 1;
+  provider: 'claude';
+  profileId: string;
+  updatedAt: number;
+  claudeAiOauth: ClaudeAiOauth;
+}
+
+function isClaudeCredentialBlock(value: unknown): value is ClaudeAiOauth {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  return 'accessToken' in record || 'refreshToken' in record || 'expiresAt' in record || 'refreshTokenExpiresAt' in record;
+}
+
+function readCredentialEnvelope(profileId: string): ClaudeCredentialEnvelope | null {
+  for (const file of [claudeProfileCredentialsPath(profileId), `${claudeProfileCredentialsPath(profileId)}.bak`]) {
+    try {
+      const envelope = JSON.parse(fs.readFileSync(file, 'utf8')) as ClaudeCredentialEnvelope;
+      if (
+        envelope?.kind === 'claude-codex-account-switch/claude-credentials'
+        && envelope.provider === 'claude'
+        && envelope.profileId === profileId
+        && isClaudeCredentialBlock(envelope.claudeAiOauth)
+      ) return envelope;
+    } catch {
+      /* try the mirrored envelope */
+    }
+  }
+  return null;
+}
+
+function hydrateCredentialEnvelopes(store: ProfilesStore): void {
+  for (const profile of store.profiles) {
+    // Legacy stores carry the credential inline and are migrated on the next save.
+    if (isClaudeCredentialBlock(profile.claudeAiOauth)) continue;
+    const envelope = readCredentialEnvelope(profile.id);
+    if (envelope) profile.claudeAiOauth = envelope.claudeAiOauth;
+  }
+}
+
 /** Parse + normalize store text, or null if it isn't a usable store. */
 function parseStore(text: string): ProfilesStore | null {
   try {
     const s = JSON.parse(text) as ProfilesStore;
     if (!s || typeof s !== 'object' || !Array.isArray(s.profiles)) return null;
     if (typeof s.version !== 'number') s.version = 1;
+    s.revision = Number.isFinite(s.revision) ? s.revision : 0;
+    s.tombstones = Array.isArray(s.tombstones) ? s.tombstones : [];
+    for (const p of s.profiles) {
+      p.provider = 'claude';
+      p.updatedAt = Number.isFinite(p.updatedAt) ? p.updatedAt : p.createdAt;
+    }
+    s.activeProfileIds = {
+      claude: s.activeProfileIds?.claude ?? s.activeProfileId ?? null,
+      codex: s.activeProfileIds?.codex ?? null,
+    };
+    s.activeProfileId = s.activeProfileIds.claude;
+    hydrateCredentialEnvelopes(s);
     return s;
   } catch {
     return null;
   }
+}
+
+/** Largest recent v1 snapshot. This recovers rows lost by stale pre-v2 processes. */
+function bestLegacyBackup(): ProfilesStore | null {
+  try {
+    const dir = path.join(backupsDir(), 'profiles');
+    const candidates = fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith('.json'))
+      .sort()
+      .reverse()
+      .map((f) => parseStore(fs.readFileSync(path.join(dir, f), 'utf8')))
+      .filter((s): s is ProfilesStore => !!s);
+    return candidates.sort((a, b) => b.profiles.length - a.profiles.length || (b.revision ?? 0) - (a.revision ?? 0))[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function migrateLegacyStore(store: ProfilesStore): { store: ProfilesStore; changed: boolean } {
+  if (store.version >= 2) return { store, changed: store.version < STORE_VERSION };
+  const backup = bestLegacyBackup();
+  if (backup) {
+    for (const candidate of backup.profiles) {
+      if (!store.profiles.some((p) => sameAccount(p, candidate))) {
+        store.profiles.push(candidate);
+        logger.warn('migration recovered missing legacy profile', { email: candidate.email });
+      }
+    }
+  }
+  store.version = STORE_VERSION;
+  store.revision = (store.revision ?? 0) + 1;
+  store.tombstones = store.tombstones ?? [];
+  store.activeProfileIds = { claude: store.activeProfileId, codex: null };
+  return { store, changed: true };
 }
 
 /** Newest snapshot in backups/profiles/ that parses and still has ≥1 account. */
@@ -81,7 +171,11 @@ export function loadStore(): ProfilesStore {
 
   if (mainText != null) {
     const s = parseStore(mainText);
-    if (s) return s; // normal, healthy path
+    if (s) {
+      const migrated = migrateLegacyStore(s);
+      if (migrated.changed || mainText.includes('"claudeAiOauth"')) saveStore(migrated.store);
+      return migrated.store;
+    }
     logger.error('profiles.json is corrupt — attempting recovery', undefined, { path: profilesPath() });
   }
 
@@ -92,7 +186,7 @@ export function loadStore(): ProfilesStore {
       if (mainText != null) setCorruptAside();
       logger.warn('recovered profiles from last-known-good sidecar', { count: s.profiles.length });
       saveStore(s);
-      return s;
+      return migrateLegacyStore(s).store;
     }
   } catch {
     /* no sidecar */
@@ -104,7 +198,7 @@ export function loadStore(): ProfilesStore {
     if (mainText != null) setCorruptAside();
     logger.warn('recovered profiles from backup snapshot', { count: backup.profiles.length });
     saveStore(backup);
-    return backup;
+    return migrateLegacyStore(backup).store;
   }
 
   // 3) nothing to recover — if the main file was non-empty garbage, keep it aside.
@@ -112,7 +206,14 @@ export function loadStore(): ProfilesStore {
     logger.error('profiles.json corrupt and unrecoverable — kept aside, starting empty');
     setCorruptAside();
   }
-  return { version: 1, activeProfileId: null, profiles: [] };
+  return {
+    version: STORE_VERSION,
+    revision: 0,
+    activeProfileId: null,
+    activeProfileIds: { claude: null, codex: null },
+    tombstones: [],
+    profiles: [],
+  };
 }
 
 /** A signature of the account *set* (not tokens/usage) to detect real changes. */
@@ -145,7 +246,7 @@ function copyCredentials(from: Profile, to: Profile): void {
   to.needsReauth = from.needsReauth;
 }
 
-function mergeWithDisk(next: ProfilesStore, opts: { allowAccountRemoval?: boolean } = {}): ProfilesStore {
+function mergeWithDisk(next: ProfilesStore): ProfilesStore {
   let current: ProfilesStore | null = null;
   try {
     current = parseStore(fs.readFileSync(profilesPath(), 'utf8'));
@@ -154,10 +255,18 @@ function mergeWithDisk(next: ProfilesStore, opts: { allowAccountRemoval?: boolea
   }
   if (!current) return next;
 
+  const tombstones = new Map<string, NonNullable<ProfilesStore['tombstones']>[number]>();
+  for (const t of [...(current.tombstones ?? []), ...(next.tombstones ?? [])]) {
+    const old = tombstones.get(t.id);
+    if (!old || old.deletedAt < t.deletedAt) tombstones.set(t.id, t);
+  }
+  next.tombstones = [...tombstones.values()];
+  next.profiles = next.profiles.filter((p) => !tombstones.has(p.id));
+
   for (const diskProfile of current.profiles) {
+    if (tombstones.has(diskProfile.id)) continue;
     const incoming = next.profiles.find((p) => sameAccount(p, diskProfile));
     if (!incoming) {
-      if (opts.allowAccountRemoval) continue;
       next.profiles.push(diskProfile);
       logger.warn('profiles save prevented account loss', { email: diskProfile.email });
       continue;
@@ -167,6 +276,10 @@ function mergeWithDisk(next: ProfilesStore, opts: { allowAccountRemoval?: boolea
     const incomingOauth = incoming.claudeAiOauth;
     const diskRefresh = diskOauth?.refreshToken?.trim() || '';
     const incomingRefresh = incomingOauth?.refreshToken?.trim() || '';
+
+    if (diskRefresh && diskRefresh === incomingRefresh) {
+      incoming.needsReauth = !!(diskProfile.needsReauth || incoming.needsReauth);
+    }
 
     if (hasRefreshableOauth(diskOauth) && !hasRefreshableOauth(incomingOauth)) {
       copyCredentials(diskProfile, incoming);
@@ -185,7 +298,23 @@ function mergeWithDisk(next: ProfilesStore, opts: { allowAccountRemoval?: boolea
       copyCredentials(diskProfile, incoming);
       logger.warn('profiles save preserved newer disk token over stale incoming copy', { email: incoming.email });
     }
+
+    if ((diskProfile.usage?.fetchedAt ?? 0) > (incoming.usage?.fetchedAt ?? 0)) {
+      incoming.usage = diskProfile.usage;
+    }
   }
+
+  const incomingActive = next.profiles.find((p) => p.id === next.activeProfileId);
+  const diskActive = current.profiles.find((p) => p.id === current.activeProfileId);
+  if (!incomingActive || ((diskActive?.lastUsedAt ?? 0) > (incomingActive.lastUsedAt ?? 0))) {
+    next.activeProfileId = current.activeProfileId;
+  }
+  next.activeProfileIds = {
+    claude: next.activeProfileId,
+    codex: next.activeProfileIds?.codex ?? current.activeProfileIds?.codex ?? null,
+  };
+  next.version = STORE_VERSION;
+  next.revision = Math.max(next.revision ?? 0, current.revision ?? 0) + 1;
 
   return next;
 }
@@ -229,28 +358,65 @@ let saveSeq = 0;
 
 /** Atomic write via a per-call temp file (unique so concurrent/other-process writes can't collide). */
 function atomicWriteFile(target: string, content: string): void {
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   const tmp = `${target}.tmp-${process.pid}-${saveSeq++}`;
-  fs.writeFileSync(tmp, content, 'utf8');
+  fs.writeFileSync(tmp, content, { encoding: 'utf8', mode: 0o600 });
   try {
     fs.renameSync(tmp, target);
   } catch {
-    fs.writeFileSync(target, content, 'utf8');
+    fs.writeFileSync(target, content, { encoding: 'utf8', mode: 0o600 });
     try {
       fs.unlinkSync(tmp);
     } catch {
       /* ignore */
     }
   }
+  if (process.platform !== 'win32') fs.chmodSync(target, 0o600);
 }
 
-export function saveStore(store: ProfilesStore, opts: { allowAccountRemoval?: boolean } = {}): void {
+function persistCredentialEnvelopes(store: ProfilesStore): void {
+  for (const profile of store.profiles) {
+    if (!isClaudeCredentialBlock(profile.claudeAiOauth)) continue;
+    const envelope: ClaudeCredentialEnvelope = {
+      kind: 'claude-codex-account-switch/claude-credentials',
+      version: 1,
+      provider: 'claude',
+      profileId: profile.id,
+      updatedAt: Date.now(),
+      claudeAiOauth: profile.claudeAiOauth,
+    };
+    const content = JSON.stringify(envelope, null, 2) + '\n';
+    const target = claudeProfileCredentialsPath(profile.id);
+    atomicWriteFile(target, content);
+    atomicWriteFile(`${target}.bak`, content);
+  }
+}
+
+function serializeStore(store: ProfilesStore): string {
+  const metadata = {
+    ...store,
+    profiles: store.profiles.map((profile) => {
+      if (!isClaudeCredentialBlock(profile.claudeAiOauth)) return profile;
+      const { claudeAiOauth: _secret, ...rest } = profile;
+      return rest;
+    }),
+  };
+  return JSON.stringify(metadata, null, 2) + '\n';
+}
+
+export function saveStore(store: ProfilesStore): void {
   withFileLockSync('profiles-store', () => {
     ensureDataDirs();
-    const merged = mergeWithDisk(store, opts);
+    const merged = mergeWithDisk(store);
     store.profiles = merged.profiles;
     store.activeProfileId = merged.activeProfileId;
+    store.activeProfileIds = merged.activeProfileIds;
+    store.revision = merged.revision;
+    store.tombstones = merged.tombstones;
+    store.version = STORE_VERSION;
     backupProfilesIfChanged(store);
-    const content = JSON.stringify(store, null, 2) + '\n';
+    persistCredentialEnvelopes(store);
+    const content = serializeStore(store);
     atomicWriteFile(profilesPath(), content);
     // Mirror the SAME known-valid content to the last-known-good sidecar. profiles.json and
     // its .bak are written back-to-back, so an interrupted write can corrupt at most one of
@@ -264,8 +430,58 @@ export function saveStore(store: ProfilesStore, opts: { allowAccountRemoval?: bo
 }
 
 /**
+ * Apply a targeted mutation to the freshest on-disk store while holding its lock.
+ * Callers that only change one profile should use this instead of saving a UI snapshot
+ * that may predate a concurrent token rotation, rename, import, or deletion.
+ */
+export function mutateStore(mutator: (store: ProfilesStore) => void): ProfilesStore {
+  return withFileLockSync('profiles-store', () => {
+    ensureDataDirs();
+    let current = (() => {
+      try {
+        return parseStore(fs.readFileSync(profilesPath(), 'utf8'));
+      } catch {
+        return null;
+      }
+    })();
+    if (!current) {
+      try {
+        current = parseStore(fs.readFileSync(lastGoodPath(), 'utf8'));
+      } catch {
+        current = null;
+      }
+    }
+    const store = current
+      ? migrateLegacyStore(current).store
+      : {
+          version: STORE_VERSION,
+          revision: 0,
+          activeProfileId: null,
+          activeProfileIds: { claude: null, codex: null },
+          tombstones: [],
+          profiles: [],
+        } satisfies ProfilesStore;
+
+    mutator(store);
+    store.version = STORE_VERSION;
+    store.revision = (store.revision ?? 0) + 1;
+    store.tombstones = store.tombstones ?? [];
+    store.activeProfileIds = {
+      claude: store.activeProfileId,
+      codex: store.activeProfileIds?.codex ?? null,
+    };
+    backupProfilesIfChanged(store);
+    persistCredentialEnvelopes(store);
+    const content = serializeStore(store);
+    atomicWriteFile(profilesPath(), content);
+    atomicWriteFile(lastGoodPath(), content);
+    return store;
+  });
+}
+
+/**
  * The OAuth token's `subscriptionType` isn't always populated (e.g. right after the
- * manual paste-code add-account flow). Fall back to deriving the plan from
+ * official isolated add-account flow). Fall back to deriving the plan from
  * `organizationType`, which Claude always sets (e.g. "claude_pro" -> "pro",
  * "claude_max" -> "max").
  */
@@ -320,8 +536,10 @@ export function makeProfile(fields: LiveProfileFields, label?: string): Profile 
   }
   return {
     id: crypto.randomUUID(),
+    provider: 'claude',
     label: label ?? fields.oauthAccount.displayName ?? fields.email,
     createdAt: Date.now(),
+    updatedAt: Date.now(),
     ...fields,
   };
 }
@@ -340,6 +558,7 @@ export function copyFieldsInto(profile: Profile, fields: LiveProfileFields): Pro
   profile.claudeAiOauth = fields.claudeAiOauth;
   profile.oauthAccount = fields.oauthAccount;
   profile.userID = fields.userID;
+  profile.updatedAt = Date.now();
   return profile;
 }
 
@@ -365,13 +584,16 @@ export function captureDesktopAccount(store: ProfilesStore, label: string, email
     existing ??
     {
       id: newDesktopProfileId(),
+      provider: 'claude',
       label: label || email || 'Desktop account',
       email: email || label || '(desktop account)',
       createdAt: Date.now(),
+      updatedAt: Date.now(),
     };
   const dir = snapshotLiveDesktopInto(profile.id);
   profile.desktopSnapshotDir = dir;
   profile.desktopCapturedAt = Date.now();
+  profile.updatedAt = Date.now();
   if (label) profile.label = label;
   if (!existing) store.profiles.push(profile);
   logger.info(existing ? 'desktop: linked to existing profile' : 'desktop: captured new profile', { email: profile.email });
@@ -488,6 +710,7 @@ function candidatesFromCcswitchFile(file: string): ImportCandidate[] {
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (data?.kind === 'claude-account-switch/export-all' && Array.isArray(data.accounts)) {
+      if (data.provider && data.provider !== 'claude') return [];
       return (data.accounts as PortableExport[]).map((a) => ({
         source: `${src} → ${a.email}`,
         fields: fieldsFromExportRecord(a),
@@ -495,6 +718,7 @@ function candidatesFromCcswitchFile(file: string): ImportCandidate[] {
       }));
     }
     if (data?.kind === 'claude-account-switch/export') {
+      if (data.provider && data.provider !== 'claude') return [];
       return [{ source: src, fields: fieldsFromExportRecord(data as PortableExport), label: (data as PortableExport).label }];
     }
     // Unknown JSON — maybe a raw .credentials.json
@@ -577,6 +801,7 @@ export function addOrUpdateProfile(store: ProfilesStore, fields: LiveProfileFiel
   if (existing) {
     copyFieldsInto(existing, fields);
     existing.needsReauth = false; // a fresh login means the account is healthy again
+    existing.updatedAt = Date.now();
     if (label) existing.label = label;
     logger.info('import: updated existing profile', { email: existing.email });
     return existing;
@@ -594,7 +819,8 @@ function toExportRecord(profile: Profile): PortableExport | null {
   if (!hasCliAuth(profile)) return null;
   return {
     kind: 'claude-account-switch/export',
-    version: 1,
+    version: 2,
+    provider: 'claude',
     exportedAt: Date.now(),
     label: profile.label,
     email: profile.email,
@@ -615,7 +841,7 @@ export function exportProfile(profile: Profile): string {
   ensureDataDirs();
   const safeLabel = profile.label.replace(/[^\w.-]+/g, '_').slice(0, 40) || 'account';
   const file = path.join(exportDir(), `${safeLabel}.ccswitch.json`);
-  fs.writeFileSync(file, JSON.stringify(record, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(file, JSON.stringify(record, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
   logger.info('exported profile', { email: profile.email, file });
   return file;
 }
@@ -625,12 +851,13 @@ export function exportAllProfiles(store: ProfilesStore): string {
   ensureDataDirs();
   const data: PortableExportAll = {
     kind: 'claude-account-switch/export-all',
-    version: 1,
+    version: 2,
+    provider: 'claude',
     exportedAt: Date.now(),
     accounts: store.profiles.map(toExportRecord).filter((r): r is PortableExport => r != null),
   };
   const file = path.join(exportDir(), `all-accounts.ccswitch.json`);
-  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
   logger.info('exported all profiles', { count: store.profiles.length, file });
   return file;
 }
@@ -638,6 +865,9 @@ export function exportAllProfiles(store: ProfilesStore): string {
 export function deleteProfile(store: ProfilesStore, id: string): void {
   const profile = store.profiles.find((p) => p.id === id);
   if (profile?.desktopSnapshotDir) deleteDesktopSnapshot(id);
+  if (profile) {
+    store.tombstones = [...(store.tombstones ?? []).filter((t) => t.id !== id), { id, provider: 'claude', deletedAt: Date.now() }];
+  }
   store.profiles = store.profiles.filter((p) => p.id !== id);
   if (store.activeProfileId === id) store.activeProfileId = null;
 }
