@@ -1,5 +1,5 @@
 // Cross-platform "make it feel like a real app" installer: a recurring keep-alive job
-// (so saved accounts never expire even with the UI closed) + Start-menu/Desktop shortcuts.
+// (so saved access tokens are refreshed even with the UI closed) + Start-menu/Desktop shortcuts.
 // Every step is best-effort and reported individually — one failure never aborts the rest.
 import fs from 'node:fs';
 import os from 'node:os';

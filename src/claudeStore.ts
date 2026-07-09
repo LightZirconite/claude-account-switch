@@ -20,7 +20,14 @@ import {
 } from 'jsonc-parser';
 import { credentialsPath, claudeJsonPath, backupsDir, ensureDataDirs } from './paths';
 import { logger } from './logger';
-import { hasCliAuth, type ClaudeAiOauth, type LiveAccount, type OauthAccount, type Profile } from './types';
+import {
+  hasCliAuth,
+  hasRefreshableOauth,
+  type ClaudeAiOauth,
+  type LiveAccount,
+  type OauthAccount,
+  type Profile,
+} from './types';
 
 function readText(p: string): string | null {
   try {
@@ -181,6 +188,9 @@ export function restoreLatestBackup(): string | null {
 // ---------- Writing ----------
 
 function writeCredentials(claudeAiOauth: ClaudeAiOauth, organizationUuidRoot?: string): void {
+  if (!hasRefreshableOauth(claudeAiOauth)) {
+    throw new Error('Refusing to write invalid Claude Code OAuth credentials.');
+  }
   const t = readCredentialsText();
   let obj: Record<string, unknown> = {};
   if (t) {
@@ -213,6 +223,9 @@ function writeClaudeJson(oauthAccount: OauthAccount, userID?: string): void {
  * running Claude session doesn't end up holding an invalidated refresh token.
  */
 export function updateLiveCredentials(claudeAiOauth: ClaudeAiOauth, organizationUuidRoot?: string): void {
+  if (!hasRefreshableOauth(claudeAiOauth)) {
+    throw new Error('Refusing to sync invalid Claude Code OAuth credentials.');
+  }
   const t = readCredentialsText();
   let obj: Record<string, unknown> = {};
   if (t) {
@@ -314,6 +327,9 @@ export function dryRunApply(p: Profile): DryRunReport {
 export function applyProfile(p: Profile, opts: { dryRun?: boolean } = {}): ApplyResult {
   if (!hasCliAuth(p)) {
     return { ok: false, error: 'This profile has no Claude Code credentials captured.' };
+  }
+  if (p.needsReauth) {
+    return { ok: false, error: 'This profile needs re-authentication before it can be switched in.' };
   }
   if (opts.dryRun) {
     return { ok: true, dryRun: dryRunApply(p) };

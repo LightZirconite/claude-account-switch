@@ -26,6 +26,7 @@ import {
 } from './profiles';
 import {
   applyProfile,
+  getLiveAccount,
   restoreLatestBackup,
   dryRunApply,
   updateLiveCredentials,
@@ -54,7 +55,7 @@ import {
   type ManualAuth,
   type PrimedIdentity,
 } from './oauth';
-import type { Profile, ProfilesStore } from './types';
+import { hasCliAuth, hasRefreshableOauth, type Profile, type ProfilesStore } from './types';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -267,8 +268,8 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const storeRef = useRef(store);
   storeRef.current = store;
 
-  const persist = useCallback((s: ProfilesStore) => {
-    saveStore(s);
+  const persist = useCallback((s: ProfilesStore, opts: { allowAccountRemoval?: boolean } = {}) => {
+    saveStore(s, opts);
     setStore({ ...s });
   }, []);
 
@@ -307,7 +308,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
   const onRotate = useCallback(
     (p: Profile) => {
       saveStore(store);
-      if (p.id === store.activeProfileId && p.claudeAiOauth) {
+      if (p.id === store.activeProfileId && hasCliAuth(p) && !p.needsReauth) {
         try {
           updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
         } catch (e) {
@@ -336,7 +337,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
     }
     // Validate needsReauth directly instead of only via the usage-cache-gated refresh
     // path below (fetchUsage short-circuits on a warm cache and would never reach it).
-    if (p.needsReauth && p.claudeAiOauth && p.claudeAiOauth.expiresAt > Date.now() + 60_000) {
+    if (p.needsReauth && hasCliAuth(p) && p.claudeAiOauth.expiresAt > Date.now() + 60_000) {
       p.needsReauth = false;
     }
   }, []);
@@ -360,7 +361,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
         }
       }
       for (const p of s.profiles) {
-        if (p.id === s.activeProfileId || !p.claudeAiOauth) continue;
+        if (p.id === s.activeProfileId || !hasCliAuth(p)) continue;
         try {
           p.usage = await fetchUsage(p, claudeVersion, { onRotate });
           persist(storeRef.current);
@@ -387,7 +388,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
     const rotate = (p: Profile) => {
       const s = storeRef.current;
       saveStore(s);
-      if (p.id === s.activeProfileId && p.claudeAiOauth) {
+      if (p.id === s.activeProfileId && hasCliAuth(p) && !p.needsReauth) {
         try {
           updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
         } catch {
@@ -398,7 +399,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
     const run = () => {
       (async () => {
         for (const p of storeRef.current.profiles) {
-          if (!p.claudeAiOauth || p.needsReauth) continue;
+          if (!hasCliAuth(p) || p.needsReauth) continue;
           // Skip the ACTIVE account: a running `claude` session rotates its token
           // independently, so refreshing our (possibly already-stale) copy here could
           // desync and falsely flag it. The 2-min active-usage interval — which
@@ -422,7 +423,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
   // debounce avoids firing a request for every row you pass through while holding ↑/↓.
   useEffect(() => {
     const p = profiles[cursor];
-    if (!p || !p.claudeAiOauth) return;
+    if (!p || (!hasCliAuth(p) && !p.needsReauth)) return;
     const t = setTimeout(() => {
       reconcileActiveIfLive(storeRef.current, p);
       fetchUsage(p, claudeVersion, { onRotate })
@@ -473,7 +474,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
         force: true,
         onRotate: (p) => {
           saveStore(s);
-          if (p.id === s.activeProfileId && p.claudeAiOauth) {
+          if (p.id === s.activeProfileId && hasCliAuth(p) && !p.needsReauth) {
             try {
               updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
             } catch {
@@ -513,7 +514,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
       setBusy(`Switching to ${target.label}…`);
       const lines: string[] = [];
 
-      if (target.claudeAiOauth) {
+      if (hasCliAuth(target)) {
         // Capture the outgoing (currently live) account's latest tokens first.
         try {
           reconcileWithLive(store);
@@ -523,10 +524,16 @@ function App({ initialStore, claudeVersion }: AppProps) {
         // Proactively refresh the target's token if it's expired, so it works instantly.
         // Routed through the single-flighted ensureFreshToken so it can't race (and burn
         // the token against) a background refresh of this same account.
+        let hasFreshToken = false;
         try {
-          await ensureFreshToken(target, onRotate);
+          hasFreshToken = await ensureFreshToken(target, onRotate);
         } catch (e) {
           logger.warn('proactive refresh on switch failed', { email: target.email });
+        }
+        if (!hasFreshToken || target.needsReauth) {
+          setBusy(null);
+          showMessage('Switch failed', ['This account login has expired. Re-add it with "a" before switching.'], 'error');
+          return;
         }
         const res = applyProfile(target);
         if (!res.ok) {
@@ -576,6 +583,10 @@ function App({ initialStore, claudeVersion }: AppProps) {
     (target: Profile) => {
       if (target.id === store.activeProfileId) {
         setStatus(`"${target.label}" is already the active account.`);
+        return;
+      }
+      if (!hasCliAuth(target) && !target.desktopSnapshotDir) {
+        setStatus(`"${target.label}" has no usable login. Press "a" to re-add it.`);
         return;
       }
       setStatus('Scanning running claude processes...');
@@ -706,13 +717,17 @@ function App({ initialStore, claudeVersion }: AppProps) {
 
   const doImport = useCallback(
     (cand: ImportCandidate) => {
-      const p = addOrUpdateProfile(store, cand.fields, cand.label);
-      persist(store);
-      setCursor(store.profiles.findIndex((x) => x.id === p.id));
-      setMode('list');
-      setStatus(`Imported "${p.label}" (${p.email}).`);
+      try {
+        const p = addOrUpdateProfile(store, cand.fields, cand.label);
+        persist(store);
+        setCursor(store.profiles.findIndex((x) => x.id === p.id));
+        setMode('list');
+        setStatus(`Imported "${p.label}" (${p.email}).`);
+      } catch (e) {
+        showMessage('Import failed', [String((e as Error)?.message ?? e)], 'error');
+      }
     },
-    [store, persist],
+    [store, persist, showMessage],
   );
 
   const exportSelected = useCallback(() => {
@@ -827,7 +842,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
         if (selected) {
           const label = selected.label;
           deleteProfile(store, selected.id);
-          persist(store);
+          persist(store, { allowAccountRemoval: true });
           setCursor((c) => Math.max(0, Math.min(c, store.profiles.length - 1)));
           setStatus(`Deleted "${label}".`);
         }
@@ -881,10 +896,14 @@ function App({ initialStore, claudeVersion }: AppProps) {
         if (target) {
           const cands = importFromPath(target);
           if (cands.length) {
-            cands.forEach((c) => addOrUpdateProfile(store, c.fields, c.label));
-            persist(store);
-            setMode('list');
-            setStatus(`Imported ${cands.length} account(s) from path.`);
+            try {
+              cands.forEach((c) => addOrUpdateProfile(store, c.fields, c.label));
+              persist(store);
+              setMode('list');
+              setStatus(`Imported ${cands.length} account(s) from path.`);
+            } catch (e) {
+              showMessage('Import failed', [String((e as Error)?.message ?? e)], 'error');
+            }
           } else {
             setStatus('Nothing importable at that path.');
             setMode('importMenu');
@@ -1031,8 +1050,12 @@ function App({ initialStore, claudeVersion }: AppProps) {
                     <Text bold color="white">{selected.label}</Text>{' '}
                     <Text color={planColor(selected.subscriptionType)}>{(selected.subscriptionType ?? '').toUpperCase()}</Text>
                   </Text>
-                  {!selected.claudeAiOauth ? (
-                    <Text dimColor>{'   Desktop-only account — usage not available'}</Text>
+                  {!hasCliAuth(selected) ? (
+                    selected.needsReauth ? (
+                      <Text color="red">{'   ⚠ login expired — press "a" to re-add this account'}</Text>
+                    ) : (
+                      <Text dimColor>{'   Desktop-only account — usage not available'}</Text>
+                    )
                   ) : selected.usage && (selected.usage.status === 'ok' || selected.usage.status === 'stale') ? (
                     <>
                       <Text>
@@ -1118,15 +1141,15 @@ function App({ initialStore, claudeVersion }: AppProps) {
           </Text>
           <Box marginTop={1} flexDirection="column">
             <Text wrap="wrap">
-              Make this feel like a real app and keep your accounts logged in forever:
+              Make this feel like a real app and keep saved accounts refreshed safely:
             </Text>
             <Text>
               {'  • '}A <Text bold>Desktop + menu shortcut</Text> to launch the switcher.
             </Text>
             <Text>
-              {'  • '}An <Text bold>automatic keep-alive</Text> (every 6h) so saved accounts never expire —
+              {'  • '}An <Text bold>automatic keep-alive</Text> (every 6h) to refresh tokens before access expiry —
             </Text>
-            <Text>{'    '}even when this window is closed. Works on Windows, macOS and Linux.</Text>
+            <Text>{'    '}and warn when Anthropic requires a real /login renewal.</Text>
           </Box>
           <Box marginTop={1} flexDirection="column">
             {(() => {
@@ -1315,7 +1338,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
               {profiles.map((p, i) => {
                 const isActive = p.id === store.activeProfileId;
                 const isCursor = i === cursor;
-                const linked = [p.claudeAiOauth ? 'CLI' : null, p.desktopSnapshotDir ? 'DSK' : null].filter(Boolean).join('+');
+                const linked = [hasCliAuth(p) ? 'CLI' : null, p.desktopSnapshotDir ? 'DSK' : null].filter(Boolean).join('+');
                 return (
                   <Box key={p.id}>
                     <Text color="cyanBright" bold>
@@ -1348,7 +1371,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
               <Text bold color="yellow">
                 Switch to "{pendingSwitch.profile.label}" ({pendingSwitch.profile.email})?
               </Text>
-              {pendingSwitch.profile.claudeAiOauth ? (
+              {hasCliAuth(pendingSwitch.profile) ? (
                 (store.closeClaudeOnSwitch ?? true) ? (
                   pendingSwitch.pids.length ? (
                     <Text>
@@ -1434,15 +1457,75 @@ Usage:
   switch.cmd login           Add an account via the official 'claude' login (fallback)
   switch.cmd import <path>   Import account(s) from a file or folder
   switch.cmd export-all      Export ALL accounts into one portable backup file
+  switch.cmd doctor          Diagnose saved accounts and live Claude auth (no secrets)
   switch.cmd --dry-run       Show exactly which keys a switch would change (no writes)
   switch.cmd restore         Roll back the last credential change from backup
   switch.cmd install         Set up shortcuts + auto keep-alive (feels like a real app)
   switch.cmd uninstall       Remove shortcuts + the scheduled keep-alive job
-  switch.cmd keep-alive          Refresh all accounts' tokens now (keeps logins alive)
+  switch.cmd keep-alive          Refresh due tokens now and report accounts needing renewal
   switch.cmd keep-alive install  Schedule keep-alive only (no shortcuts)
   switch.cmd --help          This help
 
 Data & logs live in ~/.claude-switch/`);
+}
+
+function asTime(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value;
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function relMs(ms: number | null): string {
+  if (ms == null) return 'unknown';
+  const diff = ms - Date.now();
+  const abs = Math.abs(diff);
+  const unit =
+    abs >= 86_400_000 ? `${Math.round(diff / 86_400_000)}d` :
+    abs >= 3_600_000 ? `${Math.round(diff / 3_600_000)}h` :
+    `${Math.round(diff / 60_000)}m`;
+  return diff >= 0 ? `in ${unit}` : `${unit.replace('-', '')} ago`;
+}
+
+function usageAge(p: Profile): string {
+  if (!p.usage?.fetchedAt) return 'none';
+  return `${p.usage.status}, ${relMs(p.usage.fetchedAt)} old`;
+}
+
+function printDoctor(): void {
+  const store = loadStore();
+  console.log(`Claude Account Switch doctor`);
+  console.log(`Claude Code version: ${detectClaudeVersion()}`);
+  console.log(`Profiles: ${store.profiles.length}`);
+  console.log(`Active profile id: ${store.activeProfileId ?? '(none)'}`);
+
+  const envAuth = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CONFIG_DIR']
+    .filter((k) => !!process.env[k]);
+  console.log(`Auth env override: ${envAuth.length ? envAuth.join(', ') : 'none'}`);
+
+  const live = getLiveAccount();
+  const liveOauth = live.claudeAiOauth;
+  console.log('\nLive Claude files:');
+  console.log(`  email: ${live.oauthAccount?.emailAddress ?? '(unknown)'}`);
+  console.log(`  refreshable: ${hasRefreshableOauth(liveOauth) ? 'yes' : 'NO'}`);
+  console.log(`  access token: ${liveOauth?.accessToken ? `present, expires ${relMs(asTime(liveOauth.expiresAt))}` : 'missing'}`);
+  console.log(`  login expiry: ${relMs(asTime(liveOauth?.refreshTokenExpiresAt))}`);
+
+  console.log('\nSaved profiles:');
+  for (const p of store.profiles) {
+    const oauth = p.claudeAiOauth;
+    const refreshable = hasCliAuth(p);
+    const flags = [
+      p.id === store.activeProfileId ? 'active' : null,
+      p.needsReauth ? 'needs re-add' : null,
+      refreshable ? 'cli' : null,
+      p.desktopSnapshotDir ? 'desktop' : null,
+    ].filter(Boolean).join(', ') || 'saved';
+    console.log(`  - ${p.label} <${p.email}> [${flags}]`);
+    console.log(`    access: ${oauth?.accessToken ? relMs(asTime(oauth.expiresAt)) : 'missing'}; login: ${relMs(asTime(oauth?.refreshTokenExpiresAt))}; usage: ${usageAge(p)}`);
+  }
 }
 
 function printDryRun(target: Profile, rep: DryRunReport): void {
@@ -1478,7 +1561,7 @@ async function runKeepAliveOnce(): Promise<void> {
   }
   const onRotate = (p: Profile) => {
     saveStore(store);
-    if (p.id === store.activeProfileId && p.claudeAiOauth) {
+    if (p.id === store.activeProfileId && hasCliAuth(p) && !p.needsReauth) {
       try {
         updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
       } catch {
@@ -1489,11 +1572,11 @@ async function runKeepAliveOnce(): Promise<void> {
   let refreshed = 0;
   let dead = 0;
   for (const p of store.profiles) {
-    if (!p.claudeAiOauth) continue;
     if (p.needsReauth) {
       dead++;
       continue;
     }
+    if (!hasCliAuth(p)) continue;
     const isActive = p.id === store.activeProfileId;
     if (isActive && claudeRunning) continue; // the live session owns its own token
     if (isActive) {
@@ -1526,6 +1609,11 @@ async function main(): Promise<void> {
 
   if (args.includes('--help') || args.includes('-h')) {
     printHelp();
+    return;
+  }
+
+  if (args[0] === 'doctor') {
+    printDoctor();
     return;
   }
 
@@ -1564,7 +1652,7 @@ async function main(): Promise<void> {
   if (args[0] === 'login') {
     console.log('Starting official claude login in an isolated sandbox...\n');
     const ident = await loginViaClaudeCli(findClaudeExe());
-    if (!ident || !ident.claudeAiOauth) {
+    if (!ident || !hasRefreshableOauth(ident.claudeAiOauth)) {
       console.log('\nLogin did not complete. Nothing imported.');
       return;
     }
@@ -1584,8 +1672,12 @@ async function main(): Promise<void> {
     }
     const store = loadStore();
     for (const c of cands) {
-      const p = addOrUpdateProfile(store, c.fields, c.label);
-      console.log(`Imported "${p.label}" (${p.email})`);
+      try {
+        const p = addOrUpdateProfile(store, c.fields, c.label);
+        console.log(`Imported "${p.label}" (${p.email})`);
+      } catch (e) {
+        console.log(`Skipped invalid account from ${c.source}: ${(e as Error).message}`);
+      }
     }
     saveStore(store);
     return;
@@ -1622,7 +1714,7 @@ async function main(): Promise<void> {
     // refresh-token rotation race with a live `claude` session) even after the token
     // is valid again. Validate it right away instead of waiting on the lazy,
     // usage-cache-gated refresh path — otherwise the UI shows stale red for minutes.
-    if (p.needsReauth && p.claudeAiOauth && p.claudeAiOauth.expiresAt > Date.now() + 60_000) {
+    if (p.needsReauth && hasCliAuth(p) && p.claudeAiOauth.expiresAt > Date.now() + 60_000) {
       p.needsReauth = false;
     }
   }

@@ -12,7 +12,7 @@ import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { logger } from './logger';
 import { parseTree, findNodeAtLocation, getNodeValue } from 'jsonc-parser';
-import type { ClaudeAiOauth, OauthAccount } from './types';
+import { hasRefreshableOauth, type ClaudeAiOauth, type OauthAccount } from './types';
 
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 export const AUTHORIZE_URL = 'https://claude.ai/oauth/authorize';
@@ -166,7 +166,7 @@ export function primeIdentity(tokens: TokenSet, claudeExe: string, scopes: strin
     if (fs.existsSync(credPath)) {
       try {
         const after = JSON.parse(fs.readFileSync(credPath, 'utf8'));
-        if (after.claudeAiOauth) finalOauth = after.claudeAiOauth;
+        if (hasRefreshableOauth(after.claudeAiOauth)) finalOauth = after.claudeAiOauth;
         organizationUuidRoot = after.organizationUuid;
       } catch {
         /* keep original */

@@ -1,7 +1,9 @@
 // Per-account usage/quota via the undocumented oauth/usage endpoint.
 // Aggressively rate-limited: cache hard, degrade gracefully.
 import { logger } from './logger';
+import { withFileLock } from './locks';
 import { refreshToken, type TokenSet } from './oauth';
+import { findByAccountUuid, findByEmail, loadStore, saveStore } from './profiles';
 import { hasCliAuth, type Profile, type UsageInfo } from './types';
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
@@ -14,12 +16,33 @@ const MIN_INTERVAL_MS = 30 * 1000; // hard floor: never hit the endpoint more th
 // (wrongly) flag a perfectly healthy account as dead. So we single-flight refreshes per
 // account: a second caller awaits the first's result instead of POSTing a now-stale token.
 const inFlightRefresh = new Map<string, Promise<TokenSet | null>>();
-// Last time we ATTEMPTED a refresh for an account (success or failure), used to back off
-// so a known-bad (needsReauth) account can't hammer the token endpoint on every render.
+// Last time we ATTEMPTED a refresh for an account (success or failure), used as a hard
+// floor for concurrent/stale UI paths. Known-dead accounts are not retried at all.
 const lastRefreshAttempt = new Map<string, number>();
 
 /** Marks an error carried out of the single-flight refresh as a dead-token (invalid_grant). */
 class InvalidGrantError extends Error {}
+
+function copyAuthState(from: Profile, to: Profile): void {
+  to.claudeAiOauth = from.claudeAiOauth;
+  to.oauthAccount = from.oauthAccount;
+  to.accountUuid = from.accountUuid;
+  to.organizationUuid = from.organizationUuid;
+  to.organizationUuidRoot = from.organizationUuidRoot;
+  to.organizationType = from.organizationType;
+  to.subscriptionType = from.subscriptionType;
+  to.userID = from.userID;
+  to.needsReauth = from.needsReauth;
+}
+
+function findDiskProfile(profile: Profile): Profile | undefined {
+  const disk = loadStore();
+  return disk.profiles.find((p) => p.id === profile.id) ?? findByAccountUuid(disk, profile.accountUuid) ?? findByEmail(disk, profile.email);
+}
+
+function refreshLockName(profile: Profile): string {
+  return `oauth-refresh-${profile.accountUuid || profile.email || profile.id}`;
+}
 
 /**
  * Ensure profile has a non-expired access token, refreshing (and persisting rotation) if
@@ -46,19 +69,38 @@ async function ensureAccessToken(
   }
   if (!oauth.refreshToken) return oauth.accessToken ?? null;
 
-  // Back off for a known-dead account: don't re-POST a refresh token we already know is
-  // rejected until MIN_INTERVAL_MS has passed. (A healthy account whose access token
-  // merely expired is NOT throttled — needsReauth is false — so it refreshes right away.)
+  // A known-dead account must be re-added. Retrying the same rejected refresh token only
+  // hammers the endpoint and can overwrite live state via unrelated persistence paths.
+  if (profile.needsReauth) return null;
+
+  // Back off repeated attempts from stale UI paths. A healthy account whose access token
+  // merely expired is still allowed to refresh after the hard floor.
   const last = lastRefreshAttempt.get(profile.id) ?? 0;
-  if (profile.needsReauth && now - last < MIN_INTERVAL_MS) {
+  if (now - last < MIN_INTERVAL_MS) {
     return null;
   }
 
-  // Single-flight: coalesce concurrent refreshes for this account onto one POST.
+  // Single-flight coalesces callers within this process; the file lock below coalesces
+  // separate switcher/keep-alive processes so only one refresh token POST can happen.
   let pending = inFlightRefresh.get(profile.id);
   if (!pending) {
-    const tokenAtStart = oauth.refreshToken;
-    pending = (async () => {
+    pending = withFileLock(refreshLockName(profile), async () => {
+      const diskProfile = findDiskProfile(profile);
+      if (diskProfile && diskProfile !== profile) copyAuthState(diskProfile, profile);
+      if (!hasCliAuth(profile) || profile.needsReauth) return null;
+
+      const lockedOauth = profile.claudeAiOauth;
+      const lockedNow = Date.now();
+      if (lockedOauth.accessToken && lockedOauth.expiresAt && lockedOauth.expiresAt > lockedNow + refreshLeadMs) {
+        return {
+          accessToken: lockedOauth.accessToken,
+          refreshToken: lockedOauth.refreshToken,
+          expiresAt: lockedOauth.expiresAt,
+          scopes: Array.isArray(lockedOauth.scopes) ? lockedOauth.scopes : String(lockedOauth.scopes ?? '').split(' ').filter(Boolean),
+        };
+      }
+
+      const tokenAtStart = lockedOauth.refreshToken;
       lastRefreshAttempt.set(profile.id, Date.now());
       try {
         return await refreshToken(tokenAtStart);
@@ -73,18 +115,30 @@ async function ensureAccessToken(
       } finally {
         inFlightRefresh.delete(profile.id);
       }
-    })();
+    });
     inFlightRefresh.set(profile.id, pending);
   }
 
   try {
     const refreshed = await pending;
     if (!refreshed) return null;
+    if (!hasCliAuth(profile)) return null;
+    const currentOauth = profile.claudeAiOauth;
     // All coalesced callers write the same rotated token — idempotent.
-    oauth.accessToken = refreshed.accessToken;
-    oauth.refreshToken = refreshed.refreshToken; // rotates
-    oauth.expiresAt = refreshed.expiresAt;
+    currentOauth.accessToken = refreshed.accessToken;
+    currentOauth.refreshToken = refreshed.refreshToken; // rotates
+    currentOauth.expiresAt = refreshed.expiresAt;
     profile.needsReauth = false;
+    try {
+      const disk = loadStore();
+      const diskProfile = disk.profiles.find((p) => p.id === profile.id) ?? findByAccountUuid(disk, profile.accountUuid) ?? findByEmail(disk, profile.email);
+      if (diskProfile && hasCliAuth(diskProfile)) {
+        copyAuthState(profile, diskProfile);
+        saveStore(disk);
+      }
+    } catch (e) {
+      logger.warn('usage: failed to persist refreshed token from locked path', { email: profile.email, error: String(e) });
+    }
     onRotate?.(profile); // persist the rotation immediately so it's never lost
     logger.info('usage: refreshed token', { email: profile.email });
     return refreshed.accessToken;
@@ -109,14 +163,14 @@ export async function ensureFreshToken(
   onRotate?: (p: Profile) => void,
 ): Promise<boolean> {
   const token = await ensureAccessToken(profile, onRotate);
-  return token != null;
+  return !!token;
 }
 
 /**
  * Proactively refresh an account's OAuth token if it expires within `leadMs`, WITHOUT
  * touching the rate-limited usage endpoint. This is the keep-alive that lets PARKED
- * accounts live forever: as long as we rotate + persist their token before it expires,
- * the account never dies — mirroring what the live Claude session does for the active one.
+ * accounts usable until Anthropic requires a real login renewal: as long as we rotate +
+ * persist their access token before it expires, the saved credential stays warm.
  * Safe to call often: it no-ops when the token is still fresh, single-flights concurrent
  * calls, and backs off accounts already known to be dead (needsReauth).
  */
@@ -143,7 +197,16 @@ export async function fetchUsage(
   opts: { force?: boolean; onRotate?: (p: Profile) => void } = {},
 ): Promise<UsageInfo> {
   const now = Date.now();
-  if (!hasCliAuth(profile)) return { fetchedAt: now, status: 'never' };
+  if (!hasCliAuth(profile)) {
+    if (profile.needsReauth && profile.usage && (profile.usage.status === 'ok' || profile.usage.status === 'stale')) {
+      return { ...profile.usage, status: 'stale' };
+    }
+    return {
+      fetchedAt: now,
+      status: profile.needsReauth ? 'error' : 'never',
+      error: profile.needsReauth ? 'login expired — re-add with "a"' : undefined,
+    };
+  }
   const cacheWindow = opts.force ? MIN_INTERVAL_MS : CACHE_MS;
   if (profile.usage && profile.usage.status === 'ok' && now - profile.usage.fetchedAt < cacheWindow) {
     return profile.usage;

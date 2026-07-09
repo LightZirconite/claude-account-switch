@@ -11,6 +11,17 @@ export interface ClaudeAiOauth {
   [key: string]: unknown;
 }
 
+/** Whether an OAuth block can still participate in Claude Code auth/refresh. */
+export function hasRefreshableOauth(oauth: ClaudeAiOauth | null | undefined): oauth is ClaudeAiOauth {
+  return (
+    !!oauth &&
+    typeof oauth.refreshToken === 'string' &&
+    oauth.refreshToken.trim().length > 0 &&
+    typeof oauth.expiresAt === 'number' &&
+    Number.isFinite(oauth.expiresAt)
+  );
+}
+
 /** The `oauthAccount` block stored in ~/.claude.json */
 export interface OauthAccount {
   accountUuid: string;
@@ -87,7 +98,7 @@ export interface Profile {
 export function hasCliAuth(
   p: Profile,
 ): p is Profile & { claudeAiOauth: ClaudeAiOauth; oauthAccount: OauthAccount; accountUuid: string; organizationUuid: string } {
-  return !!p.claudeAiOauth && !!p.oauthAccount;
+  return hasRefreshableOauth(p.claudeAiOauth) && !!p.oauthAccount;
 }
 
 /** Whether this profile has a captured Claude Desktop session bundle. */

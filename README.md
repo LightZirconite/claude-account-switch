@@ -36,8 +36,8 @@ switch.cmd       # launch the switcher (also auto-builds on first run)
 ```
 
 On the very first launch the switcher offers a **one-click setup** (press `i`): it adds a
-Desktop + menu shortcut and schedules an automatic **keep-alive** so your saved accounts
-**never expire**, even when the app is closed. You can open this any time with `S`, or from
+Desktop + menu shortcut and schedules an automatic **keep-alive** so saved access tokens
+are refreshed before access expiry, even when the app is closed. You can open this any time with `S`, or from
 the command line:
 
 ```
@@ -45,14 +45,16 @@ switch.cmd install     # shortcuts + auto keep-alive (Windows, macOS & Linux)
 switch.cmd uninstall   # remove them again (never touches your accounts)
 ```
 
-### Never lose an account
+### Never silently lose an account
 
-Once added, an account is meant to stay logged in **forever** — like a normal `claude`
-login. The switcher keeps each account's OAuth token refreshed *before* it expires (in-app
-every 10 min, and via the scheduled job every 6 h even when closed), and it never lets a
-concurrent refresh burn a token. Your `profiles.json` is mirrored to a last-known-good copy
-on every save and auto-recovered if it's ever corrupted, so a crash or power cut can't wipe
-your accounts.
+Once added, an account should never disappear from the switcher. The switcher keeps each
+account's OAuth access token refreshed before access expiry (in-app every 10 min, and via
+the scheduled job every 6 h even when closed), serializes refreshes across processes, and
+refuses to overwrite a newer token with a stale in-memory copy. Anthropic can still revoke
+or expire the underlying login; when that happens, the account remains listed and is marked
+for re-authentication instead of being deleted. Your `profiles.json` is mirrored to a
+last-known-good copy on every save and auto-recovered if it's ever corrupted, so a crash or
+power cut can't wipe your accounts.
 
 ## Keys
 
@@ -94,11 +96,12 @@ in — no web login.
 ```
 switch.cmd login          # add an account via the official `claude` login (robust fallback)
 switch.cmd import <path>   # import from a file or folder
+switch.cmd doctor          # diagnose saved accounts + live Claude auth (no secrets)
 switch.cmd --dry-run       # show exactly which keys a switch would change (no writes)
 switch.cmd restore         # roll back the last credential change from backup
 switch.cmd install         # set up shortcuts + auto keep-alive
 switch.cmd uninstall       # remove shortcuts + the scheduled keep-alive
-switch.cmd keep-alive      # refresh every account's token now (run by the scheduler)
+switch.cmd keep-alive      # refresh due tokens now and report accounts needing renewal
 switch.cmd --help
 ```
 

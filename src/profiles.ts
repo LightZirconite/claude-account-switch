@@ -6,8 +6,10 @@ import { profilesPath, ensureDataDirs, exportDir, importDir, backupsDir } from '
 import { getLiveAccount } from './claudeStore';
 import { snapshotLiveDesktopInto, newDesktopProfileId, deleteDesktopSnapshot } from './desktopStore';
 import { logger } from './logger';
+import { withFileLockSync } from './locks';
 import {
   hasCliAuth,
+  hasRefreshableOauth,
   type ClaudeAiOauth,
   type OauthAccount,
   type PortableExport,
@@ -122,6 +124,72 @@ function accountsSignature(store: ProfilesStore): string {
   );
 }
 
+function accountKey(p: Profile): string {
+  return (p.accountUuid || p.email || p.id).trim().toLowerCase();
+}
+
+function sameAccount(a: Profile, b: Profile): boolean {
+  return a.id === b.id || (!!a.accountUuid && a.accountUuid === b.accountUuid) || accountKey(a) === accountKey(b);
+}
+
+function copyCredentials(from: Profile, to: Profile): void {
+  to.email = from.email;
+  to.accountUuid = from.accountUuid;
+  to.organizationUuid = from.organizationUuid;
+  to.organizationUuidRoot = from.organizationUuidRoot;
+  to.organizationType = from.organizationType;
+  to.subscriptionType = from.subscriptionType;
+  to.claudeAiOauth = from.claudeAiOauth;
+  to.oauthAccount = from.oauthAccount;
+  to.userID = from.userID;
+  to.needsReauth = from.needsReauth;
+}
+
+function mergeWithDisk(next: ProfilesStore, opts: { allowAccountRemoval?: boolean } = {}): ProfilesStore {
+  let current: ProfilesStore | null = null;
+  try {
+    current = parseStore(fs.readFileSync(profilesPath(), 'utf8'));
+  } catch {
+    current = null;
+  }
+  if (!current) return next;
+
+  for (const diskProfile of current.profiles) {
+    const incoming = next.profiles.find((p) => sameAccount(p, diskProfile));
+    if (!incoming) {
+      if (opts.allowAccountRemoval) continue;
+      next.profiles.push(diskProfile);
+      logger.warn('profiles save prevented account loss', { email: diskProfile.email });
+      continue;
+    }
+
+    const diskOauth = diskProfile.claudeAiOauth;
+    const incomingOauth = incoming.claudeAiOauth;
+    const diskRefresh = diskOauth?.refreshToken?.trim() || '';
+    const incomingRefresh = incomingOauth?.refreshToken?.trim() || '';
+
+    if (hasRefreshableOauth(diskOauth) && !hasRefreshableOauth(incomingOauth)) {
+      copyCredentials(diskProfile, incoming);
+      logger.warn('profiles save preserved refreshable credentials over invalid incoming copy', { email: incoming.email });
+      continue;
+    }
+
+    if (
+      hasRefreshableOauth(diskOauth) &&
+      hasRefreshableOauth(incomingOauth) &&
+      diskRefresh &&
+      incomingRefresh &&
+      diskRefresh !== incomingRefresh &&
+      (incoming.needsReauth || (diskOauth.expiresAt ?? 0) > (incomingOauth.expiresAt ?? 0))
+    ) {
+      copyCredentials(diskProfile, incoming);
+      logger.warn('profiles save preserved newer disk token over stale incoming copy', { email: incoming.email });
+    }
+  }
+
+  return next;
+}
+
 /**
  * Before overwriting profiles.json, snapshot the PREVIOUS version whenever the set of
  * accounts changed (add / delete / rename). This guarantees an account can never be
@@ -175,19 +243,24 @@ function atomicWriteFile(target: string, content: string): void {
   }
 }
 
-export function saveStore(store: ProfilesStore): void {
-  ensureDataDirs();
-  backupProfilesIfChanged(store);
-  const content = JSON.stringify(store, null, 2) + '\n';
-  atomicWriteFile(profilesPath(), content);
-  // Mirror the SAME known-valid content to the last-known-good sidecar. profiles.json and
-  // its .bak are written back-to-back, so an interrupted write can corrupt at most one of
-  // them — loadStore can always recover from the other, with the freshest tokens.
-  try {
-    atomicWriteFile(lastGoodPath(), content);
-  } catch {
-    /* sidecar is best-effort */
-  }
+export function saveStore(store: ProfilesStore, opts: { allowAccountRemoval?: boolean } = {}): void {
+  withFileLockSync('profiles-store', () => {
+    ensureDataDirs();
+    const merged = mergeWithDisk(store, opts);
+    store.profiles = merged.profiles;
+    store.activeProfileId = merged.activeProfileId;
+    backupProfilesIfChanged(store);
+    const content = JSON.stringify(store, null, 2) + '\n';
+    atomicWriteFile(profilesPath(), content);
+    // Mirror the SAME known-valid content to the last-known-good sidecar. profiles.json and
+    // its .bak are written back-to-back, so an interrupted write can corrupt at most one of
+    // them — loadStore can always recover from the other, with the freshest tokens.
+    try {
+      atomicWriteFile(lastGoodPath(), content);
+    } catch {
+      /* sidecar is best-effort */
+    }
+  });
 }
 
 /**
@@ -222,7 +295,11 @@ interface LiveProfileFields {
 /** Read the current live account into profile fields (or null if not logged in). */
 export function liveProfileFields(): LiveProfileFields | null {
   const live = getLiveAccount();
-  if (!live.claudeAiOauth || !live.oauthAccount) return null;
+  if (!live.oauthAccount) return null;
+  if (!hasRefreshableOauth(live.claudeAiOauth)) {
+    logger.warn('reconcile: live Claude Code OAuth block is missing refreshable tokens');
+    return null;
+  }
   const oa = live.oauthAccount;
   return {
     email: oa.emailAddress ?? '(unknown)',
@@ -238,6 +315,9 @@ export function liveProfileFields(): LiveProfileFields | null {
 }
 
 export function makeProfile(fields: LiveProfileFields, label?: string): Profile {
+  if (!hasRefreshableOauth(fields.claudeAiOauth)) {
+    throw new Error('Refusing to create profile with invalid Claude Code OAuth credentials.');
+  }
   return {
     id: crypto.randomUUID(),
     label: label ?? fields.oauthAccount.displayName ?? fields.email,
@@ -248,6 +328,9 @@ export function makeProfile(fields: LiveProfileFields, label?: string): Profile 
 
 /** Overwrite a profile's credential fields from the given fields (keeps id/label/timestamps). */
 export function copyFieldsInto(profile: Profile, fields: LiveProfileFields): Profile {
+  if (!hasRefreshableOauth(fields.claudeAiOauth)) {
+    throw new Error('Refusing to copy invalid Claude Code OAuth credentials into profile.');
+  }
   profile.email = fields.email;
   profile.accountUuid = fields.accountUuid;
   profile.organizationUuid = fields.organizationUuid;
@@ -487,6 +570,9 @@ export function importFromPath(target: string): ImportCandidate[] {
  * into a Desktop-only profile with the same email, so one person stays one row.
  */
 export function addOrUpdateProfile(store: ProfilesStore, fields: LiveProfileFields, label?: string): Profile {
+  if (!hasRefreshableOauth(fields.claudeAiOauth)) {
+    throw new Error('Imported Claude Code credentials are missing a refresh token.');
+  }
   const existing = findByAccountUuid(store, fields.accountUuid) ?? findByEmail(store, fields.email);
   if (existing) {
     copyFieldsInto(existing, fields);
