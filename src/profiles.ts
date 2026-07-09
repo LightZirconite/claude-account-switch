@@ -16,16 +16,101 @@ import {
   type ProfilesStore,
 } from './types';
 
-export function loadStore(): ProfilesStore {
+/** Path of the last-known-good sidecar kept next to profiles.json. */
+function lastGoodPath(): string {
+  return profilesPath() + '.bak';
+}
+
+/** Parse + normalize store text, or null if it isn't a usable store. */
+function parseStore(text: string): ProfilesStore | null {
   try {
-    const t = fs.readFileSync(profilesPath(), 'utf8');
-    const s = JSON.parse(t) as ProfilesStore;
-    if (!Array.isArray(s.profiles)) s.profiles = [];
+    const s = JSON.parse(text) as ProfilesStore;
+    if (!s || typeof s !== 'object' || !Array.isArray(s.profiles)) return null;
     if (typeof s.version !== 'number') s.version = 1;
     return s;
   } catch {
-    return { version: 1, activeProfileId: null, profiles: [] };
+    return null;
   }
+}
+
+/** Newest snapshot in backups/profiles/ that parses and still has ≥1 account. */
+function newestUsableBackup(): ProfilesStore | null {
+  try {
+    const dir = path.join(backupsDir(), 'profiles');
+    const files = fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith('.json'))
+      .sort()
+      .reverse();
+    for (const f of files) {
+      const s = parseStore(fs.readFileSync(path.join(dir, f), 'utf8'));
+      if (s && s.profiles.length) return s;
+    }
+  } catch {
+    /* none */
+  }
+  return null;
+}
+
+/** Move a corrupt profiles.json aside for forensics (never silently overwrite it). */
+function setCorruptAside(): void {
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    fs.renameSync(profilesPath(), `${profilesPath()}.corrupt-${stamp}`);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Load the store, NEVER destroying accounts. A corrupt/partial profiles.json (power cut,
+ * antivirus lock, disk hiccup) used to fall through to an empty store — and the next save
+ * would then overwrite the recoverable file, wiping every login. Now we recover, in order,
+ * from: the last-known-good sidecar, then the newest account-set backup. A truly corrupt &
+ * unrecoverable file is moved aside (kept), never overwritten in place.
+ */
+export function loadStore(): ProfilesStore {
+  let mainText: string | null = null;
+  try {
+    mainText = fs.readFileSync(profilesPath(), 'utf8');
+  } catch {
+    mainText = null; // missing/unreadable — decide below (fresh install vs. lost main file)
+  }
+
+  if (mainText != null) {
+    const s = parseStore(mainText);
+    if (s) return s; // normal, healthy path
+    logger.error('profiles.json is corrupt — attempting recovery', undefined, { path: profilesPath() });
+  }
+
+  // 1) last-known-good sidecar (freshest tokens — written on every save)
+  try {
+    const s = parseStore(fs.readFileSync(lastGoodPath(), 'utf8'));
+    if (s && (s.profiles.length || mainText == null)) {
+      if (mainText != null) setCorruptAside();
+      logger.warn('recovered profiles from last-known-good sidecar', { count: s.profiles.length });
+      saveStore(s);
+      return s;
+    }
+  } catch {
+    /* no sidecar */
+  }
+
+  // 2) newest usable account-set backup
+  const backup = newestUsableBackup();
+  if (backup) {
+    if (mainText != null) setCorruptAside();
+    logger.warn('recovered profiles from backup snapshot', { count: backup.profiles.length });
+    saveStore(backup);
+    return backup;
+  }
+
+  // 3) nothing to recover — if the main file was non-empty garbage, keep it aside.
+  if (mainText != null && mainText.trim()) {
+    logger.error('profiles.json corrupt and unrecoverable — kept aside, starting empty');
+    setCorruptAside();
+  }
+  return { version: 1, activeProfileId: null, profiles: [] };
 }
 
 /** A signature of the account *set* (not tokens/usage) to detect real changes. */
@@ -72,21 +157,36 @@ function backupProfilesIfChanged(next: ProfilesStore): void {
   }
 }
 
-export function saveStore(store: ProfilesStore): void {
-  ensureDataDirs();
-  backupProfilesIfChanged(store);
-  const content = JSON.stringify(store, null, 2) + '\n';
-  const tmp = profilesPath() + '.tmp';
+let saveSeq = 0;
+
+/** Atomic write via a per-call temp file (unique so concurrent/other-process writes can't collide). */
+function atomicWriteFile(target: string, content: string): void {
+  const tmp = `${target}.tmp-${process.pid}-${saveSeq++}`;
   fs.writeFileSync(tmp, content, 'utf8');
   try {
-    fs.renameSync(tmp, profilesPath());
+    fs.renameSync(tmp, target);
   } catch {
-    fs.writeFileSync(profilesPath(), content, 'utf8');
+    fs.writeFileSync(target, content, 'utf8');
     try {
       fs.unlinkSync(tmp);
     } catch {
       /* ignore */
     }
+  }
+}
+
+export function saveStore(store: ProfilesStore): void {
+  ensureDataDirs();
+  backupProfilesIfChanged(store);
+  const content = JSON.stringify(store, null, 2) + '\n';
+  atomicWriteFile(profilesPath(), content);
+  // Mirror the SAME known-valid content to the last-known-good sidecar. profiles.json and
+  // its .bak are written back-to-back, so an interrupted write can corrupt at most one of
+  // them — loadStore can always recover from the other, with the freshest tokens.
+  try {
+    atomicWriteFile(lastGoodPath(), content);
+  } catch {
+    /* sidecar is best-effort */
   }
 }
 

@@ -1,7 +1,8 @@
 // Keyboard-driven TUI for switching Claude Code accounts. UI is in English.
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { render, Box, Text, useApp, useInput } from 'ink';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import path from 'node:path';
 import clipboard from 'clipboardy';
 
 import { logFile, findClaudeExe, importDir } from './paths';
@@ -1328,6 +1329,9 @@ Usage:
   switch.cmd export-all      Export ALL accounts into one portable backup file
   switch.cmd --dry-run       Show exactly which keys a switch would change (no writes)
   switch.cmd restore         Roll back the last credential change from backup
+  switch.cmd keep-alive          Refresh all accounts' tokens now (keeps logins alive)
+  switch.cmd keep-alive install  Schedule keep-alive every 6h (accounts never expire)
+  switch.cmd keep-alive uninstall  Remove the scheduled keep-alive job
   switch.cmd --help          This help
 
 Data & logs live in ~/.claude-switch/`);
@@ -1345,6 +1349,103 @@ function printDryRun(target: Profile, rep: DryRunReport): void {
   console.log('\nNo files were written.');
 }
 
+const KEEPALIVE_TASK = 'ClaudeAccountSwitch-KeepAlive';
+
+/** Absolute path to this running script (dist/cli.js), for the scheduler to invoke. */
+function scriptEntry(): string {
+  return path.resolve(process.argv[1] ?? '');
+}
+
+/**
+ * Headless keep-alive: refresh every account's OAuth token that's near expiry and persist
+ * the rotation — so accounts stay alive even when the switcher UI isn't open. Run by the OS
+ * scheduler (see keep-alive install). The ACTIVE account is left to a running `claude`
+ * session if one is live (it manages its own token); otherwise we reconcile + refresh it too.
+ */
+async function runKeepAliveOnce(): Promise<void> {
+  const store = loadStore();
+  if (!store.profiles.length) {
+    console.log('keep-alive: no accounts saved.');
+    return;
+  }
+  const LEAD_MS = 60 * 60 * 1000; // refresh anything expiring within the next hour
+  let claudeRunning = false;
+  try {
+    claudeRunning = findClaudeProcesses().length > 0;
+  } catch {
+    /* treat as not running */
+  }
+  const onRotate = (p: Profile) => {
+    saveStore(store);
+    if (p.id === store.activeProfileId && p.claudeAiOauth) {
+      try {
+        updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+  let refreshed = 0;
+  let dead = 0;
+  for (const p of store.profiles) {
+    if (!p.claudeAiOauth) continue;
+    if (p.needsReauth) {
+      dead++;
+      continue;
+    }
+    const isActive = p.id === store.activeProfileId;
+    if (isActive && claudeRunning) continue; // the live session owns its own token
+    if (isActive) {
+      try {
+        reconcileWithLive(store);
+      } catch {
+        /* keep going */
+      }
+    }
+    const before = p.claudeAiOauth.refreshToken;
+    await keepTokenAlive(p, LEAD_MS, onRotate);
+    if (p.claudeAiOauth.refreshToken !== before) refreshed++;
+    if (p.needsReauth) dead++;
+  }
+  saveStore(store);
+  logger.info('keep-alive run complete', { refreshed, dead, total: store.profiles.length });
+  console.log(`keep-alive: refreshed ${refreshed} token(s)${dead ? `, ${dead} account(s) need re-add` : ''}.`);
+}
+
+/** Register an OS scheduled job that runs `keep-alive` every 6 hours (Windows Task Scheduler). */
+function keepAliveInstall(): void {
+  const entry = scriptEntry();
+  if (process.platform !== 'win32') {
+    console.log('Add this to your crontab (macOS/Linux) to keep accounts alive while the app is closed:');
+    console.log(`  0 */6 * * *  "${process.execPath}" "${entry}" keep-alive`);
+    return;
+  }
+  const tr = `"${process.execPath}" "${entry}" keep-alive`;
+  const r = spawnSync(
+    'schtasks',
+    ['/Create', '/F', '/SC', 'HOURLY', '/MO', '6', '/TN', KEEPALIVE_TASK, '/TR', tr],
+    { encoding: 'utf8' },
+  );
+  if (r.status === 0) {
+    console.log(`✓ Installed scheduled task "${KEEPALIVE_TASK}" (runs every 6h).`);
+    console.log('  Your saved accounts now stay logged in even when the switcher is closed.');
+    console.log(`  Remove it any time with:  switch.cmd keep-alive uninstall`);
+  } else {
+    console.log('Could not install the scheduled task (try an elevated terminal).');
+    console.log((r.stderr || r.stdout || '').trim());
+  }
+}
+
+/** Remove the scheduled keep-alive job. */
+function keepAliveUninstall(): void {
+  if (process.platform !== 'win32') {
+    console.log('Remove the cron line you added for `keep-alive`.');
+    return;
+  }
+  const r = spawnSync('schtasks', ['/Delete', '/F', '/TN', KEEPALIVE_TASK], { encoding: 'utf8' });
+  console.log(r.status === 0 ? `✓ Removed scheduled task "${KEEPALIVE_TASK}".` : 'No scheduled task to remove.');
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
@@ -1356,6 +1457,19 @@ async function main(): Promise<void> {
   if (args[0] === 'restore') {
     const dir = restoreLatestBackup();
     console.log(dir ? `Restored credentials from backup: ${dir}` : 'No backups found.');
+    return;
+  }
+
+  if (args[0] === 'keep-alive') {
+    if (args[1] === 'install') {
+      keepAliveInstall();
+      return;
+    }
+    if (args[1] === 'uninstall') {
+      keepAliveUninstall();
+      return;
+    }
+    await runKeepAliveOnce();
     return;
   }
 
