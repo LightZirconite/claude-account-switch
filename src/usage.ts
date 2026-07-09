@@ -1,22 +1,40 @@
 // Per-account usage/quota via the undocumented oauth/usage endpoint.
 // Aggressively rate-limited: cache hard, degrade gracefully.
 import { logger } from './logger';
-import { refreshToken } from './oauth';
+import { refreshToken, type TokenSet } from './oauth';
 import { hasCliAuth, type Profile, type UsageInfo } from './types';
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CACHE_MS = 10 * 60 * 1000; // usage only changes every few hours
 const MIN_INTERVAL_MS = 30 * 1000; // hard floor: never hit the endpoint more than once / 30s per account
 
-/** Ensure profile has a non-expired access token, refreshing (and persisting rotation) if needed. */
+// The OAuth refresh token ROTATES: every successful refresh invalidates the token we
+// sent and returns a new one. Two refreshes racing on the same account would both send
+// the same token — the first rotates it away, the second gets invalid_grant and would
+// (wrongly) flag a perfectly healthy account as dead. So we single-flight refreshes per
+// account: a second caller awaits the first's result instead of POSTing a now-stale token.
+const inFlightRefresh = new Map<string, Promise<TokenSet | null>>();
+// Last time we ATTEMPTED a refresh for an account (success or failure), used to back off
+// so a known-bad (needsReauth) account can't hammer the token endpoint on every render.
+const lastRefreshAttempt = new Map<string, number>();
+
+/** Marks an error carried out of the single-flight refresh as a dead-token (invalid_grant). */
+class InvalidGrantError extends Error {}
+
+/**
+ * Ensure profile has a non-expired access token, refreshing (and persisting rotation) if
+ * needed. `refreshLeadMs` is how far before expiry we proactively refresh (default 60s;
+ * the keep-alive passes a larger lead so parked accounts never actually reach expiry).
+ */
 async function ensureAccessToken(
   profile: Profile,
   onRotate?: (p: Profile) => void,
+  refreshLeadMs = 60_000,
 ): Promise<string | null> {
   const now = Date.now();
   if (!hasCliAuth(profile)) return null;
   const oauth = profile.claudeAiOauth;
-  if (oauth.expiresAt && oauth.expiresAt > now + 60_000) {
+  if (oauth.accessToken && oauth.expiresAt && oauth.expiresAt > now + refreshLeadMs) {
     // Token is still valid — if it was previously flagged needsReauth (e.g. a
     // transient invalid_grant during a refresh race), a valid token proves the
     // account is fine again, so clear the flag instead of leaving it stuck.
@@ -27,24 +45,95 @@ async function ensureAccessToken(
     return oauth.accessToken;
   }
   if (!oauth.refreshToken) return oauth.accessToken ?? null;
+
+  // Back off for a known-dead account: don't re-POST a refresh token we already know is
+  // rejected until MIN_INTERVAL_MS has passed. (A healthy account whose access token
+  // merely expired is NOT throttled — needsReauth is false — so it refreshes right away.)
+  const last = lastRefreshAttempt.get(profile.id) ?? 0;
+  if (profile.needsReauth && now - last < MIN_INTERVAL_MS) {
+    return null;
+  }
+
+  // Single-flight: coalesce concurrent refreshes for this account onto one POST.
+  let pending = inFlightRefresh.get(profile.id);
+  if (!pending) {
+    const tokenAtStart = oauth.refreshToken;
+    pending = (async () => {
+      lastRefreshAttempt.set(profile.id, Date.now());
+      try {
+        return await refreshToken(tokenAtStart);
+      } catch (e) {
+        const msg = String(e);
+        if (/invalid_grant/i.test(msg)) {
+          logger.warn('usage: refresh token rejected (needs re-login)', { email: profile.email });
+          throw new InvalidGrantError(msg);
+        }
+        logger.warn('usage: token refresh failed', { email: profile.email, error: msg });
+        throw e;
+      } finally {
+        inFlightRefresh.delete(profile.id);
+      }
+    })();
+    inFlightRefresh.set(profile.id, pending);
+  }
+
   try {
-    const refreshed = await refreshToken(oauth.refreshToken);
+    const refreshed = await pending;
+    if (!refreshed) return null;
+    // All coalesced callers write the same rotated token — idempotent.
     oauth.accessToken = refreshed.accessToken;
     oauth.refreshToken = refreshed.refreshToken; // rotates
     oauth.expiresAt = refreshed.expiresAt;
     profile.needsReauth = false;
-    onRotate?.(profile);
+    onRotate?.(profile); // persist the rotation immediately so it's never lost
     logger.info('usage: refreshed token', { email: profile.email });
     return refreshed.accessToken;
   } catch (e) {
-    const msg = String(e);
-    if (/invalid_grant/i.test(msg)) {
+    if (e instanceof InvalidGrantError) {
       profile.needsReauth = true; // dead refresh token — the account must be re-added
-      logger.warn('usage: refresh token rejected (needs re-login)', { email: profile.email });
-    } else {
-      logger.warn('usage: token refresh failed', { email: profile.email, error: msg });
+      onRotate?.(profile); // persist the flag
     }
+    // A non-invalid_grant failure (network/5xx) is transient — leave needsReauth untouched.
     return null;
+  }
+}
+
+/**
+ * Guarantee `profile` has a usable (non-expired) access token, rotating + persisting if
+ * needed. Goes through the SAME single-flight path as usage refreshes, so calling it right
+ * before a switch can't race a background refresh of the same account (which would burn the
+ * token). Returns false only when the refresh token is dead (invalid_grant) or absent.
+ */
+export async function ensureFreshToken(
+  profile: Profile,
+  onRotate?: (p: Profile) => void,
+): Promise<boolean> {
+  const token = await ensureAccessToken(profile, onRotate);
+  return token != null;
+}
+
+/**
+ * Proactively refresh an account's OAuth token if it expires within `leadMs`, WITHOUT
+ * touching the rate-limited usage endpoint. This is the keep-alive that lets PARKED
+ * accounts live forever: as long as we rotate + persist their token before it expires,
+ * the account never dies — mirroring what the live Claude session does for the active one.
+ * Safe to call often: it no-ops when the token is still fresh, single-flights concurrent
+ * calls, and backs off accounts already known to be dead (needsReauth).
+ */
+export async function keepTokenAlive(
+  profile: Profile,
+  leadMs: number,
+  onRotate?: (p: Profile) => void,
+): Promise<void> {
+  if (!hasCliAuth(profile)) return;
+  if (profile.needsReauth) return; // dead token — nothing to keep alive
+  const oauth = profile.claudeAiOauth;
+  const now = Date.now();
+  if (oauth.accessToken && oauth.expiresAt && oauth.expiresAt > now + leadMs) return; // still fresh
+  try {
+    await ensureAccessToken(profile, onRotate, leadMs);
+  } catch {
+    /* best-effort keep-alive */
   }
 }
 
@@ -62,7 +151,16 @@ export async function fetchUsage(
 
   const access = await ensureAccessToken(profile, opts.onRotate);
   if (!access) {
-    return { fetchedAt: now, status: 'error', error: 'no valid access token' };
+    // Keep showing the last known usage (dimmed as 'stale') so a needs-reauth account
+    // still displays its last rate-limit numbers instead of a blank error.
+    if (profile.usage && (profile.usage.status === 'ok' || profile.usage.status === 'stale')) {
+      return { ...profile.usage, status: 'stale' };
+    }
+    return {
+      fetchedAt: now,
+      status: 'error',
+      error: profile.needsReauth ? 'login expired — re-add with "a"' : 'no valid access token',
+    };
   }
 
   try {

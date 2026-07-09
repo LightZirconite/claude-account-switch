@@ -32,12 +32,11 @@ import {
   type DryRunReport,
 } from './claudeStore';
 import { applyDesktopSnapshot, isDesktopInstalled } from './desktopStore';
-import { fetchUsage, leastLoaded } from './usage';
+import { ensureFreshToken, fetchUsage, keepTokenAlive, leastLoaded } from './usage';
 import { findClaudeProcesses, closeProcesses, detectClaudeVersion, type ProcInfo } from './processes';
 import {
   buildManualAuth,
   exchangeCode,
-  refreshToken,
   primeIdentity,
   loginViaClaudeCli,
   DEFAULT_SCOPES,
@@ -304,22 +303,79 @@ function App({ initialStore, claudeVersion }: AppProps) {
     }
   }, []);
 
-  // fetch active usage on mount (best-effort, cached)
+  // On open, populate usage for EVERY account (not just the active one) so the whole
+  // table is fresh immediately — no more "I have to press refresh myself". The active
+  // account goes first (fast, most relevant); the rest follow staggered so we stay gentle
+  // on the rate-limited usage endpoint. fetchUsage's own cache means already-fresh rows
+  // don't re-hit the network.
   useEffect(() => {
     (async () => {
-      const a = getActive(store);
-      if (!a) return;
-      reconcileActiveIfLive(store, a);
-      try {
-        const info = await fetchUsage(a, claudeVersion, { onRotate });
-        a.usage = info;
-        persist(store);
-      } catch (e) {
-        logger.error('mount usage fetch failed', e);
+      const s = storeRef.current;
+      const a = getActive(s);
+      if (a) {
+        reconcileActiveIfLive(s, a);
+        try {
+          a.usage = await fetchUsage(a, claudeVersion, { onRotate });
+          persist(s);
+        } catch (e) {
+          logger.error('mount usage fetch failed', e);
+        }
+      }
+      for (const p of s.profiles) {
+        if (p.id === s.activeProfileId || !p.claudeAiOauth) continue;
+        try {
+          p.usage = await fetchUsage(p, claudeVersion, { onRotate });
+          persist(storeRef.current);
+        } catch (e) {
+          logger.error('mount usage fetch failed', e, { email: p.email });
+        }
+        await sleep(600); // be gentle with the rate-limited endpoint
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Keep-alive: every 10 minutes, proactively refresh the OAuth token of ANY account whose
+  // token expires within the next ~30 minutes — parked accounts included. This only touches
+  // the (non-rate-limited) token endpoint, rotating and persisting before expiry, so an
+  // account that's just sitting there never dies. This is what makes saved accounts as
+  // durable as a normal `claude login`: as long as the switcher runs periodically, the
+  // token chain never breaks. (needs-reauth accounts are skipped — their token is dead.)
+  useEffect(() => {
+    const KEEP_ALIVE_LEAD_MS = 30 * 60 * 1000;
+    // Stable rotate handler (reads live store via ref) so this effect doesn't re-subscribe
+    // on every persist. Persists the rotation and, if the rotated account is the active one,
+    // syncs it into the live credentials so a running `claude` session stays valid.
+    const rotate = (p: Profile) => {
+      const s = storeRef.current;
+      saveStore(s);
+      if (p.id === s.activeProfileId && p.claudeAiOauth) {
+        try {
+          updateLiveCredentials(p.claudeAiOauth, p.organizationUuidRoot ?? p.organizationUuid);
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+    const run = () => {
+      (async () => {
+        for (const p of storeRef.current.profiles) {
+          if (!p.claudeAiOauth || p.needsReauth) continue;
+          // Skip the ACTIVE account: a running `claude` session rotates its token
+          // independently, so refreshing our (possibly already-stale) copy here could
+          // desync and falsely flag it. The 2-min active-usage interval — which
+          // reconciles from the live files first — keeps the active account alive.
+          if (p.id === storeRef.current.activeProfileId) continue;
+          await keepTokenAlive(p, KEEP_ALIVE_LEAD_MS, rotate);
+        }
+        persist(storeRef.current);
+      })().catch((e) => logger.error('keep-alive failed', e));
+    };
+    run(); // once shortly after open, then on the interval
+    const t = setInterval(run, 10 * 60 * 1000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [claudeVersion]);
 
   // As you move the cursor (hover, no need to press Enter), preview that account's
   // usage in the panel below. fetchUsage's own 10-minute cache means flicking through
@@ -418,18 +474,12 @@ function App({ initialStore, claudeVersion }: AppProps) {
           logger.error('reconcile before switch failed', e);
         }
         // Proactively refresh the target's token if it's expired, so it works instantly.
-        const oauth = target.claudeAiOauth;
-        if (oauth.expiresAt && oauth.expiresAt < Date.now() + 60_000 && oauth.refreshToken) {
-          try {
-            const r = await refreshToken(oauth.refreshToken);
-            oauth.accessToken = r.accessToken;
-            oauth.refreshToken = r.refreshToken;
-            oauth.expiresAt = r.expiresAt;
-            target.needsReauth = false;
-          } catch (e) {
-            if (/invalid_grant/i.test(String(e))) target.needsReauth = true;
-            logger.warn('proactive refresh on switch failed', { email: target.email });
-          }
+        // Routed through the single-flighted ensureFreshToken so it can't race (and burn
+        // the token against) a background refresh of this same account.
+        try {
+          await ensureFreshToken(target, onRotate);
+        } catch (e) {
+          logger.warn('proactive refresh on switch failed', { email: target.email });
         }
         const res = applyProfile(target);
         if (!res.ok) {
@@ -924,7 +974,7 @@ function App({ initialStore, claudeVersion }: AppProps) {
                   </Text>
                   {!selected.claudeAiOauth ? (
                     <Text dimColor>{'   Desktop-only account — usage not available'}</Text>
-                  ) : selected.usage?.status === 'ok' ? (
+                  ) : selected.usage && (selected.usage.status === 'ok' || selected.usage.status === 'stale') ? (
                     <>
                       <Text>
                         {'   5h  '}
@@ -940,6 +990,11 @@ function App({ initialStore, claudeVersion }: AppProps) {
                         </Text>
                         <Text dimColor>resets {resetAt(selected.usage.seven_day?.resets_at)}</Text>
                       </Text>
+                      {selected.needsReauth ? (
+                        <Text color="red">{'   ⚠ login expired — press "a" to re-add (numbers are last-known)'}</Text>
+                      ) : selected.usage.status === 'stale' ? (
+                        <Text dimColor>{'   (cached — refreshing…)'}</Text>
+                      ) : null}
                       {/* PROMO: Fable 50% until 2026-07-07 — auto-hidden after FABLE_PROMO_END; safe to delete this block after the promo. */}
                       {(() => {
                         if (Date.now() >= FABLE_PROMO_END) return null;
@@ -954,8 +1009,12 @@ function App({ initialStore, claudeVersion }: AppProps) {
                         );
                       })()}
                     </>
+                  ) : selected.needsReauth ? (
+                    <Text color="red">{'   ⚠ login expired — press "a" to re-add this account'}</Text>
+                  ) : selected.usage?.status === 'rate_limited' ? (
+                    <Text dimColor>{'   rate-limited — usage will refresh shortly'}</Text>
                   ) : (
-                    <Text dimColor>{'   press u to load usage'}</Text>
+                    <Text dimColor>{'   loading usage… (press u to force refresh)'}</Text>
                   )}
                 </Box>
               ) : null}
