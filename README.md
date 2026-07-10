@@ -64,9 +64,11 @@ The account actions apply only to the visible provider.
 | q | quit |
 
 Codex switching is performed by a detached worker. It validates the target first, refuses
-to continue while a Codex CLI is active, asks the desktop app to close gracefully, swaps
+to continue while a Codex CLI is active, asks the desktop app to close gracefully, then
+force-quits only the confirmed Desktop process tree if it merely minimizes. It swaps
 `auth.json` atomically, validates the result through App Server, and rolls back on failure.
-No process is force-killed.
+The confirmation warns that unsaved Desktop work can be lost; Claude and standalone Codex
+CLI processes are never force-killed.
 
 ## Remote authorization
 

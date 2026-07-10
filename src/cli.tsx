@@ -1754,8 +1754,8 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           {mode === 'codexConfirmSwitch' && pendingCodexSwitch ? (
             <Box marginTop={1} flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
               <Text bold color="yellow">Switch Codex to "{pendingCodexSwitch.label}" ({pendingCodexSwitch.email})?</Text>
-              <Text>Codex Desktop will be closed gracefully, validated, switched and reopened.</Text>
-              <Text dimColor>Running standalone Codex CLI sessions must be closed manually. No force-kill is used.</Text>
+              <Text>Codex Desktop will be asked to close, then force-quit after 8 seconds if it only minimizes.</Text>
+              <Text dimColor>Unsaved Desktop work can be lost. Standalone Codex CLI sessions are never force-quit.</Text>
               <Box marginTop={1}><Text color="yellow">[y/Enter]</Text><Text dimColor> confirm · [n/Esc] cancel</Text></Box>
             </Box>
           ) : null}

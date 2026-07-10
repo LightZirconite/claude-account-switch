@@ -22,7 +22,9 @@
 
 ## Switching safety
 
-- Never force-kill Claude or Codex processes.
+- Never force-kill Claude or a standalone Codex CLI process. A confirmed Codex Desktop
+  switch may terminate only its identified Desktop process tree after a bounded graceful
+  close attempt; the UI must warn that unsaved Desktop work can be lost.
 - Validate the target before modifying live authentication.
 - Abort before writing when a relevant process refuses to close.
 - Replace only the provider-specific auth file atomically and roll back on validation failure.

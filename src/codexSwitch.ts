@@ -42,6 +42,8 @@ export type CodexAuthTransactionResult<T> =
   | { ok: false; error: Error; backupDir: string };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const GRACEFUL_DESKTOP_CLOSE_MS = 8_000;
+const FORCED_DESKTOP_CLOSE_WAIT_MS = 10_000;
 
 function windowsProcesses(): RawProcess[] {
   const script = [
@@ -110,6 +112,49 @@ export function remainingTrackedProcessIds(initialPids: ReadonlySet<number>, cur
   return current.filter((process) => initialPids.has(process.pid)).map((process) => process.pid);
 }
 
+export function desktopProcessRootIds(processes: CodexProcessInfo[]): number[] {
+  const pids = new Set(processes.map((process) => process.pid));
+  return processes.filter((process) => !pids.has(process.ppid)).map((process) => process.pid);
+}
+
+async function waitForTrackedProcessesToExit(initialPids: ReadonlySet<number>, timeoutMs: number): Promise<number[]> {
+  const deadline = Date.now() + timeoutMs;
+  let remaining = remainingTrackedProcessIds(initialPids, findCodexProcesses());
+  while (remaining.length && Date.now() < deadline) {
+    await sleep(500);
+    remaining = remainingTrackedProcessIds(initialPids, findCodexProcesses());
+  }
+  return remaining;
+}
+
+function forceTerminateDesktopProcessTree(appProcesses: CodexProcessInfo[]): void {
+  const roots = desktopProcessRootIds(appProcesses);
+  if (process.platform === 'win32') {
+    for (const pid of roots) {
+      try {
+        execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+          encoding: 'utf8',
+          timeout: 15_000,
+          windowsHide: true,
+        });
+      } catch {
+        // A process can exit between the observation and taskkill. The caller
+        // verifies the complete original process set before changing auth.
+      }
+    }
+    return;
+  }
+  if (process.platform === 'darwin') {
+    for (const pid of roots) {
+      try {
+        process.kill(pid, 'SIGTERM');
+      } catch {
+        /* process already exited or cannot be terminated */
+      }
+    }
+  }
+}
+
 async function requestGracefulAppClose(appProcesses: CodexProcessInfo[]): Promise<void> {
   const initialPids = new Set(appProcesses.map((process) => process.pid));
   if (!initialPids.size) return;
@@ -126,13 +171,16 @@ async function requestGracefulAppClose(appProcesses: CodexProcessInfo[]): Promis
   } else if (process.platform === 'darwin') {
     execFileSync('osascript', ['-e', 'tell application "Codex" to quit'], { timeout: 10_000 });
   }
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    if (!remainingTrackedProcessIds(initialPids, findCodexProcesses()).length) return;
-    await sleep(500);
-  }
-  const remaining = remainingTrackedProcessIds(initialPids, findCodexProcesses());
-  throw new Error(`Codex is still closing after 60 seconds (process ${remaining.join(', ')}). Close it completely and retry. No credentials were changed.`);
+  const remainingAfterGracefulClose = await waitForTrackedProcessesToExit(initialPids, GRACEFUL_DESKTOP_CLOSE_MS);
+  if (!remainingAfterGracefulClose.length) return;
+
+  // The Windows Codex Desktop app can turn a CloseMainWindow request into a
+  // tray minimization. The user already confirmed this switch, so terminate
+  // only the observed Desktop tree, never a standalone Codex CLI session.
+  forceTerminateDesktopProcessTree(appProcesses);
+  const remainingAfterForce = await waitForTrackedProcessesToExit(initialPids, FORCED_DESKTOP_CLOSE_WAIT_MS);
+  if (!remainingAfterForce.length) return;
+  throw new Error(`Codex Desktop could not be closed (process ${remainingAfterForce.join(', ')}). No credentials were changed.`);
 }
 
 function relaunchCodexApp(): void {

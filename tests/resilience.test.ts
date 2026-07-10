@@ -27,7 +27,7 @@ import {
   saveCodexStore,
 } from '../src/codexProfiles';
 import { codexRedirectUriFromAuthUrl, validateCodexCallbackUrl } from '../src/codexAppServer';
-import { applyCodexAuthTransaction, remainingTrackedProcessIds } from '../src/codexSwitch';
+import { applyCodexAuthTransaction, desktopProcessRootIds, remainingTrackedProcessIds } from '../src/codexSwitch';
 import { applyProfile } from '../src/claudeStore';
 import { withFileLock } from '../src/locks';
 import { moveProviderCursor, switchProviderTab } from '../src/navigation';
@@ -256,4 +256,8 @@ test('Codex keeps tracking the original desktop process while it closes', () => 
     { pid: 300, ppid: 1, name: 'codex.exe', commandLine: '', kind: 'cli' as const },
   ];
   assert.deepEqual(remainingTrackedProcessIds(initial, current), [102]);
+  assert.deepEqual(desktopProcessRootIds([
+    { pid: 101, ppid: 1, name: 'ChatGPT.exe', commandLine: '', kind: 'app' },
+    { pid: 102, ppid: 101, name: 'codex.exe', commandLine: '', kind: 'app' },
+  ]), [101]);
 });
