@@ -14,6 +14,7 @@ import {
   deleteProfile,
   loadStore,
   mutateStore,
+  reconcileWithLive,
   saveStore,
 } from '../src/profiles';
 import {
@@ -21,13 +22,16 @@ import {
   importCodexFromPath,
   loadCodexStore,
   readCodexAuth,
+  recoverAbandonedCodexHomes,
   renameCodexProfile,
   saveCodexStore,
 } from '../src/codexProfiles';
+import { codexRedirectUriFromAuthUrl, validateCodexCallbackUrl } from '../src/codexAppServer';
 import { applyCodexAuthTransaction } from '../src/codexSwitch';
 import { applyProfile } from '../src/claudeStore';
 import { withFileLock } from '../src/locks';
 import { moveProviderCursor, switchProviderTab } from '../src/navigation';
+import { buildManualAuth } from '../src/oauth';
 import type { CodexAuthFile, Profile, ProfilesStore } from '../src/types';
 
 let root = '';
@@ -207,4 +211,40 @@ test('a Codex tombstone blocks stale resurrection and provider cursors stay inde
   const claudeTab = switchProviderTab(moved, 'left');
   assert.equal(claudeTab.provider, 'claude');
   assert.deepEqual(claudeTab.cursors, { claude: 2, codex: 6 });
+});
+
+test('portable login URLs support remote Claude authorization and a validated Codex callback', () => {
+  const claude = new URL(buildManualAuth().url);
+  assert.equal(claude.hostname, 'claude.ai');
+  assert.equal(claude.searchParams.get('code'), 'true');
+  assert.equal(claude.searchParams.get('redirect_uri'), 'https://console.anthropic.com/oauth/code/callback');
+
+  const expected = 'http://localhost:1455/auth/callback';
+  const authUrl = `https://auth.openai.com/authorize?redirect_uri=${encodeURIComponent(expected)}`;
+  assert.equal(codexRedirectUriFromAuthUrl(authUrl), expected);
+  assert.equal(
+    validateCodexCallbackUrl(`${expected}?code=remote-code&state=state`, expected),
+    `${expected}?code=remote-code&state=state`,
+  );
+  assert.throws(
+    () => validateCodexCallbackUrl('http://localhost:9999/auth/callback?code=wrong', expected),
+    /does not match/,
+  );
+});
+
+test('live-auth drift clears only the Claude active marker and abandoned Codex sandboxes are preserved', () => {
+  resetRoot();
+  saveStore(store([claudeProfile('saved', 'saved@example.test')], 3));
+  const reconciled = mutateStore((fresh) => { reconcileWithLive(fresh); });
+  assert.equal(reconciled.activeProfileId, null);
+  assert.equal(reconciled.profiles.length, 1);
+
+  const pending = codexProfileHome('pending-abandoned');
+  writeJson(path.join(pending, 'partial.json'), { incomplete: true });
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(pending, old, old);
+  const recovered = recoverAbandonedCodexHomes(0);
+  assert.equal(recovered.length, 1);
+  assert.equal(fs.existsSync(pending), false);
+  assert.equal(fs.existsSync(path.join(recovered[0], 'partial.json')), true);
 });

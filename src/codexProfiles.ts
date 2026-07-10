@@ -18,6 +18,7 @@ import { inspectCodexHome, loginCodexHome, type CodexInspection } from './codexA
 import type { CodexAuthFile, CodexProfile, CodexProfilesStore, CodexUsageInfo, ProfileTombstone } from './types';
 
 const STORE_VERSION = 1;
+const ABANDONED_PENDING_AGE_MS = 15 * 60_000;
 let writeSeq = 0;
 
 interface PortableCodexProfile {
@@ -103,6 +104,39 @@ export function loadCodexStore(): CodexProfilesStore {
     return backup;
   }
   return emptyStore();
+}
+
+export function listPendingCodexHomes(): Array<{ name: string; updatedAt: number }> {
+  try {
+    return fs.readdirSync(codexCredentialsRoot(), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith('pending-'))
+      .map((entry) => {
+        const source = path.join(codexCredentialsRoot(), entry.name);
+        return { name: entry.name, updatedAt: fs.statSync(source).mtimeMs };
+      });
+  } catch {
+    return [];
+  }
+}
+
+/** Preserve abandoned login sandboxes for diagnostics instead of leaving them active. */
+export function recoverAbandonedCodexHomes(minAgeMs = ABANDONED_PENDING_AGE_MS): string[] {
+  ensureDataDirs();
+  const recovered: string[] = [];
+  for (const pending of listPendingCodexHomes()) {
+    if (Date.now() - pending.updatedAt < minAgeMs) continue;
+    const source = path.join(codexCredentialsRoot(), pending.name);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const destination = path.join(backupsDir(), 'codex-abandoned', `${stamp}-${pending.name}`);
+    try {
+      fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+      fs.renameSync(source, destination);
+      recovered.push(destination);
+    } catch (error) {
+      logger.warn('codex abandoned login recovery failed', { name: pending.name, error: String(error) });
+    }
+  }
+  return recovered;
 }
 
 function mergeTombstones(a: ProfileTombstone[], b: ProfileTombstone[]): ProfileTombstone[] {
@@ -326,7 +360,13 @@ export async function reconcileLiveCodex(
   }
   // Read after inspection because account/read(refreshToken=true) may rotate auth.json.
   const auth = readCodexAuth(codexHome());
-  if (!auth) return { store: loadCodexStore(), profile: null };
+  if (!auth) {
+    const current = loadCodexStore();
+    const store = current.activeProfileId
+      ? mutateCodexStore((fresh) => { fresh.activeProfileId = null; })
+      : current;
+    return { store, profile: null };
+  }
   const result = upsertAuth(auth, inspection);
   result.store = mutateCodexStore((store) => {
     store.activeProfileId = result.profile.id;
@@ -336,12 +376,16 @@ export async function reconcileLiveCodex(
   return result;
 }
 
-export async function addCodexAccount(onAuthUrl: (url: string) => void): Promise<{ store: CodexProfilesStore; profile: CodexProfile }> {
+export async function addCodexAccount(
+  onAuthUrl: (url: string) => void | Promise<void>,
+  signal?: AbortSignal,
+): Promise<{ store: CodexProfilesStore; profile: CodexProfile }> {
   ensureDataDirs();
+  recoverAbandonedCodexHomes();
   const tempId = `pending-${crypto.randomUUID()}`;
   const home = codexProfileHome(tempId);
   try {
-    const inspection = await loginCodexHome(home, onAuthUrl);
+    const inspection = await loginCodexHome(home, onAuthUrl, signal);
     if (inspection.account?.type !== 'chatgpt') throw new Error('Only ChatGPT Codex accounts are supported.');
     const auth = readCodexAuth(home);
     if (!auth) throw new Error('Codex login completed without a reusable ChatGPT auth.json.');

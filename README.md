@@ -16,7 +16,7 @@ and switch only the selected provider's authentication.
 | Behavior | Claude | Codex |
 | --- | --- | --- |
 | Active credentials | Claude credential/config files | `~/.codex/auth.json` only |
-| Add account | isolated `claude auth login` | App Server `account/login/start` |
+| Add account | portable paste-code OAuth flow | App Server `account/login/start` |
 | Identity | Claude live files/status | App Server `account/read` + `account_id` |
 | Quotas | cached best-effort Claude usage | App Server `account/rateLimits/read` |
 | Maintenance | serialized OAuth rotation | forced App Server token refresh |
@@ -52,7 +52,7 @@ The account actions apply only to the visible provider.
 | Left/Right | switch between Claude and Codex tabs |
 | Up/Down | move that provider's independent cursor |
 | Enter | switch to the selected account |
-| a | add or re-authorize through the provider's official login |
+| a | copy a remote authorization URL, then paste the returned code/callback |
 | i | import provider-tagged credentials |
 | e / E | export selected / all accounts for the visible provider |
 | r | rename the selected account |
@@ -67,6 +67,22 @@ Codex switching is performed by a detached worker. It validates the target first
 to continue while a Codex CLI is active, asks the desktop app to close gracefully, swaps
 `auth.json` atomically, validates the result through App Server, and rolls back on failure.
 No process is force-killed.
+
+## Remote authorization
+
+Pressing `a` never opens a browser. The authorization URL is copied to the clipboard and
+also shown in the TUI so it can be sent to another computer.
+
+- Claude: authorize remotely, copy the final authorization code, paste it into the TUI,
+  then press Enter.
+- Codex: authorize remotely, copy the complete final `http://localhost:...` callback URL,
+  paste it into the TUI, then press Enter. The switcher forwards it only to the exact local
+  callback origin/path created for that login attempt.
+- Escape cancels either waiting flow without changing saved accounts. An interrupted Codex
+  sandbox is moved into `backups/codex-abandoned/` on recovery instead of being discarded.
+
+`switch.cmd login claude` remains an official interactive CLI fallback when Anthropic
+changes the portable paste-code flow.
 
 ## Reliability model
 
@@ -129,7 +145,8 @@ switch.cmd doctor all
 ```
 
 The test suite covers legacy three-profile recovery, credential extraction, concurrent
-mutations, tombstones, provider isolation, cursor independence and Codex auth rollback.
+mutations, tombstones, provider isolation, cursor independence, remote callback validation,
+active-marker drift, abandoned login recovery and Codex auth rollback.
 
 ## License
 

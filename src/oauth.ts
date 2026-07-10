@@ -1,15 +1,47 @@
 // Claude login is delegated to the official CLI in an isolated CLAUDE_CONFIG_DIR.
-// This module only serializes refresh-token rotation for saved parked accounts.
+// The TUI also offers the portable paste-code flow for users authorizing on another PC.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { logger } from './logger';
 import { parseTree, findNodeAtLocation, getNodeValue } from 'jsonc-parser';
-import type { ClaudeAiOauth, OauthAccount } from './types';
+import { hasRefreshableOauth, type ClaudeAiOauth, type OauthAccount } from './types';
 
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+export const AUTHORIZE_URL = 'https://claude.ai/oauth/authorize';
+export const MANUAL_REDIRECT = 'https://console.anthropic.com/oauth/code/callback';
+export const DEFAULT_SCOPES = 'org:create_api_key user:profile user:inference';
 const TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
+
+function base64url(buffer: Buffer): string {
+  return buffer.toString('base64url');
+}
+
+export interface ManualAuth {
+  url: string;
+  state: string;
+  verifier: string;
+}
+
+export function buildManualAuth(scopes = DEFAULT_SCOPES): ManualAuth {
+  const verifier = base64url(crypto.randomBytes(32));
+  const challenge = base64url(crypto.createHash('sha256').update(verifier).digest());
+  const state = base64url(crypto.randomBytes(32));
+  const url = `${AUTHORIZE_URL}?${new URLSearchParams({
+    code: 'true',
+    client_id: CLIENT_ID,
+    response_type: 'code',
+    redirect_uri: MANUAL_REDIRECT,
+    scope: scopes,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state,
+  })}`;
+  logger.info('oauth: built portable Claude authorization URL');
+  return { url, state, verifier };
+}
 
 export interface TokenSet {
   accessToken: string;
@@ -33,7 +65,7 @@ async function postToken(body: Record<string, string>): Promise<TokenSet> {
         ? 'invalid_request'
         : 'oauth_error';
     logger.warn('oauth: token endpoint failed', { status: res.status, reason });
-    throw new Error(`Token refresh failed (HTTP ${res.status}, ${reason}).`);
+    throw new Error(`OAuth token request failed (HTTP ${res.status}, ${reason}).`);
   }
   const d = (await res.json()) as {
     access_token: string;
@@ -58,6 +90,19 @@ export async function refreshToken(refresh: string): Promise<TokenSet> {
   });
 }
 
+export async function exchangeCode(pasted: string, verifier: string, state: string): Promise<TokenSet> {
+  const code = pasted.trim().split('#')[0].split('&')[0].trim();
+  if (!code) throw new Error('The pasted Claude authorization code is empty.');
+  return postToken({
+    grant_type: 'authorization_code',
+    code,
+    state,
+    client_id: CLIENT_ID,
+    redirect_uri: MANUAL_REDIRECT,
+    code_verifier: verifier,
+  });
+}
+
 export interface PrimedIdentity {
   claudeAiOauth: ClaudeAiOauth;
   oauthAccount: OauthAccount;
@@ -72,6 +117,64 @@ function extractNode<T>(text: string, key: string): T | undefined {
   return node ? (getNodeValue(node) as T) : undefined;
 }
 
+function isolatedClaudeEnv(configDir: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDE_CONFIG_DIR: configDir };
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+  delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  return env;
+}
+
+/** Resolve account identity without touching the user's live Claude configuration. */
+export function primeIdentity(tokens: TokenSet, claudeExe: string, scopes = DEFAULT_SCOPES): PrimedIdentity {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-prime-'));
+  const claudeAiOauth: ClaudeAiOauth = {
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
+    expiresAt: tokens.expiresAt,
+    scopes: tokens.scopes ?? scopes.split(' '),
+  };
+  try {
+    fs.writeFileSync(path.join(tmp, '.credentials.json'), JSON.stringify({ claudeAiOauth }, null, 2), {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    const result = spawnSync(claudeExe, ['-p', 'hi', '--max-turns', '1'], {
+      env: isolatedClaudeEnv(tmp),
+      timeout: 60_000,
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    logger.info('oauth: isolated identity lookup finished', { status: result.status, hadError: !!result.error });
+
+    let oauthAccount: OauthAccount = { accountUuid: '' };
+    let userID: string | undefined;
+    const claudeJson = path.join(tmp, '.claude.json');
+    if (fs.existsSync(claudeJson)) {
+      const text = fs.readFileSync(claudeJson, 'utf8');
+      oauthAccount = extractNode<OauthAccount>(text, 'oauthAccount') ?? oauthAccount;
+      userID = extractNode<string>(text, 'userID');
+    }
+    let finalOauth = claudeAiOauth;
+    let organizationUuidRoot: string | undefined;
+    const credentials = path.join(tmp, '.credentials.json');
+    if (fs.existsSync(credentials)) {
+      const after = JSON.parse(fs.readFileSync(credentials, 'utf8')) as {
+        claudeAiOauth?: ClaudeAiOauth;
+        organizationUuid?: string;
+      };
+      if (hasRefreshableOauth(after.claudeAiOauth)) finalOauth = after.claudeAiOauth;
+      organizationUuidRoot = after.organizationUuid;
+    }
+    return { claudeAiOauth: finalOauth, oauthAccount, userID, organizationUuidRoot };
+  } catch (error) {
+    logger.error('oauth: isolated identity lookup failed', error);
+    return { claudeAiOauth, oauthAccount: { accountUuid: '' } };
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 /**
  * Run the official `claude` login inside an isolated temp CLAUDE_CONFIG_DIR
  * (interactive). Returns the resulting identity after the user completes login.
@@ -80,7 +183,7 @@ function extractNode<T>(text: string, key: string): T | undefined {
 export function loginViaClaudeCli(claudeExe: string, email?: string): Promise<PrimedIdentity | null> {
   return new Promise((resolve) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-login-'));
-    const env = { ...process.env, CLAUDE_CONFIG_DIR: tmp };
+    const env = isolatedClaudeEnv(tmp);
     logger.info('oauth: starting official isolated Claude login', { tmp });
     const args = ['auth', 'login', ...(email?.trim() ? ['--email', email.trim()] : [])];
     const child = spawn(claudeExe, args, { env, stdio: 'inherit' });

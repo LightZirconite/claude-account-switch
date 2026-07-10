@@ -614,6 +614,13 @@ export function reconcileWithLive(store: ProfilesStore): { changed: boolean; act
   const fields = liveProfileFields();
   if (!fields) {
     logger.warn('reconcile: no live account (not logged in)');
+    const active = getActive(store);
+    if (active && hasCliAuth(active)) {
+      // The metadata marker must not claim a saved profile is active when Claude's
+      // actual live credential file is missing or unusable. The profile stays saved.
+      store.activeProfileId = null;
+      return { changed: true, activeId: null };
+    }
     return { changed: false, activeId: store.activeProfileId };
   }
   let profile = findByAccountUuid(store, fields.accountUuid);

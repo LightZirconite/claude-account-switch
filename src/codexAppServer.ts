@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import readline from 'node:readline';
 import { logger } from './logger';
 import type { CodexRateLimitBucket } from './types';
+import pkg from '../package.json';
 
 export interface CodexAccountInfo {
   type: string;
@@ -21,6 +22,69 @@ export interface CodexInspection {
   account: CodexAccountInfo | null;
   requiresOpenaiAuth: boolean;
   rateLimits: CodexRateLimitsResult | null;
+}
+
+export class CodexLoginCancelledError extends Error {
+  constructor() {
+    super('Codex login cancelled.');
+    this.name = 'CodexLoginCancelledError';
+  }
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
+}
+
+export function codexRedirectUriFromAuthUrl(authUrl: string): string | null {
+  try {
+    const redirectValue = new URL(authUrl).searchParams.get('redirect_uri');
+    if (!redirectValue) return null;
+    const redirect = new URL(redirectValue);
+    if (redirect.protocol !== 'http:' || !isLoopbackHost(redirect.hostname)) return null;
+    return redirect.toString();
+  } catch {
+    return null;
+  }
+}
+
+export function validateCodexCallbackUrl(pasted: string, expectedRedirect: string): string {
+  let callback: URL;
+  let expected: URL;
+  try {
+    callback = new URL(pasted.trim().replace(/^"(.*)"$/, '$1'));
+    expected = new URL(expectedRedirect);
+  } catch {
+    throw new Error('Paste the complete localhost callback URL returned after ChatGPT authorization.');
+  }
+  if (
+    callback.protocol !== 'http:'
+    || !isLoopbackHost(callback.hostname)
+    || callback.origin !== expected.origin
+    || callback.pathname !== expected.pathname
+  ) {
+    throw new Error('The callback URL does not match this Codex login attempt.');
+  }
+  if (!callback.searchParams.has('code') && !callback.searchParams.has('error')) {
+    throw new Error('The callback URL has no authorization result. Copy the final localhost URL in full.');
+  }
+  return callback.toString();
+}
+
+export async function submitCodexCallback(
+  pasted: string,
+  expectedRedirect: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const callback = validateCodexCallbackUrl(pasted, expectedRedirect);
+  const timeout = AbortSignal.timeout(15_000);
+  const response = await fetch(callback, {
+    method: 'GET',
+    redirect: 'manual',
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
+  if (response.status >= 400) {
+    throw new Error(`Codex callback was rejected (HTTP ${response.status}).`);
+  }
 }
 
 interface RpcMessage {
@@ -122,7 +186,7 @@ export class CodexAppServerClient {
       clientInfo: {
         name: 'claude_codex_account_switch',
         title: 'Claude + Codex Account Switch',
-        version: '2.0.0',
+        version: pkg.version,
       },
     });
     this.notify('initialized', {});
@@ -260,21 +324,54 @@ export async function inspectCodexHome(home: string, refreshToken = false): Prom
 
 export async function loginCodexHome(
   home: string,
-  onAuthUrl: (url: string) => void,
+  onAuthUrl: (url: string) => void | Promise<void>,
+  signal?: AbortSignal,
 ): Promise<CodexInspection> {
   const client = new CodexAppServerClient(home);
   try {
+    if (signal?.aborted) throw new CodexLoginCancelledError();
     await client.start();
-    const completed = client.waitForNotification<{ loginId?: string | null; success: boolean; error?: string | null }>(
-      'account/login/completed',
-    );
-    const started = await client.request<{ type: string; loginId: string; authUrl: string }>(
+    const startRequest = client.request<{ type: string; loginId: string; authUrl: string }>(
       'account/login/start',
       { type: 'chatgpt', useHostedLoginSuccessPage: true, appBrand: 'codex' },
     );
+    let startAbortHandler: (() => void) | undefined;
+    const startCancelled = new Promise<never>((_, reject) => {
+      startAbortHandler = () => reject(new CodexLoginCancelledError());
+      signal?.addEventListener('abort', startAbortHandler, { once: true });
+      if (signal?.aborted) startAbortHandler();
+    });
+    let started: { type: string; loginId: string; authUrl: string };
+    try {
+      started = signal ? await Promise.race([startRequest, startCancelled]) : await startRequest;
+    } finally {
+      if (startAbortHandler) signal?.removeEventListener('abort', startAbortHandler);
+    }
     if (!started.authUrl) throw new Error('Codex did not return an authentication URL.');
-    onAuthUrl(started.authUrl);
-    const result = await completed;
+    if (signal?.aborted) {
+      void client.request('account/login/cancel', { loginId: started.loginId }, 5_000).catch(() => {});
+      throw new CodexLoginCancelledError();
+    }
+    await onAuthUrl(started.authUrl);
+    const completed = client.waitForNotification<{ loginId?: string | null; success: boolean; error?: string | null }>(
+      'account/login/completed',
+      (params) => !params.loginId || params.loginId === started.loginId,
+    );
+    let abortHandler: (() => void) | undefined;
+    const cancelled = new Promise<never>((_, reject) => {
+      abortHandler = () => {
+        void client.request('account/login/cancel', { loginId: started.loginId }, 5_000).catch(() => {});
+        reject(new CodexLoginCancelledError());
+      };
+      signal?.addEventListener('abort', abortHandler, { once: true });
+      if (signal?.aborted) abortHandler();
+    });
+    let result: { loginId?: string | null; success: boolean; error?: string | null };
+    try {
+      result = signal ? await Promise.race([completed, cancelled]) : await completed;
+    } finally {
+      if (abortHandler) signal?.removeEventListener('abort', abortHandler);
+    }
     if (!result.success) throw new Error(result.error || 'Codex login failed.');
     const accountResult = await client.request<{ account: CodexAccountInfo | null; requiresOpenaiAuth: boolean }>(
       'account/read',
