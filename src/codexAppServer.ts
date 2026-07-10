@@ -24,6 +24,8 @@ export interface CodexInspection {
   rateLimits: CodexRateLimitsResult | null;
 }
 
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 export class CodexLoginCancelledError extends Error {
   constructor() {
     super('Codex login cancelled.');
@@ -312,13 +314,53 @@ export async function inspectCodexHome(home: string, refreshToken = false): Prom
       account: CodexAccountInfo | null;
       requiresOpenaiAuth: boolean;
     }>('account/read', { refreshToken });
-    let rateLimits: CodexRateLimitsResult | null = null;
-    if (accountResult.account?.type === 'chatgpt') {
-      rateLimits = await client.request<CodexRateLimitsResult>('account/rateLimits/read');
-    }
+    const rateLimits = await readChatgptRateLimits(client, accountResult.account);
     return { ...accountResult, rateLimits };
   } finally {
     await client.stop();
+  }
+}
+
+async function readAccountAfterChatgptLogin(
+  client: CodexAppServerClient,
+): Promise<{ account: CodexAccountInfo | null; requiresOpenaiAuth: boolean }> {
+  let result = await client.request<{ account: CodexAccountInfo | null; requiresOpenaiAuth: boolean }>(
+    'account/read',
+    { refreshToken: false },
+  );
+  if (result.account?.type === 'chatgpt') return result;
+  // The official flow emits account/updated after completion. It may already
+  // be buffered, so waitForNotification handles both ordering possibilities.
+  await client.waitForNotification<{ authMode?: string | null }>(
+    'account/updated',
+    (params) => params.authMode === 'chatgpt',
+    5_000,
+  ).catch(() => undefined);
+  // `account/login/completed` can arrive just before the app-server persists the
+  // account projection. Keep the login result usable instead of treating that
+  // short window as an unsupported account type.
+  for (let attempt = 0; attempt < 4 && result.account?.type !== 'chatgpt'; attempt++) {
+    await sleep(250);
+    result = await client.request<{ account: CodexAccountInfo | null; requiresOpenaiAuth: boolean }>(
+      'account/read',
+      { refreshToken: false },
+    );
+  }
+  return result;
+}
+
+async function readChatgptRateLimits(
+  client: CodexAppServerClient,
+  account: CodexAccountInfo | null,
+): Promise<CodexRateLimitsResult | null> {
+  if (account?.type !== 'chatgpt') return null;
+  try {
+    return await client.request<CodexRateLimitsResult>('account/rateLimits/read');
+  } catch {
+    // Quotas are optional. An unavailable quota endpoint cannot invalidate a
+    // completed ChatGPT login or otherwise refreshable credentials.
+    logger.warn('codex rate limit read unavailable', { accountType: account.type });
+    return null;
   }
 }
 
@@ -373,13 +415,8 @@ export async function loginCodexHome(
       if (abortHandler) signal?.removeEventListener('abort', abortHandler);
     }
     if (!result.success) throw new Error(result.error || 'Codex login failed.');
-    const accountResult = await client.request<{ account: CodexAccountInfo | null; requiresOpenaiAuth: boolean }>(
-      'account/read',
-      { refreshToken: false },
-    );
-    const rateLimits = accountResult.account?.type === 'chatgpt'
-      ? await client.request<CodexRateLimitsResult>('account/rateLimits/read')
-      : null;
+    const accountResult = await readAccountAfterChatgptLogin(client);
+    const rateLimits = await readChatgptRateLimits(client, accountResult.account);
     return { ...accountResult, rateLimits };
   } finally {
     await client.stop();

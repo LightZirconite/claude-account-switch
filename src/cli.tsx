@@ -66,6 +66,7 @@ import {
   leastLoadedCodex,
   loadCodexStore,
   listPendingCodexHomes,
+  readCodexAuth,
   recoverAbandonedCodexHomes,
   reconcileLiveCodex,
   refreshAllCodexProfiles,
@@ -2002,11 +2003,25 @@ async function printCodexDoctor(): Promise<void> {
   console.log(`Profiles: ${store.profiles.length}`);
   console.log(`Active profile id: ${store.activeProfileId ?? '(none)'}`);
   console.log(`Abandoned/pending login sandboxes: ${pending.length}`);
+  const liveAuth = readCodexAuth(codexHome());
+  const savedLiveProfile = liveAuth
+    ? store.profiles.find((profile) => profile.accountId === liveAuth.tokens.account_id)
+    : null;
   try {
     const live = await inspectCodexHome(codexHome(), false);
-    console.log(`Live account: ${live.account?.type === 'chatgpt' ? `${live.account.email ?? '(unknown)'} (${live.account.planType ?? 'unknown plan'})` : 'not logged in with ChatGPT'}`);
+    if (liveAuth) {
+      const email = live.account?.email ?? savedLiveProfile?.email ?? '(unknown)';
+      const plan = live.account?.planType ?? savedLiveProfile?.planType ?? 'unknown plan';
+      console.log(`Live account: ${email} (${plan})`);
+    } else {
+      console.log('Live account: not logged in with ChatGPT');
+    }
   } catch (e) {
-    console.log(`Live account: unavailable (${String((e as Error).message ?? e)})`);
+    if (liveAuth) {
+      console.log(`Live account: ${savedLiveProfile?.email ?? '(managed ChatGPT auth saved)'} (status check unavailable)`);
+    } else {
+      console.log(`Live account: unavailable (${String((e as Error).message ?? e)})`);
+    }
   }
   console.log('Saved profiles:');
   for (const profile of store.profiles) {

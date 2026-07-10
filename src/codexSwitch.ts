@@ -34,6 +34,7 @@ interface RawProcess {
   ParentProcessId?: number;
   Name?: string;
   CommandLine?: string;
+  ExecutablePath?: string;
 }
 
 export type CodexAuthTransactionResult<T> =
@@ -45,7 +46,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 function windowsProcesses(): RawProcess[] {
   const script = [
     "$ErrorActionPreference='SilentlyContinue'",
-    "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'ChatGPT.exe' -or $_.Name -eq 'codex.exe' } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress",
+    "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'ChatGPT.exe' -or $_.Name -eq 'codex.exe' } | Select-Object ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath | ConvertTo-Json -Compress",
   ].join('; ');
   try {
     const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
@@ -67,7 +68,7 @@ function unixProcesses(): RawProcess[] {
     return out.split(/\r?\n/).flatMap((line) => {
       const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
       if (!match || !/(?:^|\/)(?:codex|ChatGPT)(?:\.exe)?$/i.test(match[3])) return [];
-      return [{ ProcessId: Number(match[1]), ParentProcessId: Number(match[2]), Name: match[3], CommandLine: match[4] }];
+      return [{ ProcessId: Number(match[1]), ParentProcessId: Number(match[2]), Name: match[3], CommandLine: match[4], ExecutablePath: match[3] }];
     });
   } catch {
     return [];
@@ -76,7 +77,14 @@ function unixProcesses(): RawProcess[] {
 
 export function findCodexProcesses(): CodexProcessInfo[] {
   const rows = process.platform === 'win32' ? windowsProcesses() : unixProcesses();
-  const appPids = new Set(rows.filter((row) => /chatgpt/i.test(row.Name ?? '')).map((row) => Number(row.ProcessId)));
+  const appPids = new Set(rows.filter((row) => {
+    const name = row.Name ?? '';
+    const executable = row.ExecutablePath ?? '';
+    const commandLine = row.CommandLine ?? '';
+    return /chatgpt/i.test(name)
+      || /[\\/]WindowsApps[\\/]OpenAI\.Codex_/i.test(executable)
+      || /\.app[\\/]Contents[\\/]MacOS[\\/]/i.test(commandLine);
+  }).map((row) => Number(row.ProcessId)));
   let changed = true;
   while (changed) {
     changed = false;
@@ -98,9 +106,18 @@ export function findCodexProcesses(): CodexProcessInfo[] {
     }));
 }
 
-async function requestGracefulAppClose(): Promise<void> {
+export function remainingTrackedProcessIds(initialPids: ReadonlySet<number>, current: CodexProcessInfo[]): number[] {
+  return current.filter((process) => initialPids.has(process.pid)).map((process) => process.pid);
+}
+
+async function requestGracefulAppClose(appProcesses: CodexProcessInfo[]): Promise<void> {
+  const initialPids = new Set(appProcesses.map((process) => process.pid));
+  if (!initialPids.size) return;
   if (process.platform === 'win32') {
-    const script = "Get-Process ChatGPT -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { [void]$_.CloseMainWindow() }";
+    const script = [
+      "$ErrorActionPreference='SilentlyContinue'",
+      "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'ChatGPT.exe' -or ($_.Name -eq 'codex.exe' -and $_.ExecutablePath -match '[\\\\/]WindowsApps[\\\\/]OpenAI\\.Codex_') } | ForEach-Object { $process = Get-Process -Id $_.ProcessId; if ($process.MainWindowHandle -ne 0) { [void]$process.CloseMainWindow() } }",
+    ].join('; ');
     execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
       encoding: 'utf8',
       timeout: 10_000,
@@ -109,12 +126,13 @@ async function requestGracefulAppClose(): Promise<void> {
   } else if (process.platform === 'darwin') {
     execFileSync('osascript', ['-e', 'tell application "Codex" to quit'], { timeout: 10_000 });
   }
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
-    if (!findCodexProcesses().some((proc) => proc.kind === 'app')) return;
+    if (!remainingTrackedProcessIds(initialPids, findCodexProcesses()).length) return;
     await sleep(500);
   }
-  throw new Error('Codex did not close cleanly. No credentials were changed.');
+  const remaining = remainingTrackedProcessIds(initialPids, findCodexProcesses());
+  throw new Error(`Codex is still closing after 60 seconds (process ${remaining.join(', ')}). Close it completely and retry. No credentials were changed.`);
 }
 
 function relaunchCodexApp(): void {
@@ -190,9 +208,9 @@ export async function switchCodexProfile(profileId: string): Promise<CodexSwitch
     if (!target) return { ok: false, profileId, message: 'Codex profile not found.' };
 
     try {
-      const inspection = await inspectCodexHome(codexProfileHome(profileId), true);
+      await inspectCodexHome(codexProfileHome(profileId), true);
       const targetAuth = readCodexAuth(codexProfileHome(profileId));
-      if (inspection.account?.type !== 'chatgpt' || targetAuth?.tokens.account_id !== target.accountId) {
+      if (!targetAuth || targetAuth.tokens.account_id !== target.accountId) {
         throw new Error('Target Codex login could not be validated. Re-add the account.');
       }
     } catch (e) {
@@ -208,10 +226,11 @@ export async function switchCodexProfile(profileId: string): Promise<CodexSwitch
         message: `Close the running Codex CLI session(s) first: ${cli.map((proc) => proc.pid).join(', ')}. Nothing changed.`,
       };
     }
-    const appWasRunning = processes.some((proc) => proc.kind === 'app');
+    const appProcesses = processes.filter((proc) => proc.kind === 'app');
+    const appWasRunning = appProcesses.length > 0;
     if (appWasRunning) {
       try {
-        await requestGracefulAppClose();
+        await requestGracefulAppClose(appProcesses);
       } catch (e) {
         return { ok: false, profileId, message: String((e as Error).message ?? e) };
       }
@@ -234,9 +253,9 @@ export async function switchCodexProfile(profileId: string): Promise<CodexSwitch
     }
 
     const applied = await applyCodexAuthTransaction(profileId, async () => {
-      const validation = await inspectCodexHome(codexHome(), true);
+      await inspectCodexHome(codexHome(), true);
       const live = readCodexAuth(codexHome());
-      if (validation.account?.type !== 'chatgpt' || live?.tokens.account_id !== target.accountId) {
+      if (!live || live.tokens.account_id !== target.accountId) {
         throw new Error('Codex loaded a different account after the switch.');
       }
       syncCodexProfileAuthFromHome(profileId, codexHome());

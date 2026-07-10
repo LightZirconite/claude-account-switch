@@ -322,9 +322,11 @@ function upsertAuth(
       existing.email = inspection?.account?.email || meta.email;
       existing.planType = inspection?.account?.planType || meta.planType;
       if (label) existing.label = label;
-      if (inspection?.account?.type === 'chatgpt') existing.needsReauth = false;
+      // readCodexAuth already proves that this is a managed ChatGPT credential.
+      // account/read metadata can lag the completed login notification.
+      existing.needsReauth = false;
       existing.updatedAt = Date.now();
-      if (inspection?.account?.type === 'chatgpt') existing.usage = usageFromInspection(inspection, existing.usage);
+      if (inspection) existing.usage = usageFromInspection(inspection, existing.usage);
       selected = existing;
     } else {
       const id = crypto.randomUUID();
@@ -337,6 +339,7 @@ function upsertAuth(
         planType: inspection?.account?.planType || meta.planType,
         createdAt: Date.now(),
         updatedAt: Date.now(),
+        needsReauth: false,
         usage: inspection ? usageFromInspection(inspection) : undefined,
       };
       current.profiles.push(selected);
@@ -386,9 +389,11 @@ export async function addCodexAccount(
   const home = codexProfileHome(tempId);
   try {
     const inspection = await loginCodexHome(home, onAuthUrl, signal);
-    if (inspection.account?.type !== 'chatgpt') throw new Error('Only ChatGPT Codex accounts are supported.');
     const auth = readCodexAuth(home);
     if (!auth) throw new Error('Codex login completed without a reusable ChatGPT auth.json.');
+    // The file is created by the official ChatGPT login flow and rejects API-key
+    // mode. It is a stronger and more durable signal than a transient account/read
+    // projection immediately following the callback.
     return upsertAuth(auth, inspection);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
@@ -403,7 +408,10 @@ export async function refreshCodexProfile(profileId: string): Promise<CodexProfi
       // Officially force the managed ChatGPT refresh so the rotated auth.json is
       // durable inside this account envelope before the account lock is released.
       const inspection = await inspectCodexHome(codexProfileHome(profileId), true);
-      if (inspection.account?.type !== 'chatgpt') throw new Error('ChatGPT login is no longer available.');
+      const refreshedAuth = readCodexAuth(codexProfileHome(profileId));
+      if (!refreshedAuth || refreshedAuth.tokens.account_id !== profile.accountId) {
+        throw new Error('ChatGPT login is no longer available.');
+      }
       return mutateCodexStore((store) => {
         const target = store.profiles.find((p) => p.id === profileId);
         if (!target) return;
