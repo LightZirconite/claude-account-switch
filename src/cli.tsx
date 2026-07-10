@@ -142,6 +142,16 @@ function relTime(ms?: number): string {
 const CLAUDE_ORANGE = '#D97757'; // Claude brand coral/orange
 // Current Windows Codex app manifest uses this royal-blue brand background.
 const CODEX_BLUE = '#3143FF';
+const CodexTerminalMark = () => (
+  <Box flexDirection="column" alignItems="center">
+    <Text bold color={CODEX_BLUE}>{'      .-~~~~-.'}</Text>
+    <Text bold color={CODEX_BLUE}>{"   .-'        '-."}</Text>
+    <Text bold color={CODEX_BLUE}>{" .'      "}<Text color="white">{'>_'}</Text>{"       '."}</Text>
+    <Text bold color={CODEX_BLUE}>{'(        ______     )'}</Text>
+    <Text bold color={CODEX_BLUE}>{" '.              .'"}</Text>
+    <Text bold color={CODEX_BLUE}>{"   '-.________.-'"}</Text>
+  </Box>
+);
 // Fable promo: show the Fable per-model bucket only until this date, then it auto-hides.
 const FABLE_PROMO_END = new Date('2026-07-08T00:00:00').getTime();
 
@@ -1472,12 +1482,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           <Text bold><Text color={CODEX_BLUE}>Codex</Text> <Text color="white">Account Switch</Text>{' '}<Text dimColor>v{APP_VERSION}</Text></Text>
           <Box marginTop={1} width={W - 2}>
             <Box width={leftW} flexDirection="column" alignItems="center">
-              <Box flexDirection="column" alignItems="center">
-                <Text bold color={CODEX_BLUE}>{'  ╭──╮  '}</Text>
-                <Text bold color={CODEX_BLUE}>{'╭─╯╭╮╰─╮'}</Text>
-                <Text bold color={CODEX_BLUE}>{'╰─╮╰╯╭─╯'}</Text>
-                <Text bold color={CODEX_BLUE}>{'  ╰──╯  '}</Text>
-              </Box>
+              <CodexTerminalMark />
               <Box marginTop={1} flexDirection="column" alignItems="center">
                 <Text>Welcome back, <Text bold>{codexActive?.label ?? 'there'}</Text>!</Text>
                 {codexActive ? <Text><Text color={planColor(codexActive.planType)}>Codex {(codexActive.planType ?? '').toUpperCase()}</Text><Text dimColor> · {codexActive.email}</Text></Text> : <Text dimColor>No Codex account selected</Text>}
