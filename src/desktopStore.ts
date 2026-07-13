@@ -105,11 +105,3 @@ export function applyDesktopSnapshot(snapshotDir: string): DesktopApplyResult {
 export function newDesktopProfileId(): string {
   return crypto.randomUUID();
 }
-
-export function deleteDesktopSnapshot(profileId: string): void {
-  try {
-    fs.rmSync(snapshotDirFor(profileId), { recursive: true, force: true });
-  } catch {
-    /* ignore */
-  }
-}

@@ -166,6 +166,10 @@ export interface ProfileTombstone {
   id: string;
   provider: ProviderId;
   deletedAt: number;
+  /** A later explicit restore wins over stale writers carrying the deletion. */
+  restoredAt?: number;
+  /** Secret-free metadata used to undo a voluntary deletion. */
+  archivedProfile?: Omit<Profile, 'claudeAiOauth'> | CodexProfile;
 }
 
 /** Narrows a Profile to one with its claude-code fields present (added/imported for the CLI). */

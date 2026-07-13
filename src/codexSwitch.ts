@@ -112,7 +112,7 @@ export function remainingTrackedProcessIds(initialPids: ReadonlySet<number>, cur
   return current.filter((process) => initialPids.has(process.pid)).map((process) => process.pid);
 }
 
-export function desktopProcessRootIds(processes: CodexProcessInfo[]): number[] {
+export function codexProcessRootIds(processes: CodexProcessInfo[]): number[] {
   const pids = new Set(processes.map((process) => process.pid));
   return processes.filter((process) => !pids.has(process.ppid)).map((process) => process.pid);
 }
@@ -127,8 +127,25 @@ async function waitForTrackedProcessesToExit(initialPids: ReadonlySet<number>, t
   return remaining;
 }
 
-function forceTerminateDesktopProcessTree(appProcesses: CodexProcessInfo[]): void {
-  const roots = desktopProcessRootIds(appProcesses);
+async function forceCloseCodexCliSessions(timeoutMs = FORCED_DESKTOP_CLOSE_WAIT_MS): Promise<number[]> {
+  const deadline = Date.now() + timeoutMs;
+  let quietSince = 0;
+  while (Date.now() < deadline) {
+    const cliProcesses = findCodexProcesses().filter((process) => process.kind === 'cli');
+    if (cliProcesses.length) {
+      quietSince = 0;
+      forceTerminateCodexProcessTrees(cliProcesses);
+    } else {
+      if (!quietSince) quietSince = Date.now();
+      if (Date.now() - quietSince >= 1_000) return [];
+    }
+    await sleep(250);
+  }
+  return findCodexProcesses().filter((process) => process.kind === 'cli').map((process) => process.pid);
+}
+
+function forceTerminateCodexProcessTrees(processes: CodexProcessInfo[]): void {
+  const roots = codexProcessRootIds(processes);
   if (process.platform === 'win32') {
     for (const pid of roots) {
       try {
@@ -176,8 +193,8 @@ async function requestGracefulAppClose(appProcesses: CodexProcessInfo[]): Promis
 
   // The Windows Codex Desktop app can turn a CloseMainWindow request into a
   // tray minimization. The user already confirmed this switch, so terminate
-  // only the observed Desktop tree, never a standalone Codex CLI session.
-  forceTerminateDesktopProcessTree(appProcesses);
+  // only the observed Desktop process tree.
+  forceTerminateCodexProcessTrees(appProcesses);
   const remainingAfterForce = await waitForTrackedProcessesToExit(initialPids, FORCED_DESKTOP_CLOSE_WAIT_MS);
   if (!remainingAfterForce.length) return;
   throw new Error(`Codex Desktop could not be closed (process ${remainingAfterForce.join(', ')}). No credentials were changed.`);
@@ -266,13 +283,16 @@ export async function switchCodexProfile(profileId: string): Promise<CodexSwitch
     }
 
     const processes = findCodexProcesses();
-    const cli = processes.filter((proc) => proc.kind === 'cli');
-    if (cli.length) {
-      return {
-        ok: false,
-        profileId,
-        message: `Close the running Codex CLI session(s) first: ${cli.map((proc) => proc.pid).join(', ')}. Nothing changed.`,
-      };
+    const cliProcesses = processes.filter((proc) => proc.kind === 'cli');
+    if (cliProcesses.length) {
+      const remainingCli = await forceCloseCodexCliSessions();
+      if (remainingCli.length) {
+        return {
+          ok: false,
+          profileId,
+          message: `Codex CLI could not be closed (process ${remainingCli.join(', ')}). No credentials were changed.`,
+        };
+      }
     }
     const appProcesses = processes.filter((proc) => proc.kind === 'app');
     const appWasRunning = appProcesses.length > 0;
@@ -288,6 +308,16 @@ export async function switchCodexProfile(profileId: string): Promise<CodexSwitch
       await reconcileLiveCodex();
     } catch (e) {
       logger.warn('codex outgoing live auth could not be reconciled', { error: String(e) });
+    }
+
+    const respawnedCli = await forceCloseCodexCliSessions();
+    if (respawnedCli.length) {
+      if (appWasRunning) relaunchCodexApp();
+      return {
+        ok: false,
+        profileId,
+        message: `Codex CLI kept restarting (process ${respawnedCli.join(', ')}). No credentials were changed.`,
+      };
     }
 
     const remaining = findCodexProcesses();

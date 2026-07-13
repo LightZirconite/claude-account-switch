@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { claudeProfileCredentialsPath, profilesPath, ensureDataDirs, exportDir, importDir, backupsDir } from './paths';
 import { getLiveAccount } from './claudeStore';
-import { snapshotLiveDesktopInto, newDesktopProfileId, deleteDesktopSnapshot } from './desktopStore';
+import { snapshotLiveDesktopInto, newDesktopProfileId } from './desktopStore';
 import { logger } from './logger';
 import { withFileLockSync } from './locks';
 import {
@@ -74,6 +74,11 @@ function parseStore(text: string): ProfilesStore | null {
     if (typeof s.version !== 'number') s.version = 1;
     s.revision = Number.isFinite(s.revision) ? s.revision : 0;
     s.tombstones = Array.isArray(s.tombstones) ? s.tombstones : [];
+    for (const tombstone of s.tombstones) {
+      if (tombstone.archivedProfile?.provider === 'claude') {
+        delete (tombstone.archivedProfile as Partial<Profile>).claudeAiOauth;
+      }
+    }
     for (const p of s.profiles) {
       p.provider = 'claude';
       p.updatedAt = Number.isFinite(p.updatedAt) ? p.updatedAt : p.createdAt;
@@ -258,13 +263,19 @@ function mergeWithDisk(next: ProfilesStore): ProfilesStore {
   const tombstones = new Map<string, NonNullable<ProfilesStore['tombstones']>[number]>();
   for (const t of [...(current.tombstones ?? []), ...(next.tombstones ?? [])]) {
     const old = tombstones.get(t.id);
-    if (!old || old.deletedAt < t.deletedAt) tombstones.set(t.id, t);
+    const oldEventAt = old ? Math.max(old.deletedAt, old.restoredAt ?? 0) : 0;
+    const eventAt = Math.max(t.deletedAt, t.restoredAt ?? 0);
+    if (!old || oldEventAt < eventAt
+      || (oldEventAt === eventAt && (old.restoredAt ?? 0) < (t.restoredAt ?? 0))) tombstones.set(t.id, t);
   }
   next.tombstones = [...tombstones.values()];
-  next.profiles = next.profiles.filter((p) => !tombstones.has(p.id));
+  const deleted = new Set([...tombstones.values()]
+    .filter((t) => !t.restoredAt || t.deletedAt > t.restoredAt)
+    .map((t) => t.id));
+  next.profiles = next.profiles.filter((p) => !deleted.has(p.id));
 
   for (const diskProfile of current.profiles) {
-    if (tombstones.has(diskProfile.id)) continue;
+    if (deleted.has(diskProfile.id)) continue;
     const incoming = next.profiles.find((p) => sameAccount(p, diskProfile));
     if (!incoming) {
       next.profiles.push(diskProfile);
@@ -804,7 +815,20 @@ export function addOrUpdateProfile(store: ProfilesStore, fields: LiveProfileFiel
   if (!hasRefreshableOauth(fields.claudeAiOauth)) {
     throw new Error('Imported Claude Code credentials are missing a refresh token.');
   }
-  const existing = findByAccountUuid(store, fields.accountUuid) ?? findByEmail(store, fields.email);
+  let existing = findByAccountUuid(store, fields.accountUuid) ?? findByEmail(store, fields.email);
+  if (!existing) {
+    const archived = (store.tombstones ?? []).find((t) => {
+      if (t.provider !== 'claude' || t.archivedProfile?.provider !== 'claude'
+        || (t.restoredAt && t.restoredAt >= t.deletedAt)) return false;
+      return t.archivedProfile.accountUuid === fields.accountUuid
+        || t.archivedProfile.email.trim().toLowerCase() === fields.email.trim().toLowerCase();
+    });
+    if (archived?.archivedProfile?.provider === 'claude') {
+      existing = { ...archived.archivedProfile };
+      store.profiles.push(existing);
+      archived.restoredAt = Date.now();
+    }
+  }
   if (existing) {
     copyFieldsInto(existing, fields);
     existing.needsReauth = false; // a fresh login means the account is healthy again
@@ -871,10 +895,47 @@ export function exportAllProfiles(store: ProfilesStore): string {
 
 export function deleteProfile(store: ProfilesStore, id: string): void {
   const profile = store.profiles.find((p) => p.id === id);
-  if (profile?.desktopSnapshotDir) deleteDesktopSnapshot(id);
   if (profile) {
-    store.tombstones = [...(store.tombstones ?? []).filter((t) => t.id !== id), { id, provider: 'claude', deletedAt: Date.now() }];
+    if (store.activeProfileId === id) throw new Error('Cannot delete the active Claude account.');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const archive = path.join(backupsDir(), 'claude-deleted', `${stamp}-${id}`);
+    try {
+      const credentials = path.dirname(claudeProfileCredentialsPath(id));
+      if (fs.existsSync(credentials)) fs.cpSync(credentials, path.join(archive, 'credentials'), { recursive: true });
+      if (profile.desktopSnapshotDir && fs.existsSync(profile.desktopSnapshotDir)) {
+        fs.cpSync(profile.desktopSnapshotDir, path.join(archive, 'desktop'), { recursive: true });
+      }
+    } catch (error) {
+      logger.warn('claude deleted credential backup failed; canonical copy retained', { error: String(error) });
+    }
+    const { claudeAiOauth: _secret, ...archivedProfile } = profile;
+    store.tombstones = [
+      ...(store.tombstones ?? []).filter((t) => t.id !== id),
+      { id, provider: 'claude', deletedAt: Date.now(), archivedProfile },
+    ];
+    logger.info('claude profile archived', { email: profile.email });
   }
   store.profiles = store.profiles.filter((p) => p.id !== id);
   if (store.activeProfileId === id) store.activeProfileId = null;
+}
+
+/** Restore the most recently archived Claude profile without making it active. */
+export function restoreLatestDeletedProfile(store: ProfilesStore): Profile | undefined {
+  const tombstone = [...(store.tombstones ?? [])]
+    .filter((t) => t.provider === 'claude' && t.archivedProfile?.provider === 'claude'
+      && (!t.restoredAt || t.deletedAt > t.restoredAt))
+    .sort((a, b) => b.deletedAt - a.deletedAt)[0];
+  if (!tombstone?.archivedProfile || tombstone.archivedProfile.provider !== 'claude') return undefined;
+  const archived = tombstone.archivedProfile as Omit<Profile, 'claudeAiOauth'>;
+  const envelope = readCredentialEnvelope(archived.id);
+  const restored: Profile = {
+    ...archived,
+    ...(envelope ? { claudeAiOauth: envelope.claudeAiOauth } : {}),
+    ...(!envelope && archived.accountUuid ? { needsReauth: true } : {}),
+    updatedAt: Date.now(),
+  };
+  if (!store.profiles.some((profile) => profile.id === restored.id)) store.profiles.push(restored);
+  tombstone.restoredAt = Date.now();
+  logger.info('claude archived profile restored', { email: restored.email });
+  return restored;
 }

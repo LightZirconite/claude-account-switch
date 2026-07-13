@@ -56,19 +56,31 @@ The account actions apply only to the visible provider.
 | i | import provider-tagged credentials |
 | e / E | export selected / all accounts for the visible provider |
 | r | rename the selected account |
-| d | delete the selected non-active account |
-| l | highlight the account with the most quota headroom |
-| b | switch to the account with the most quota headroom |
-| u | refresh quotas for the visible provider |
+| d | archive the selected non-active account without destroying credentials |
+| z | restore the most recently archived account for the visible provider |
+| l | highlight the account with the most raw quota headroom |
+| b | refresh quotas, then choose the reset-aware **Best Now** account |
+| u | refresh quotas for the visible provider (duplicate requests are coalesced) |
 | S | setup shortcuts and scheduled maintenance |
 | q | quit |
 
-Codex switching is performed by a detached worker. It validates the target first, refuses
-to continue while a Codex CLI is active, asks the desktop app to close gracefully, then
-force-quits only the confirmed Desktop process tree if it merely minimizes. It swaps
-`auth.json` atomically, validates the result through App Server, and rolls back on failure.
-The confirmation warns that unsaved Desktop work can be lost; Claude and standalone Codex
-CLI processes are never force-killed.
+Moving the cursor previews that account's cached or freshly-read quota without switching
+accounts. A `0%` five-hour bucket with no provider reset timestamp is shown as
+`available now`: the rolling window has not started, so there is no honest clock time to
+display yet.
+
+**Best Now** is deliberately different from `l`. It first excludes accounts blocked by
+their five-hour or weekly cap, then spends capacity from the five-hour window that resets
+soonest. If no five-hour window is running, it considers the weekly reset and finally raw
+headroom. Equivalent choices keep the active account to avoid an unnecessary process
+restart. When every account is exhausted, it reports the first real upcoming reset instead
+of switching to a blocked account.
+
+Codex switching is performed by a detached worker. It validates the target first, closes
+detected Codex CLI sessions, asks the desktop app to close gracefully, then force-quits the
+confirmed Codex process trees if needed. It swaps `auth.json` atomically, validates the
+result through App Server, and rolls back on failure. The confirmation warns that unsaved
+Codex work can be lost; Claude processes are never force-killed.
 
 ## Remote authorization
 
@@ -90,10 +102,12 @@ changes the portable paste-code flow.
 
 - OAuth refreshes are single-flight in-process and locked across processes.
 - A rotated token is persisted before its account lock is released.
-- The active Claude account is reconciled to disk before any refresh, preventing a live
-  Claude session from racing a stale cached refresh token.
-- Stores use atomic writes, last-known-good mirrors, account-set snapshots and deletion
-  tombstones. A stale writer cannot silently remove or resurrect a profile.
+- The official Claude client exclusively owns refresh-token rotation for the active
+  account. The switcher only reconciles that live state and shows cached quotas when its
+  access token is expired; scheduled maintenance refreshes parked accounts only.
+- Stores use atomic writes, last-known-good mirrors, account-set snapshots and reversible
+  tombstones. A stale writer cannot silently remove or resurrect a profile; an explicit
+  `z` restore records a newer event so stale processes cannot delete it again.
 - Last known quotas remain visible as `stale` when a live refresh fails.
 - Each Claude/Codex account has a separate credential envelope under
   `~/.claude-switch/credentials/`.

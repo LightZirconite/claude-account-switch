@@ -17,6 +17,7 @@ import {
   addOrUpdateProfile,
   captureDesktopAccount,
   deleteProfile,
+  restoreLatestDeletedProfile,
   exportProfile,
   scanImportDir,
   importFromPath,
@@ -33,7 +34,7 @@ import {
   type DryRunReport,
 } from './claudeStore';
 import { applyDesktopSnapshot, isDesktopInstalled } from './desktopStore';
-import { ensureFreshToken, fetchUsage, keepTokenAlive, leastLoaded } from './usage';
+import { bestNow, ensureFreshToken, fetchUsage, keepTokenAlive, leastLoaded } from './usage';
 import { findClaudeProcesses, closeProcesses, detectClaudeVersion, type ProcInfo } from './processes';
 import {
   installAll,
@@ -59,6 +60,7 @@ import { hasCliAuth, hasRefreshableOauth, type Profile, type ProfilesStore } fro
 import type { CodexProfile, CodexProfilesStore, ProviderId } from './types';
 import {
   addCodexAccount,
+  bestNowCodex,
   deleteCodexProfile,
   exportAllCodexProfiles,
   exportCodexProfile,
@@ -68,7 +70,9 @@ import {
   listPendingCodexHomes,
   readCodexAuth,
   recoverAbandonedCodexHomes,
+  restoreLatestDeletedCodexProfile,
   reconcileLiveCodex,
+  refreshCodexProfile,
   refreshAllCodexProfiles,
   renameCodexProfile,
 } from './codexProfiles';
@@ -87,6 +91,7 @@ import {
   waitForCodexSwitchResult,
 } from './codexSwitch';
 import { switchProviderTab } from './navigation';
+import type { BestNowDecision } from './scheduling';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -152,8 +157,8 @@ const CodexTerminalMark = () => (
     <Text bold color={CODEX_BLUE}>{"   '-.________.-'"}</Text>
   </Box>
 );
-// Fable promo: show the Fable per-model bucket only until this date, then it auto-hides.
-const FABLE_PROMO_END = new Date('2026-07-08T00:00:00').getTime();
+// Fable promo: keep the per-model bucket visible through July 19, then auto-hide.
+const FABLE_PROMO_END = new Date('2026-07-20T00:00:00').getTime();
 
 const Divider = ({ width, color = 'gray' as string }: { width: number; color?: string }) => (
   <Text color={color}>{'─'.repeat(Math.max(1, width))}</Text>
@@ -224,6 +229,21 @@ function resetAt(iso?: string | null): string {
   return sameDay
     ? d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
     : d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function quotaResetLabel(usedPercent: number | null | undefined, iso?: string | null): string {
+  if (usedPercent === 0 && !iso) return 'available now';
+  return `resets ${resetAt(iso)}`;
+}
+
+function bestNowDetail(decision: BestNowDecision<unknown>): string {
+  if (decision.reason === 'primary-reset-soon' && decision.primaryResetsAt) {
+    return `5h ${Math.round(decision.primaryUsedPercent ?? 0)}% · resets in ${resetIn(new Date(decision.primaryResetsAt).toISOString())}`;
+  }
+  if (decision.reason === 'secondary-reset-soon' && decision.secondaryResetsAt) {
+    return `7d ${Math.round(decision.secondaryUsedPercent ?? 0)}% · resets in ${resetIn(new Date(decision.secondaryResetsAt).toISOString())}`;
+  }
+  return 'most usable headroom';
 }
 
 function planColor(sub?: string): string {
@@ -311,9 +331,13 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const claudeReauthEmailRef = useRef<string | null>(null);
   const codexAddAbortRef = useRef<AbortController | null>(null);
   const codexRedirectRef = useRef<string | null>(null);
+  const claudeUsageRefreshRef = useRef<Promise<ProfilesStore> | null>(null);
+  const codexUsageRefreshRef = useRef<Promise<CodexProfilesStore> | null>(null);
   const cols = useTerminalSize();
   const storeRef = useRef(store);
   storeRef.current = store;
+  const codexStoreRef = useRef(codexStore);
+  codexStoreRef.current = codexStore;
 
   const reloadClaudeStore = useCallback(() => {
     const next = loadStore();
@@ -335,6 +359,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
 
   const reloadCodexStore = useCallback(() => {
     const next = loadCodexStore();
+    codexStoreRef.current = next;
     setCodexStore(next);
     setCodexCursor((cursor) => Math.max(0, Math.min(cursor, next.profiles.length - 1)));
     return next;
@@ -463,20 +488,42 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     }
   }, [buffer, codexCallbackBusy]);
 
-  const refreshCodexUsage = useCallback(async () => {
-    setBusy('Refreshing Codex usage…');
+  const refreshCodexUsage = useCallback(async (
+    options: { announce?: boolean; label?: string } = {},
+  ): Promise<CodexProfilesStore> => {
+    const existing = codexUsageRefreshRef.current;
+    if (existing) {
+      if (options.announce !== false) setStatus('Codex usage refresh already running; waiting for it.');
+      return existing;
+    }
+    const task = (async () => {
+      setBusy(options.label ?? 'Refreshing Codex usage…');
+      try {
+        const next = await refreshAllCodexProfiles();
+        codexStoreRef.current = next;
+        setCodexStore(next);
+        if (options.announce !== false) setStatus('Codex usage updated.');
+        return next;
+      } catch (e) {
+        const current = loadCodexStore();
+        codexStoreRef.current = current;
+        setCodexStore(current);
+        setStatus(`Codex refresh failed: ${String((e as Error).message ?? e)}`);
+        return current;
+      } finally {
+        setBusy(null);
+      }
+    })();
+    codexUsageRefreshRef.current = task;
     try {
-      setCodexStore(await refreshAllCodexProfiles());
-      setStatus('Codex usage updated.');
-    } catch (e) {
-      setStatus(`Codex refresh failed: ${String((e as Error).message ?? e)}`);
+      return await task;
     } finally {
-      setBusy(null);
+      if (codexUsageRefreshRef.current === task) codexUsageRefreshRef.current = null;
     }
   }, []);
 
   const beginCodexSwitch = useCallback((target: CodexProfile) => {
-    if (target.id === codexStore.activeProfileId) {
+    if (target.id === codexStoreRef.current.activeProfileId) {
       setStatus(`"${target.label}" is already the active Codex account.`);
       return;
     }
@@ -486,7 +533,30 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     }
     setPendingCodexSwitch(target);
     setMode('codexConfirmSwitch');
-  }, [codexStore.activeProfileId]);
+  }, []);
+
+  const chooseBestCodexNow = useCallback(async () => {
+    const fresh = await refreshCodexUsage({ announce: false, label: 'Evaluating Codex Best Now…' });
+    const decision = bestNowCodex(fresh.profiles, fresh.activeProfileId);
+    const target = decision.target;
+    if (!target) {
+      if (decision.reason === 'all-exhausted' && decision.nextAvailableAt) {
+        const next = fresh.profiles.find((profile) => profile.id === decision.nextAvailableId);
+        setStatus(`No Codex account is available. ${next?.label ?? 'Next account'} resets in ${resetIn(new Date(decision.nextAvailableAt).toISOString())}.`);
+      } else {
+        setStatus(decision.reason === 'no-eligible-account'
+          ? 'No usable Codex account is available.'
+          : 'Codex quota data is unavailable; press "u" to retry.');
+      }
+      return;
+    }
+    setCodexCursor(fresh.profiles.findIndex((profile) => profile.id === target.id));
+    if (target.id === fresh.activeProfileId) {
+      setStatus(`Best Now: "${target.label}" is already active — ${bestNowDetail(decision)}.`);
+      return;
+    }
+    beginCodexSwitch(target);
+  }, [beginCodexSwitch, refreshCodexUsage]);
 
   const doCodexSwitch = useCallback(async (target: CodexProfile) => {
     setMode('list');
@@ -555,7 +625,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       if (a) {
         reconcileActiveIfLive(s, a);
         try {
-          const info = await fetchUsage(a, claudeVersion, { onRotate });
+          const info = await fetchUsage(a, claudeVersion, { onRotate, allowRefresh: false });
           persistUsage(a.id, info);
         } catch (e) {
           logger.error('mount usage fetch failed', e);
@@ -626,7 +696,10 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     if (!p || (!hasCliAuth(p) && !p.needsReauth)) return;
     const t = setTimeout(() => {
       reconcileActiveIfLive(storeRef.current, p);
-      fetchUsage(p, claudeVersion, { onRotate })
+      fetchUsage(p, claudeVersion, {
+        onRotate,
+        allowRefresh: p.id !== storeRef.current.activeProfileId,
+      })
         .then((info) => {
           persistUsage(p.id, info);
         })
@@ -635,6 +708,36 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cursor, claudeVersion, reconcileActiveIfLive, persistUsage, onRotate]);
+
+  // Codex gets the same cursor-preview behaviour without forcing a token rotation.
+  // The live account is inspected through the real CODEX_HOME; parked accounts use
+  // their isolated home with account/read(refreshToken=false).
+  useEffect(() => {
+    if (provider !== 'codex') return;
+    const selectedId = codexProfiles[codexCursor]?.id;
+    if (!selectedId) return;
+    const t = setTimeout(() => {
+      void (async () => {
+        if (codexUsageRefreshRef.current) return;
+        const current = loadCodexStore();
+        const profile = current.profiles.find((candidate) => candidate.id === selectedId);
+        if (!profile || profile.needsReauth) return;
+        if (profile.usage?.status === 'ok' && Date.now() - profile.usage.fetchedAt < 10 * 60 * 1000) return;
+        try {
+          const next = profile.id === current.activeProfileId
+            ? (await reconcileLiveCodex(false)).store
+            : await refreshCodexProfile(profile.id, { forceTokenRefresh: false });
+          codexStoreRef.current = next;
+          setCodexStore(next);
+        } catch (error) {
+          logger.error('Codex cursor usage preview failed', error, { email: profile.email });
+        }
+      })();
+    }, 250);
+    return () => clearTimeout(t);
+    // Store changes intentionally do not re-trigger preview; cursor/tab changes do.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider, codexCursor]);
 
   // First run: offer the one-click setup (shortcuts + auto keep-alive) exactly once.
   useEffect(() => {
@@ -671,6 +774,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       reconcileActiveIfLive(s, a);
       void fetchUsage(a, claudeVersion, {
         force: true,
+        allowRefresh: false,
         onRotate: (p) => {
           const current = loadStore();
           storeRef.current = current;
@@ -692,20 +796,65 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     return () => clearInterval(t);
   }, [claudeVersion, persistUsage, reconcileActiveIfLive]);
 
-  const refreshAllUsage = useCallback(async () => {
-    setBusy('Refreshing usage…');
-    for (const p of store.profiles) {
-      try {
-        const info = await fetchUsage(p, claudeVersion, { force: true, onRotate });
-        persistUsage(p.id, info);
-      } catch (e) {
-        logger.error('usage refresh failed', e, { email: p.email });
-      }
-      await sleep(500); // be gentle with the rate-limited endpoint
+  const refreshAllUsage = useCallback(async (
+    options: { announce?: boolean; label?: string } = {},
+  ): Promise<ProfilesStore> => {
+    const existing = claudeUsageRefreshRef.current;
+    if (existing) {
+      if (options.announce !== false) setStatus('Usage refresh already running; waiting for it.');
+      return existing;
     }
-    setBusy(null);
-    setStatus('Usage updated.');
-  }, [store, claudeVersion, persistUsage, onRotate]);
+    const task = (async () => {
+      setBusy(options.label ?? 'Refreshing usage…');
+      try {
+        const ids = loadStore().profiles
+          .filter((profile) => hasCliAuth(profile) || profile.needsReauth)
+          .map((profile) => profile.id);
+        for (let index = 0; index < ids.length; index++) {
+          let current = loadStore();
+          let profile = current.profiles.find((candidate) => candidate.id === ids[index]);
+          if (!profile) continue;
+          if (profile.id === current.activeProfileId) {
+            reconcileActiveIfLive(current, profile);
+            current = loadStore();
+            profile = current.profiles.find((candidate) => candidate.id === ids[index]);
+            if (!profile) continue;
+          }
+          try {
+            const info = await fetchUsage(profile, claudeVersion, {
+              force: true,
+              onRotate,
+              allowRefresh: profile.id !== current.activeProfileId,
+            });
+            persistUsage(profile.id, info);
+          } catch (e) {
+            logger.error('usage refresh failed', e, { email: profile.email });
+          }
+          if (index < ids.length - 1) await sleep(500); // gentle global pacing
+        }
+        const next = loadStore();
+        storeRef.current = next;
+        setStore(next);
+        if (options.announce !== false) setStatus('Usage is up to date.');
+        return next;
+      } catch (error) {
+        logger.error('manual usage refresh failed', error);
+        const current = loadStore();
+        storeRef.current = current;
+        setStore(current);
+        setStatus(`Usage refresh failed: ${String((error as Error).message ?? error)}`);
+        return current;
+      } finally {
+        setBusy(null);
+      }
+    })();
+    claudeUsageRefreshRef.current = task;
+    try {
+      return await task;
+    } finally {
+      if (claudeUsageRefreshRef.current === task) claudeUsageRefreshRef.current = null;
+    }
+  }, [claudeVersion, persistUsage, onRotate, reconcileActiveIfLive]);
 
   const doSwitch = useCallback(
     async (target: Profile, pids: ProcInfo[]) => {
@@ -787,7 +936,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
 
   const beginSwitch = useCallback(
     (target: Profile) => {
-      if (target.id === store.activeProfileId) {
+      if (target.id === storeRef.current.activeProfileId) {
         setStatus(`"${target.label}" is already the active account.`);
         return;
       }
@@ -806,8 +955,31 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       setStatus('');
       setMode('confirmSwitch');
     },
-    [store.activeProfileId],
+    [],
   );
+
+  const chooseBestClaudeNow = useCallback(async () => {
+    const fresh = await refreshAllUsage({ announce: false, label: 'Evaluating Claude Best Now…' });
+    const decision = bestNow(fresh.profiles, fresh.activeProfileId);
+    const target = decision.target;
+    if (!target) {
+      if (decision.reason === 'all-exhausted' && decision.nextAvailableAt) {
+        const next = fresh.profiles.find((profile) => profile.id === decision.nextAvailableId);
+        setStatus(`No Claude account is available. ${next?.label ?? 'Next account'} resets in ${resetIn(new Date(decision.nextAvailableAt).toISOString())}.`);
+      } else {
+        setStatus(decision.reason === 'no-eligible-account'
+          ? 'No usable Claude account is available.'
+          : 'Claude quota data is unavailable; press "u" to retry.');
+      }
+      return;
+    }
+    setCursor(fresh.profiles.findIndex((profile) => profile.id === target.id));
+    if (target.id === fresh.activeProfileId) {
+      setStatus(`Best Now: "${target.label}" is already active — ${bestNowDetail(decision)}.`);
+      return;
+    }
+    beginSwitch(target);
+  }, [beginSwitch, refreshAllUsage]);
 
   const startAdd = useCallback(
     async (reauthEmail?: string) => {
@@ -1043,15 +1215,23 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         } else if (input === 'd' && codexSelected) {
           if (codexSelected.id === codexStore.activeProfileId) setStatus('Cannot delete the active Codex account. Switch away first.');
           else setMode('codexConfirmDelete');
-        } else if (input === 'l' || input === 'b') {
+        } else if (input === 'z') {
+          const before = codexStore.profiles.length;
+          const next = restoreLatestDeletedCodexProfile();
+          setCodexStore(next);
+          if (next.profiles.length > before) {
+            setCodexCursor(next.profiles.length - 1);
+            setStatus(`Restored archived Codex profile "${next.profiles.at(-1)?.label}".`);
+          } else setStatus('No archived Codex profile to restore.');
+        } else if (input === 'l') {
           const target = leastLoadedCodex(codexProfiles);
           if (!target) setStatus('No Codex usage data yet. Press "u" to refresh.');
-          else if (input === 'b' && target.id !== codexStore.activeProfileId) beginCodexSwitch(target);
           else {
             setCodexCursor(codexProfiles.findIndex((p) => p.id === target.id));
-            setStatus(input === 'b' ? 'Active Codex account already has the most headroom.' : `Most Codex headroom: ${target.label}.`);
+            setStatus(`Most Codex headroom: ${target.label}.`);
           }
-        } else if (input === 'u') void refreshCodexUsage();
+        } else if (input === 'b') void chooseBestCodexNow();
+        else if (input === 'u') void refreshCodexUsage();
         else if (input === 'S') openSetup();
         else if (input === 'q' || key.escape) exit();
         return;
@@ -1077,6 +1257,15 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         } else {
           setMode('confirmDelete');
         }
+      } else if (input === 'z') {
+        let restored: Profile | undefined;
+        const next = mutateStore((fresh) => { restored = restoreLatestDeletedProfile(fresh); });
+        storeRef.current = next;
+        setStore(next);
+        if (restored) {
+          setCursor(next.profiles.findIndex((profile) => profile.id === restored!.id));
+          setStatus(`Restored archived profile "${restored.label}".`);
+        } else setStatus('No archived Claude profile to restore.');
       } else if (input === 'l') {
         const target = leastLoaded(store.profiles);
         if (target) {
@@ -1086,11 +1275,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           setStatus('No usage data yet. Press "u" to refresh usage first.');
         }
       } else if (input === 'b') {
-        // Best-now: switch straight to the account with the most headroom.
-        const target = leastLoaded(store.profiles);
-        if (!target) setStatus('No usage data yet. Press "u" to refresh usage first.');
-        else if (target.id === store.activeProfileId) setStatus('Active account already has the most headroom.');
-        else beginSwitch(target);
+        void chooseBestClaudeNow();
       } else if (input === 'u') void refreshAllUsage();
       else if (input === 'S') openSetup();
       else if (input === 'q' || key.escape) exit();
@@ -1135,9 +1320,13 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     if (mode === 'codexConfirmDelete') {
       if (input === 'y' && codexSelected) {
         const label = codexSelected.label;
-        setCodexStore(deleteCodexProfile(codexSelected.id));
-        setCodexCursor((c) => Math.max(0, Math.min(c, codexProfiles.length - 2)));
-        setStatus(`Deleted Codex profile "${label}".`);
+        try {
+          setCodexStore(deleteCodexProfile(codexSelected.id));
+          setCodexCursor((c) => Math.max(0, Math.min(c, codexProfiles.length - 2)));
+          setStatus(`Archived Codex profile "${label}". Press z to restore it.`);
+        } catch (error) {
+          setStatus(`Codex archive failed: ${String((error as Error).message ?? error)}`);
+        }
         setMode('list');
       } else if (input === 'n' || key.escape) setMode('list');
       return;
@@ -1189,11 +1378,15 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       if (input === 'y') {
         if (selected) {
           const label = selected.label;
-          const next = mutateStore((fresh) => deleteProfile(fresh, selected.id));
-          storeRef.current = next;
-          setStore(next);
-          setCursor((c) => Math.max(0, Math.min(c, next.profiles.length - 1)));
-          setStatus(`Deleted "${label}".`);
+          try {
+            const next = mutateStore((fresh) => deleteProfile(fresh, selected.id));
+            storeRef.current = next;
+            setStore(next);
+            setCursor((c) => Math.max(0, Math.min(c, next.profiles.length - 1)));
+            setStatus(`Archived "${label}". Press z to restore it.`);
+          } catch (error) {
+            setStatus(`Archive failed: ${String((error as Error).message ?? error)}`);
+          }
         }
         setMode('list');
       } else if (input === 'n' || key.escape) {
@@ -1354,9 +1547,8 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const W = Math.max(72, Math.min(cols - 1, 150));
   const emailW = Math.max(16, W - (4 + 18 + 8 + 6 + 12 + 12 + 11));
   const leftW = Math.min(42, Math.max(24, Math.floor((W - 4) * 0.4)));
-  const least = leastLoaded(profiles);
-  const leastName = least ? least.label : null;
-  const codexLeast = leastLoadedCodex(codexProfiles);
+  const claudeBest = bestNow(profiles, store.activeProfileId);
+  const codexBest = bestNowCodex(codexProfiles, codexStore.activeProfileId);
   const providerColor = provider === 'claude' ? CLAUDE_ORANGE : CODEX_BLUE;
   const providerName = provider === 'claude' ? 'Claude' : 'Codex';
 
@@ -1431,21 +1623,21 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                         <Text color={utilColor(selected.usage.five_hour?.utilization ?? null)}>
                           {fmtPct(selected.usage.five_hour?.utilization).padEnd(5)}
                         </Text>
-                        <Text dimColor>resets {resetAt(selected.usage.five_hour?.resets_at)}</Text>
+                        <Text dimColor>{quotaResetLabel(selected.usage.five_hour?.utilization, selected.usage.five_hour?.resets_at)}</Text>
                       </Text>
                       <Text>
                         {'   7d  '}
                         <Text color={utilColor(selected.usage.seven_day?.utilization ?? null)}>
                           {fmtPct(selected.usage.seven_day?.utilization).padEnd(5)}
                         </Text>
-                        <Text dimColor>resets {resetAt(selected.usage.seven_day?.resets_at)}</Text>
+                        <Text dimColor>{quotaResetLabel(selected.usage.seven_day?.utilization, selected.usage.seven_day?.resets_at)}</Text>
                       </Text>
                       {selected.needsReauth ? (
                         <Text color="red">{'   ⚠ login expired — press "a" to re-add (numbers are last-known)'}</Text>
                       ) : selected.usage.status === 'stale' ? (
                         <Text dimColor>{selected.needsReauth ? '   (cached — login renewal required)' : '   (cached — live refresh unavailable)'}</Text>
                       ) : null}
-                      {/* PROMO: Fable 50% until 2026-07-07 — auto-hidden after FABLE_PROMO_END; safe to delete this block after the promo. */}
+                      {/* PROMO: Fable 50% through 2026-07-19 — auto-hidden at FABLE_PROMO_END. */}
                       {(() => {
                         if (Date.now() >= FABLE_PROMO_END) return null;
                         const fable = selected.usage.models?.find((m) => /fable/i.test(m.name));
@@ -1454,7 +1646,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                           <Text>
                             {'   Fable '}
                             <Text color={utilColor(fable.utilization)}>{fmtPct(fable.utilization).padEnd(5)}</Text>
-                            <Text dimColor>promo (until Jul 7)</Text>
+                            <Text dimColor>promo (through Jul 19)</Text>
                           </Text>
                         );
                       })()}
@@ -1468,11 +1660,14 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                   )}
                 </Box>
               ) : null}
-              {leastName ? (
+              {claudeBest.target ? (
                 <Text>
-                  <Text dimColor>most headroom: </Text>
-                  <Text color="green">{leastName}</Text>
+                  <Text dimColor>best now: </Text>
+                  <Text color="green">{claudeBest.target.label}</Text>
+                  <Text dimColor> · {bestNowDetail(claudeBest)}</Text>
                 </Text>
+              ) : claudeBest.reason === 'all-exhausted' && claudeBest.nextAvailableAt ? (
+                <Text dimColor>best now: none · next reset in {resetIn(new Date(claudeBest.nextAvailableAt).toISOString())}</Text>
               ) : null}
             </Box>
           </Box>
@@ -1495,14 +1690,14 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                   <Text><Text dimColor>{codexSelected.id === codexStore.activeProfileId ? 'active ' : 'viewing '}</Text><Text color={codexSelected.id === codexStore.activeProfileId ? 'green' : 'cyanBright'}>●</Text>{' '}<Text bold>{codexSelected.label}</Text>{' '}<Text color={planColor(codexSelected.planType)}>{(codexSelected.planType ?? '').toUpperCase()}</Text></Text>
                   {codexSelected.usage?.bucket ? (
                     <>
-                      <Text>{'   5h  '}<Text color={utilColor(codexSelected.usage.bucket.primary?.usedPercent ?? null)}>{fmtPct(codexSelected.usage.bucket.primary?.usedPercent).padEnd(5)}</Text><Text dimColor>resets {resetAt(codexSelected.usage.bucket.primary?.resetsAt ? new Date(codexSelected.usage.bucket.primary.resetsAt * 1000).toISOString() : null)}</Text></Text>
-                      <Text>{'   7d  '}<Text color={utilColor(codexSelected.usage.bucket.secondary?.usedPercent ?? null)}>{fmtPct(codexSelected.usage.bucket.secondary?.usedPercent).padEnd(5)}</Text><Text dimColor>resets {resetAt(codexSelected.usage.bucket.secondary?.resetsAt ? new Date(codexSelected.usage.bucket.secondary.resetsAt * 1000).toISOString() : null)}</Text></Text>
+                      <Text>{'   5h  '}<Text color={utilColor(codexSelected.usage.bucket.primary?.usedPercent ?? null)}>{fmtPct(codexSelected.usage.bucket.primary?.usedPercent).padEnd(5)}</Text><Text dimColor>{quotaResetLabel(codexSelected.usage.bucket.primary?.usedPercent, codexSelected.usage.bucket.primary?.resetsAt ? new Date(codexSelected.usage.bucket.primary.resetsAt * 1000).toISOString() : null)}</Text></Text>
+                      <Text>{'   7d  '}<Text color={utilColor(codexSelected.usage.bucket.secondary?.usedPercent ?? null)}>{fmtPct(codexSelected.usage.bucket.secondary?.usedPercent).padEnd(5)}</Text><Text dimColor>{quotaResetLabel(codexSelected.usage.bucket.secondary?.usedPercent, codexSelected.usage.bucket.secondary?.resetsAt ? new Date(codexSelected.usage.bucket.secondary.resetsAt * 1000).toISOString() : null)}</Text></Text>
                       {codexSelected.usage.status === 'stale' ? <Text dimColor>{'   cached — live refresh unavailable'}</Text> : null}
                     </>
                   ) : codexSelected.needsReauth ? <Text color="red">{'   ⚠ login expired — press "a" to add the account again'}</Text> : <Text dimColor>{'   press u to load Codex usage'}</Text>}
                 </Box>
               ) : null}
-              {codexLeast ? <Text><Text dimColor>most headroom: </Text><Text color="green">{codexLeast.label}</Text></Text> : null}
+              {codexBest.target ? <Text><Text dimColor>best now: </Text><Text color="green">{codexBest.target.label}</Text><Text dimColor> · {bestNowDetail(codexBest)}</Text></Text> : codexBest.reason === 'all-exhausted' && codexBest.nextAvailableAt ? <Text dimColor>best now: none · next reset in {resetIn(new Date(codexBest.nextAvailableAt).toISOString())}</Text> : null}
             </Box>
           </Box>
         </Box>
@@ -1759,15 +1954,15 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           {mode === 'codexConfirmSwitch' && pendingCodexSwitch ? (
             <Box marginTop={1} flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
               <Text bold color="yellow">Switch Codex to "{pendingCodexSwitch.label}" ({pendingCodexSwitch.email})?</Text>
-              <Text>Codex Desktop will be asked to close, then force-quit after 8 seconds if it only minimizes.</Text>
-              <Text dimColor>Unsaved Desktop work can be lost. Standalone Codex CLI sessions are never force-quit.</Text>
+              <Text>Codex Desktop and CLI sessions will be closed before the switch.</Text>
+              <Text dimColor>Unsaved Codex work can be lost. Claude processes are never force-quit.</Text>
               <Box marginTop={1}><Text color="yellow">[y/Enter]</Text><Text dimColor> confirm · [n/Esc] cancel</Text></Box>
             </Box>
           ) : null}
 
           {mode === 'codexConfirmDelete' && codexSelected ? (
             <Box marginTop={1} borderStyle="round" borderColor="red" paddingX={1}>
-              <Text color="red">Delete Codex profile "{codexSelected.label}" ({codexSelected.email})? [y] yes · [n] no</Text>
+              <Text color="red">Archive Codex profile "{codexSelected.label}" ({codexSelected.email})? Credentials are retained. [y] yes · [n] no</Text>
             </Box>
           ) : null}
 
@@ -1872,7 +2067,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           {mode === 'confirmDelete' && selected ? (
             <Box marginTop={1} borderStyle="round" borderColor="red" paddingX={1}>
               <Text color="red">
-                Delete profile "{selected.label}" ({selected.email})? [y] yes · [n] no
+                Archive profile "{selected.label}" ({selected.email})? Credentials are retained. [y] yes · [n] no
               </Text>
             </Box>
           ) : null}
@@ -1902,12 +2097,13 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
               <Text dimColor>
                 <Text color="cyan">a</Text> add · <Text color="cyan">A</Text> add Desktop · <Text color="cyan">i</Text> import ·{' '}
                 <Text color="cyan">e</Text> export · <Text color="cyan">E</Text> export-all · <Text color="cyan">r</Text> rename ·{' '}
-                <Text color="cyan">d</Text> delete · <Text color="cyan">S</Text> setup · <Text color="cyan">q</Text> quit
+                <Text color="cyan">d</Text> archive · <Text color="cyan">z</Text> restore · <Text color="cyan">S</Text> setup · <Text color="cyan">q</Text> quit
               </Text>
             ) : (
               <Text dimColor>
                 <Text color={CODEX_BLUE}>a</Text> add · <Text color={CODEX_BLUE}>i</Text> import · <Text color={CODEX_BLUE}>e</Text> export ·{' '}
-                <Text color={CODEX_BLUE}>E</Text> export-all · <Text color={CODEX_BLUE}>r</Text> rename · <Text color={CODEX_BLUE}>d</Text> delete ·{' '}
+                <Text color={CODEX_BLUE}>E</Text> export-all · <Text color={CODEX_BLUE}>r</Text> rename · <Text color={CODEX_BLUE}>d</Text> archive ·{' '}
+                <Text color={CODEX_BLUE}>z</Text> restore ·{' '}
                 <Text color={CODEX_BLUE}>S</Text> setup · <Text color={CODEX_BLUE}>q</Text> quit
               </Text>
             )}
@@ -1971,6 +2167,7 @@ function printClaudeDoctor(): void {
   console.log(`Claude provider`);
   console.log(`Claude Code version: ${detectClaudeVersion()}`);
   console.log(`Profiles: ${store.profiles.length}`);
+  console.log(`Restorable archives: ${(store.tombstones ?? []).filter((t) => t.archivedProfile?.provider === 'claude' && (!t.restoredAt || t.deletedAt > t.restoredAt)).length}`);
   console.log(`Active profile id: ${store.activeProfileId ?? '(none)'}`);
 
   const envAuth = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CONFIG_DIR']
@@ -2006,6 +2203,7 @@ async function printCodexDoctor(): Promise<void> {
   console.log(`Codex`);
   console.log(`Codex version: ${detectCodexVersion()}`);
   console.log(`Profiles: ${store.profiles.length}`);
+  console.log(`Restorable archives: ${store.tombstones.filter((t) => t.archivedProfile?.provider === 'codex' && (!t.restoredAt || t.deletedAt > t.restoredAt)).length}`);
   console.log(`Active profile id: ${store.activeProfileId ?? '(none)'}`);
   console.log(`Abandoned/pending login sandboxes: ${pending.length}`);
   const liveAuth = readCodexAuth(codexHome());
@@ -2053,8 +2251,8 @@ function printDryRun(target: Profile, rep: DryRunReport): void {
 /**
  * Headless keep-alive: refresh every account's OAuth token that's near expiry and persist
  * the rotation — so accounts stay alive even when the switcher UI isn't open. Run by the OS
- * scheduler (see keep-alive install). The ACTIVE account is left to a running `claude`
- * session if one is live (it manages its own token); otherwise we reconcile + refresh it too.
+ * scheduler (see keep-alive install). The ACTIVE account is always left to the official
+ * Claude client: refreshing it here can invalidate a rotating token held by a live session.
  */
 async function runKeepAliveOnce(): Promise<void> {
   let store = loadStore();
@@ -2063,13 +2261,7 @@ async function runKeepAliveOnce(): Promise<void> {
     return;
   }
   const LEAD_MS = 60 * 60 * 1000; // refresh anything expiring within the next hour
-  let claudeRunning = false;
-  try {
-    claudeRunning = findClaudeProcesses().length > 0;
-  } catch {
-    /* treat as not running */
-  }
-  if (!claudeRunning && getActive(store)) {
+  if (getActive(store)) {
     try {
       store = mutateStore((fresh) => {
         reconcileWithLive(fresh);
@@ -2098,7 +2290,7 @@ async function runKeepAliveOnce(): Promise<void> {
     }
     if (!hasCliAuth(p)) continue;
     const isActive = p.id === store.activeProfileId;
-    if (isActive && claudeRunning) continue; // the live session owns its own token
+    if (isActive) continue; // the official Claude client exclusively owns live token rotation
     const before = p.claudeAiOauth.refreshToken;
     await keepTokenAlive(p, LEAD_MS, onRotate);
     if (p.claudeAiOauth.refreshToken !== before) refreshed++;

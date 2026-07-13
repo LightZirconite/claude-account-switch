@@ -15,6 +15,7 @@ import {
 import { logger } from './logger';
 import { withFileLock, withFileLockSync } from './locks';
 import { inspectCodexHome, loginCodexHome, type CodexInspection } from './codexAppServer';
+import { selectBestNow, type BestNowDecision } from './scheduling';
 import type { CodexAuthFile, CodexProfile, CodexProfilesStore, CodexUsageInfo, ProfileTombstone } from './types';
 
 const STORE_VERSION = 1;
@@ -143,7 +144,10 @@ function mergeTombstones(a: ProfileTombstone[], b: ProfileTombstone[]): ProfileT
   const map = new Map<string, ProfileTombstone>();
   for (const t of [...a, ...b]) {
     const previous = map.get(t.id);
-    if (!previous || previous.deletedAt < t.deletedAt) map.set(t.id, t);
+    const previousEventAt = previous ? Math.max(previous.deletedAt, previous.restoredAt ?? 0) : 0;
+    const eventAt = Math.max(t.deletedAt, t.restoredAt ?? 0);
+    if (!previous || previousEventAt < eventAt
+      || (previousEventAt === eventAt && (previous.restoredAt ?? 0) < (t.restoredAt ?? 0))) map.set(t.id, t);
   }
   return [...map.values()];
 }
@@ -151,7 +155,9 @@ function mergeTombstones(a: ProfileTombstone[], b: ProfileTombstone[]): ProfileT
 function mergeStores(incoming: CodexProfilesStore, disk: CodexProfilesStore | null): CodexProfilesStore {
   if (!disk) return { ...incoming, revision: incoming.revision + 1 };
   const tombstones = mergeTombstones(disk.tombstones, incoming.tombstones);
-  const deleted = new Set(tombstones.map((t) => t.id));
+  const deleted = new Set(tombstones
+    .filter((t) => !t.restoredAt || t.deletedAt > t.restoredAt)
+    .map((t) => t.id));
   const profiles = incoming.profiles.filter((p) => !deleted.has(p.id));
   for (const old of disk.profiles) {
     if (deleted.has(old.id)) continue;
@@ -317,7 +323,18 @@ function upsertAuth(
   const meta = metadataFromAuth(auth);
   let selected!: CodexProfile;
   const store = mutateCodexStore((current) => {
-    const existing = current.profiles.find((p) => p.accountId === meta.accountId);
+    let existing = current.profiles.find((p) => p.accountId === meta.accountId);
+    if (!existing) {
+      const archived = current.tombstones.find((t) => t.provider === 'codex'
+        && t.archivedProfile?.provider === 'codex'
+        && t.archivedProfile.accountId === meta.accountId
+        && (!t.restoredAt || t.deletedAt > t.restoredAt));
+      if (archived?.archivedProfile?.provider === 'codex') {
+        existing = { ...archived.archivedProfile };
+        current.profiles.push(existing);
+        archived.restoredAt = Date.now();
+      }
+    }
     if (existing) {
       existing.email = inspection?.account?.email || meta.email;
       existing.planType = inspection?.account?.planType || meta.planType;
@@ -347,7 +364,9 @@ function upsertAuth(
     // Credentials are written while the store lock is held and before metadata is
     // committed. A disk error therefore cannot leave a profile row without auth.json.
     writeProfileAuth(selected.id, auth);
-    current.tombstones = current.tombstones.filter((t) => t.id !== selected.id);
+    for (const tombstone of current.tombstones) {
+      if (tombstone.id === selected.id) tombstone.restoredAt = Date.now();
+    }
   });
   return { store, profile: selected };
 }
@@ -400,14 +419,18 @@ export async function addCodexAccount(
   }
 }
 
-export async function refreshCodexProfile(profileId: string): Promise<CodexProfilesStore> {
+export async function refreshCodexProfile(
+  profileId: string,
+  options: { forceTokenRefresh?: boolean } = {},
+): Promise<CodexProfilesStore> {
   return withFileLock(`codex-account-${profileId}`, async () => {
     const profile = loadCodexStore().profiles.find((p) => p.id === profileId);
     if (!profile) throw new Error('Codex profile not found.');
+    const forceTokenRefresh = options.forceTokenRefresh ?? true;
     try {
-      // Officially force the managed ChatGPT refresh so the rotated auth.json is
-      // durable inside this account envelope before the account lock is released.
-      const inspection = await inspectCodexHome(codexProfileHome(profileId), true);
+      // Manual maintenance forces the official managed ChatGPT refresh. Cursor preview
+      // passes false and therefore reads quotas without rotating a parked credential.
+      const inspection = await inspectCodexHome(codexProfileHome(profileId), forceTokenRefresh);
       const refreshedAuth = readCodexAuth(codexProfileHome(profileId));
       if (!refreshedAuth || refreshedAuth.tokens.account_id !== profile.accountId) {
         throw new Error('ChatGPT login is no longer available.');
@@ -425,7 +448,9 @@ export async function refreshCodexProfile(profileId: string): Promise<CodexProfi
       return mutateCodexStore((store) => {
         const target = store.profiles.find((p) => p.id === profileId);
         if (!target) return;
-        if (/auth|login|unauthorized|401/i.test(String(e))) target.needsReauth = true;
+        // A read-only preview can fail because its access token is merely expired; only
+        // a failed official forced refresh proves that this saved login needs attention.
+        if (forceTokenRefresh && /auth|login|unauthorized|401/i.test(String(e))) target.needsReauth = true;
         target.usage = target.usage
           ? { ...target.usage, status: 'stale', error: String(e) }
           : { fetchedAt: Date.now(), status: 'error', error: String(e) };
@@ -466,9 +491,15 @@ export function renameCodexProfile(id: string, label: string): CodexProfilesStor
 
 export function deleteCodexProfile(id: string): CodexProfilesStore {
   const store = mutateCodexStore((current) => {
+    const profile = current.profiles.find((candidate) => candidate.id === id);
+    if (!profile) return;
+    if (current.activeProfileId === id) throw new Error('Cannot delete the active Codex account.');
     current.profiles = current.profiles.filter((p) => p.id !== id);
-    current.tombstones = [...current.tombstones.filter((t) => t.id !== id), { id, provider: 'codex', deletedAt: Date.now() }];
-    if (current.activeProfileId === id) current.activeProfileId = null;
+    current.tombstones = [
+      ...current.tombstones.filter((t) => t.id !== id),
+      { id, provider: 'codex', deletedAt: Date.now(), archivedProfile: { ...profile } },
+    ];
+    logger.info('codex profile archived', { email: profile.email });
   });
   try {
     const source = codexProfileHome(id);
@@ -476,12 +507,32 @@ export function deleteCodexProfile(id: string): CodexProfilesStore {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
       const destination = path.join(backupsDir(), 'codex-deleted', `${stamp}-${id}`);
       fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
-      fs.renameSync(source, destination);
+      fs.cpSync(source, destination, { recursive: true });
     }
   } catch (e) {
     logger.warn('codex deleted credential backup failed', { error: String(e) });
   }
   return store;
+}
+
+/** Restore the most recently archived Codex profile without making it active. */
+export function restoreLatestDeletedCodexProfile(): CodexProfilesStore {
+  return mutateCodexStore((store) => {
+    const tombstone = [...store.tombstones]
+      .filter((t) => t.provider === 'codex' && t.archivedProfile?.provider === 'codex'
+        && (!t.restoredAt || t.deletedAt > t.restoredAt))
+      .sort((a, b) => b.deletedAt - a.deletedAt)[0];
+    if (!tombstone?.archivedProfile || tombstone.archivedProfile.provider !== 'codex') return;
+    if (!store.profiles.some((profile) => profile.id === tombstone.id)) {
+      store.profiles.push({
+        ...tombstone.archivedProfile,
+        needsReauth: !readCodexAuth(codexProfileHome(tombstone.id)) || tombstone.archivedProfile.needsReauth,
+        updatedAt: Date.now(),
+      });
+    }
+    tombstone.restoredAt = Date.now();
+    logger.info('codex archived profile restored', { email: tombstone.archivedProfile.email });
+  });
 }
 
 export function setActiveCodexProfile(id: string): CodexProfilesStore {
@@ -504,6 +555,31 @@ export function leastLoadedCodex(profiles: CodexProfile[]): CodexProfile | null 
     .filter((item) => item.utilization >= 0)
     .sort((a, b) => a.utilization - b.utilization);
   return scored[0]?.profile ?? null;
+}
+
+/** Reset-aware Best Now adapter for Codex's epoch-second quota representation. */
+export function bestNowCodex(
+  profiles: CodexProfile[],
+  activeProfileId: string | null,
+  now = Date.now(),
+): BestNowDecision<CodexProfile> {
+  return selectBestNow(profiles.map((profile) => {
+    const bucket = profile.usage?.bucket;
+    const primary = bucket?.primary;
+    const secondary = bucket?.secondary;
+    return {
+      id: profile.id,
+      account: profile,
+      eligible: !profile.needsReauth,
+      isActive: profile.id === activeProfileId,
+      primary: primary
+        ? { usedPercent: primary.usedPercent, resetsAt: primary.resetsAt > 0 ? primary.resetsAt * 1000 : null }
+        : null,
+      secondary: secondary
+        ? { usedPercent: secondary.usedPercent, resetsAt: secondary.resetsAt > 0 ? secondary.resetsAt * 1000 : null }
+        : null,
+    };
+  }), now);
 }
 
 function portable(profile: CodexProfile): PortableCodexProfile {

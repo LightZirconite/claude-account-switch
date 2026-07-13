@@ -4,6 +4,7 @@ import { logger } from './logger';
 import { withFileLock } from './locks';
 import { refreshToken, type TokenSet } from './oauth';
 import { findByAccountUuid, findByEmail, loadStore, mutateStore } from './profiles';
+import { selectBestNow, type BestNowDecision } from './scheduling';
 import { hasCliAuth, type Profile, type UsageInfo } from './types';
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
@@ -16,6 +17,10 @@ const MIN_INTERVAL_MS = 30 * 1000; // hard floor: never hit the endpoint more th
 // (wrongly) flag a perfectly healthy account as dead. So we single-flight refreshes per
 // account: a second caller awaits the first's result instead of POSTing a now-stale token.
 const inFlightRefresh = new Map<string, Promise<TokenSet | null>>();
+// Usage reads can be triggered simultaneously by startup, cursor preview and a manual
+// `u`. Coalesce the complete read as well as token rotation so one account produces at
+// most one quota request at a time.
+const inFlightUsage = new Map<string, Promise<UsageInfo>>();
 // Last time we ATTEMPTED a refresh for an account (success or failure), used as a hard
 // floor for concurrent/stale UI paths. Known-dead accounts are not retried at all.
 const lastRefreshAttempt = new Map<string, number>();
@@ -53,6 +58,7 @@ async function ensureAccessToken(
   profile: Profile,
   onRotate?: (p: Profile) => void,
   refreshLeadMs = 60_000,
+  allowRefresh = true,
 ): Promise<string | null> {
   const now = Date.now();
   if (!hasCliAuth(profile)) return null;
@@ -63,6 +69,12 @@ async function ensureAccessToken(
   if (oauth.accessToken && oauth.expiresAt && oauth.expiresAt > now + refreshLeadMs) {
     return oauth.accessToken;
   }
+  // The live account is owned by Claude Code. Its refresh token rotates, and the
+  // official client may still hold the previous value in memory. A switcher-side
+  // refresh would invalidate that value and can make Claude clear its live auth on
+  // the next refresh attempt. Callers pass allowRefresh=false for the active account;
+  // stale quota data is preferable to logging the user out.
+  if (!allowRefresh) return null;
   if (!oauth.refreshToken) return oauth.accessToken ?? null;
 
   // A known-dead account must be re-added. Retrying the same rejected refresh token only
@@ -202,9 +214,15 @@ export async function keepTokenAlive(
 export async function fetchUsage(
   profile: Profile,
   claudeVersion: string,
-  opts: { force?: boolean; onRotate?: (p: Profile) => void } = {},
+  opts: { force?: boolean; onRotate?: (p: Profile) => void; allowRefresh?: boolean } = {},
 ): Promise<UsageInfo> {
   const now = Date.now();
+  // React effects can still hold an older profile object after another path persisted a
+  // fresh quota result. Rehydrate only the newer quota snapshot before applying caches.
+  const diskProfile = findDiskProfile(profile);
+  if ((diskProfile?.usage?.fetchedAt ?? 0) > (profile.usage?.fetchedAt ?? 0)) {
+    profile.usage = diskProfile?.usage;
+  }
   if (!hasCliAuth(profile)) {
     if (profile.needsReauth && profile.usage && (profile.usage.status === 'ok' || profile.usage.status === 'stale')) {
       return { ...profile.usage, status: 'stale' };
@@ -220,7 +238,25 @@ export async function fetchUsage(
     return profile.usage;
   }
 
-  const access = await ensureAccessToken(profile, opts.onRotate);
+  const pending = inFlightUsage.get(profile.id);
+  if (pending) return pending;
+
+  const request = fetchUsageUncached(profile, claudeVersion, opts, now);
+  inFlightUsage.set(profile.id, request);
+  try {
+    return await request;
+  } finally {
+    if (inFlightUsage.get(profile.id) === request) inFlightUsage.delete(profile.id);
+  }
+}
+
+async function fetchUsageUncached(
+  profile: Profile,
+  claudeVersion: string,
+  opts: { onRotate?: (p: Profile) => void; allowRefresh?: boolean },
+  now: number,
+): Promise<UsageInfo> {
+  const access = await ensureAccessToken(profile, opts.onRotate, 60_000, opts.allowRefresh !== false);
   if (!access) {
     // Keep showing the last known usage (dimmed as 'stale') so a needs-reauth account
     // still displays its last rate-limit numbers instead of a blank error.
@@ -316,4 +352,36 @@ export function leastLoaded(profiles: Profile[]): Profile | null {
     return oa - ob || a.u - b.u;
   });
   return scored[0].p;
+}
+
+function resetTime(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const value = Date.parse(iso);
+  return Number.isFinite(value) ? value : null;
+}
+
+/** Smart current-capacity selection while keeping Claude-specific parsing in its adapter. */
+export function bestNow(
+  profiles: Profile[],
+  activeProfileId: string | null,
+  now = Date.now(),
+): BestNowDecision<Profile> {
+  return selectBestNow(profiles.map((profile) => ({
+    id: profile.id,
+    account: profile,
+    eligible: hasCliAuth(profile) && !profile.needsReauth,
+    isActive: profile.id === activeProfileId,
+    primary: profile.usage?.five_hour && typeof profile.usage.five_hour.utilization === 'number'
+      ? {
+          usedPercent: profile.usage.five_hour.utilization,
+          resetsAt: resetTime(profile.usage.five_hour.resets_at),
+        }
+      : null,
+    secondary: profile.usage?.seven_day && typeof profile.usage.seven_day.utilization === 'number'
+      ? {
+          usedPercent: profile.usage.seven_day.utilization,
+          resetsAt: resetTime(profile.usage.seven_day.resets_at),
+        }
+      : null,
+  })), now);
 }
