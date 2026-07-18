@@ -24,16 +24,18 @@ export function claudeJsonPath(): string {
 }
 
 /**
- * Path to the credentials file holding `claudeAiOauth` (+ mcpOAuth).
- * Prefers the dotted `.credentials.json`; falls back to legacy `credentials.json`.
+ * Official Claude Code credential file holding `claudeAiOauth` (+ mcpOAuth).
+ * Windows and Linux always use the dotted name, including under CLAUDE_CONFIG_DIR.
+ * An undotted sibling can be left behind by older third-party tooling; it is not a
+ * second provider store and must never redirect or block live authentication.
  */
 export function credentialsPath(): string {
-  const dir = claudeConfigDir();
-  const dotted = path.join(dir, '.credentials.json');
-  const plain = path.join(dir, 'credentials.json');
-  if (fs.existsSync(dotted)) return dotted;
-  if (fs.existsSync(plain)) return plain;
-  return dotted; // default write target
+  return path.join(claudeConfigDir(), '.credentials.json');
+}
+
+/** Unsupported undotted sibling retained only for non-destructive diagnostics. */
+export function undottedClaudeCredentialsPath(): string {
+  return path.join(claudeConfigDir(), 'credentials.json');
 }
 
 /** The switcher's own data home (profiles, backups, logs, import/export). */
@@ -104,11 +106,13 @@ export function desktopUserDataDir(): string | null {
       : process.platform === 'win32'
         ? (process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming'))
         : path.join(os.homedir(), '.config');
-  for (const name of ['Claude', 'Claude-3p']) {
-    const dir = path.join(base, name);
-    if (fs.existsSync(dir)) return dir;
-  }
-  return null;
+  const candidates = ['Claude', 'Claude-3p']
+    .map((name) => path.join(base, name))
+    .filter((dir) => fs.existsSync(dir));
+  if (candidates.length < 2) return candidates[0] ?? null;
+  const plausible = candidates.filter((dir) => DESKTOP_BUNDLE_ENTRIES.some((entry) => fs.existsSync(path.join(dir, entry))));
+  if (plausible.length === 1) return plausible[0];
+  throw new Error(`Ambiguous Claude Desktop data stores: ${candidates.join(' and ')}. Close Desktop and remove/rename the stale store before capture or switching.`);
 }
 
 /**

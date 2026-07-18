@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { dataDir, ensureDataDirs } from './paths';
-import { logger } from './logger';
 
 const DEFAULT_STALE_MS = 5 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 60 * 1000;
@@ -34,6 +33,25 @@ interface LockOwner {
   ownerId: string;
   at: number;
   name: string;
+}
+
+function validOwner(owner: LockOwner | null, expectedName: string): owner is LockOwner {
+  return !!owner
+    && Number.isInteger(owner.pid)
+    && owner.pid > 0
+    && typeof owner.ownerId === 'string'
+    && owner.ownerId.length > 0
+    && Number.isFinite(owner.at)
+    && owner.name === expectedName;
+}
+
+export class AbandonedFileLockError extends Error {
+  constructor(readonly lockName: string, readonly lockDirectory: string) {
+    super(
+      `Lock "${lockName}" appears abandoned. It was retained to avoid deleting a concurrently reacquired lock; verify no owner is running, then remove ${lockDirectory} manually.`,
+    );
+    this.name = 'AbandonedFileLockError';
+  }
 }
 
 function readOwner(p: string): LockOwner | null {
@@ -69,13 +87,76 @@ function tryAcquire(name: string, staleMs: number): HeldLock | null {
       const age = Date.now() - fs.statSync(p).mtimeMs;
       const owner = readOwner(p);
       if (age > staleMs && (!owner || !processAlive(owner.pid))) {
-        fs.rmSync(p, { recursive: true, force: true });
-        logger.warn('removed stale lock', { name, ageMs: Math.round(age) });
+        // Never unlink a stale-looking lock here. Another waiter may already have
+        // removed/reacquired it after this process observed the old owner, and an
+        // unfenced rmSync would then delete the fresh owner's lock directory.
+        throw new AbandonedFileLockError(name, p);
       }
-    } catch {
-      /* retry below */
+    } catch (error) {
+      if (error instanceof AbandonedFileLockError) throw error;
+      /* A transient stat/read race is retried without deleting anything. */
     }
     return null;
+  }
+}
+
+/**
+ * Reclaim one lock whose recorded owner is provably dead.
+ *
+ * This is deliberately unavailable to ordinary waiters. A secondary, independently
+ * owned takeover lock serializes the only removers, and the primary ownerId is reread
+ * immediately before deletion. Normal acquirers cannot take the primary until after
+ * its directory has been removed, at which point this function performs no more
+ * deletions. A stale/corrupt takeover lock itself remains fail-closed.
+ */
+function reclaimAbandonedLock(name: string, staleMs: number): boolean {
+  const takeoverName = `${name}.abandoned-takeover`;
+  const takeover = tryAcquire(takeoverName, staleMs);
+  if (!takeover) {
+    throw new Error(`Another process is already recovering the abandoned lock: ${name}`);
+  }
+  try {
+    const selected = lockPath(name);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(selected);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      throw error;
+    }
+    const owner = readOwner(selected);
+    const ownerIsValid = validOwner(owner, name);
+    if (ownerIsValid) {
+      if (processAlive(owner.pid)) return false;
+    } else if (Date.now() - stat.mtimeMs <= staleMs) {
+      // Missing/corrupt ownership metadata cannot prove an immediate crash. Require
+      // the normal stale interval and preserve it for manual inspection until then.
+      return false;
+    }
+
+    const rechecked = readOwner(selected);
+    if (ownerIsValid) {
+      if (!validOwner(rechecked, name)
+        || rechecked.ownerId !== owner.ownerId
+        || rechecked.pid !== owner.pid
+        || processAlive(rechecked.pid)) return false;
+    } else {
+      let currentStat: fs.Stats;
+      try {
+        currentStat = fs.statSync(selected);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+        throw error;
+      }
+      if (validOwner(rechecked, name)
+        || currentStat.mtimeMs !== stat.mtimeMs
+        || currentStat.ctimeMs !== stat.ctimeMs) return false;
+    }
+
+    fs.rmSync(selected, { recursive: true, force: false });
+    return true;
+  } finally {
+    release(takeover);
   }
 }
 
@@ -93,15 +174,29 @@ function release(held: HeldLock): void {
 export function withFileLockSync<T>(
   name: string,
   fn: () => T,
-  opts: { staleMs?: number; timeoutMs?: number } = {},
+  opts: { staleMs?: number; timeoutMs?: number; recoverAbandoned?: boolean } = {},
 ): T {
   const staleMs = opts.staleMs ?? DEFAULT_STALE_MS;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
   let held: HeldLock | null = null;
   while (!held) {
-    held = tryAcquire(name, staleMs);
+    try {
+      held = tryAcquire(name, staleMs);
+    } catch (error) {
+      if (!(error instanceof AbandonedFileLockError) || !opts.recoverAbandoned) throw error;
+      if (reclaimAbandonedLock(name, staleMs)) continue;
+    }
     if (held) break;
+    if (opts.recoverAbandoned) {
+      const selected = lockPath(name);
+      const owner = readOwner(selected);
+      // A valid dead owner is conclusive even before the generic stale interval. This
+      // is what makes immediate post-crash journal recovery possible.
+      if (validOwner(owner, name) && !processAlive(owner.pid)) {
+        if (reclaimAbandonedLock(name, staleMs)) continue;
+      }
+    }
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for lock: ${name}`);
     sleepSync(POLL_MS);
   }

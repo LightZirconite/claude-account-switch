@@ -67,18 +67,28 @@ async function postToken(body: Record<string, string>): Promise<TokenSet> {
     logger.warn('oauth: token endpoint failed', { status: res.status, reason });
     throw new Error(`OAuth token request failed (HTTP ${res.status}, ${reason}).`);
   }
-  const d = (await res.json()) as {
-    access_token: string;
-    refresh_token: string;
-    expires_in?: number;
-    scope?: string | string[];
-  };
+  const d = (await res.json()) as Record<string, unknown>;
+  const accessToken = typeof d.access_token === 'string' ? d.access_token.trim() : '';
+  const returnedRefresh = typeof d.refresh_token === 'string' ? d.refresh_token.trim() : '';
+  const previousRefresh = body.grant_type === 'refresh_token' ? body.refresh_token?.trim() : '';
+  const refreshTokenValue = returnedRefresh || previousRefresh;
+  const expiresIn = d.expires_in === undefined ? 28_800 : d.expires_in;
+  if (!accessToken || !refreshTokenValue) {
+    throw new Error('OAuth token endpoint returned an incomplete credential set. Existing credentials were preserved.');
+  }
+  if (typeof expiresIn !== 'number' || !Number.isFinite(expiresIn) || expiresIn <= 0 || expiresIn > 365 * 24 * 60 * 60) {
+    throw new Error('OAuth token endpoint returned an invalid access-token lifetime. Existing credentials were preserved.');
+  }
+  let scopes: string[] | undefined;
+  if (typeof d.scope === 'string') scopes = d.scope.split(/\s+/).filter(Boolean);
+  else if (Array.isArray(d.scope) && d.scope.every((scope) => typeof scope === 'string')) scopes = d.scope;
+  else if (d.scope !== undefined) throw new Error('OAuth token endpoint returned an invalid scope projection. Existing credentials were preserved.');
   logger.info('oauth: token exchange ok');
   return {
-    accessToken: d.access_token,
-    refreshToken: d.refresh_token,
-    expiresAt: Date.now() + (d.expires_in ?? 28800) * 1000,
-    scopes: typeof d.scope === 'string' ? d.scope.split(' ') : d.scope,
+    accessToken,
+    refreshToken: refreshTokenValue,
+    expiresAt: Date.now() + expiresIn * 1000,
+    scopes,
   };
 }
 
@@ -110,6 +120,13 @@ export interface PrimedIdentity {
   organizationUuidRoot?: string;
 }
 
+export type ClaudeCredentialCheckpoint = (identity: PrimedIdentity) => void;
+
+export interface PrimeIdentityOptions {
+  /** Test seam around the official CLI invocation; the isolated config path is never live. */
+  runIdentityLookup?: (claudeExe: string, configDir: string) => { status: number | null; error?: unknown };
+}
+
 function extractNode<T>(text: string, key: string): T | undefined {
   const tree = parseTree(text);
   if (!tree) return undefined;
@@ -122,11 +139,33 @@ function isolatedClaudeEnv(configDir: string): NodeJS.ProcessEnv {
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_AUTH_TOKEN;
   delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete env.CLAUDE_CODE_ACCOUNT_UUID;
+  delete env.CLAUDE_CODE_USER_EMAIL;
+  delete env.CLAUDE_CODE_ORGANIZATION_UUID;
   return env;
 }
 
+export function supportsIsolatedClaudeAuth(): boolean {
+  return process.platform !== 'darwin';
+}
+
+function assertFileIsolatedClaudeAuth(): void {
+  if (!supportsIsolatedClaudeAuth()) {
+    throw new Error(
+      'Safe parked-account capture is unavailable on macOS: Claude Code stores OAuth in the login Keychain, which is not proven to be isolated by CLAUDE_CONFIG_DIR. Existing live credentials were not touched.',
+    );
+  }
+}
+
 /** Resolve account identity without touching the user's live Claude configuration. */
-export function primeIdentity(tokens: TokenSet, claudeExe: string, scopes = DEFAULT_SCOPES): PrimedIdentity {
+export function primeIdentity(
+  tokens: TokenSet,
+  claudeExe: string,
+  scopes = DEFAULT_SCOPES,
+  checkpoint?: ClaudeCredentialCheckpoint,
+  options: PrimeIdentityOptions = {},
+): PrimedIdentity {
+  assertFileIsolatedClaudeAuth();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-prime-'));
   const claudeAiOauth: ClaudeAiOauth = {
     accessToken: tokens.accessToken,
@@ -134,44 +173,78 @@ export function primeIdentity(tokens: TokenSet, claudeExe: string, scopes = DEFA
     expiresAt: tokens.expiresAt,
     scopes: tokens.scopes ?? scopes.split(' '),
   };
+  let identity: PrimedIdentity = { claudeAiOauth, oauthAccount: { accountUuid: '' } };
+  let removeTemporaryHome = true;
   try {
     fs.writeFileSync(path.join(tmp, '.credentials.json'), JSON.stringify({ claudeAiOauth }, null, 2), {
       encoding: 'utf8',
       mode: 0o600,
     });
-    const result = spawnSync(claudeExe, ['-p', 'hi', '--max-turns', '1'], {
-      env: isolatedClaudeEnv(tmp),
-      timeout: 60_000,
-      encoding: 'utf8',
-      windowsHide: true,
-    });
+    const result = options.runIdentityLookup
+      ? options.runIdentityLookup(claudeExe, tmp)
+      : spawnSync(claudeExe, ['-p', 'hi', '--max-turns', '1'], {
+          env: isolatedClaudeEnv(tmp),
+          timeout: 60_000,
+          encoding: 'utf8',
+          windowsHide: true,
+        });
     logger.info('oauth: isolated identity lookup finished', { status: result.status, hadError: !!result.error });
+
+    // Read and validate the possibly-rotated chain before touching auxiliary identity
+    // files. Once the provider rotates a refresh token, falling back to the input token
+    // would persist an invalid predecessor and deleting this home would lose the account.
+    let finalOauth: ClaudeAiOauth;
+    let organizationUuidRoot: string | undefined;
+    const credentials = path.join(tmp, '.credentials.json');
+    try {
+      const after = JSON.parse(fs.readFileSync(credentials, 'utf8')) as {
+        claudeAiOauth?: ClaudeAiOauth;
+        organizationUuid?: unknown;
+      };
+      if (!hasRefreshableOauth(after.claudeAiOauth)) {
+        throw new Error('The isolated Claude credential file no longer contains a reusable refresh token.');
+      }
+      finalOauth = after.claudeAiOauth;
+      organizationUuidRoot = typeof after.organizationUuid === 'string' ? after.organizationUuid : undefined;
+    } catch (error) {
+      removeTemporaryHome = false;
+      logger.error('oauth: rotated credential recovery read failed; isolated home retained', error, { tmp });
+      throw new Error(`Claude identity lookup may have rotated the login, but its credential file could not be verified. The isolated recovery home was retained at ${tmp}.`, {
+        cause: error,
+      });
+    }
 
     let oauthAccount: OauthAccount = { accountUuid: '' };
     let userID: string | undefined;
     const claudeJson = path.join(tmp, '.claude.json');
-    if (fs.existsSync(claudeJson)) {
-      const text = fs.readFileSync(claudeJson, 'utf8');
-      oauthAccount = extractNode<OauthAccount>(text, 'oauthAccount') ?? oauthAccount;
-      userID = extractNode<string>(text, 'userID');
+    try {
+      if (fs.existsSync(claudeJson)) {
+        const text = fs.readFileSync(claudeJson, 'utf8');
+        oauthAccount = extractNode<OauthAccount>(text, 'oauthAccount') ?? oauthAccount;
+        userID = extractNode<string>(text, 'userID');
+      }
+    } catch (error) {
+      // Identity metadata is enrichable later; the rotating credential is not. Continue
+      // with an unresolved identity so the callback checkpoints the newest token chain.
+      logger.warn('oauth: Claude identity metadata unavailable; credential will be parked', { error: String(error) });
     }
-    let finalOauth = claudeAiOauth;
-    let organizationUuidRoot: string | undefined;
-    const credentials = path.join(tmp, '.credentials.json');
-    if (fs.existsSync(credentials)) {
-      const after = JSON.parse(fs.readFileSync(credentials, 'utf8')) as {
-        claudeAiOauth?: ClaudeAiOauth;
-        organizationUuid?: string;
-      };
-      if (hasRefreshableOauth(after.claudeAiOauth)) finalOauth = after.claudeAiOauth;
-      organizationUuidRoot = after.organizationUuid;
-    }
-    return { claudeAiOauth: finalOauth, oauthAccount, userID, organizationUuidRoot };
+    identity = { claudeAiOauth: finalOauth, oauthAccount, userID, organizationUuidRoot };
+    checkpoint?.(identity);
+    return identity;
   } catch (error) {
-    logger.error('oauth: isolated identity lookup failed', error);
-    return { claudeAiOauth, oauthAccount: { accountUuid: '' } };
+    // The isolated home still contains the provider-issued rotating chain. Keeping it
+    // is preferable to consuming a one-shot authorization and deleting the only copy.
+    removeTemporaryHome = false;
+    logger.error('oauth: durable identity checkpoint failed; isolated home retained', error, { tmp });
+    const alreadyRecoveryError = !removeTemporaryHome
+      && error instanceof Error
+      && error.message.includes('isolated recovery home was retained');
+    if (alreadyRecoveryError) throw error;
+    throw new Error(`Claude credentials could not be committed; the isolated recovery home was retained at ${tmp}.`, {
+      cause: error,
+    });
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    if (removeTemporaryHome) fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
 
@@ -180,8 +253,17 @@ export function primeIdentity(tokens: TokenSet, claudeExe: string, scopes = DEFA
  * (interactive). Returns the resulting identity after the user completes login.
  * The child inherits stdio so the user sees Claude's own login prompts.
  */
-export function loginViaClaudeCli(claudeExe: string, email?: string): Promise<PrimedIdentity | null> {
-  return new Promise((resolve) => {
+export function loginViaClaudeCli(
+  claudeExe: string,
+  email?: string,
+  checkpoint?: ClaudeCredentialCheckpoint,
+): Promise<PrimedIdentity | null> {
+  try {
+    assertFileIsolatedClaudeAuth();
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return new Promise((resolve, reject) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-login-'));
     const env = isolatedClaudeEnv(tmp);
     logger.info('oauth: starting official isolated Claude login', { tmp });
@@ -202,6 +284,7 @@ export function loginViaClaudeCli(claudeExe: string, email?: string): Promise<Pr
     child.on('exit', () => {
       if (settled) return;
       settled = true;
+      let removeTemporaryHome = true;
       try {
         const credPath = [path.join(tmp, '.credentials.json'), path.join(tmp, 'credentials.json')]
           .find((candidate) => fs.existsSync(candidate));
@@ -218,20 +301,30 @@ export function loginViaClaudeCli(claudeExe: string, email?: string): Promise<Pr
           oauthAccount = extractNode<OauthAccount>(cjText, 'oauthAccount') ?? oauthAccount;
           userID = extractNode<string>(cjText, 'userID');
         }
-        resolve({
+        const identity: PrimedIdentity = {
           claudeAiOauth: creds.claudeAiOauth,
           oauthAccount,
           userID,
           organizationUuidRoot: creds.organizationUuid,
-        });
+        };
+        if (!hasRefreshableOauth(identity.claudeAiOauth)) {
+          throw new Error('Official Claude login did not produce a reusable refresh token.');
+        }
+        checkpoint?.(identity);
+        resolve(identity);
       } catch (e) {
         logger.error('oauth: official login snapshot failed', e);
-        resolve(null);
+        // Keep the official CLI home when it contains a credential that could not be
+        // parsed or committed. It remains importable and is never silently discarded.
+        removeTemporaryHome = false;
+        reject(new Error(`Claude login capture failed; the isolated recovery home was retained at ${tmp}.`, { cause: e }));
       } finally {
-        try {
-          fs.rmSync(tmp, { recursive: true, force: true });
-        } catch {
-          /* ignore */
+        if (removeTemporaryHome) {
+          try {
+            fs.rmSync(tmp, { recursive: true, force: true });
+          } catch {
+            /* cleanup can be retried by the OS */
+          }
         }
       }
     });

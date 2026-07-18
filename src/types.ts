@@ -62,6 +62,20 @@ export interface ModelLimit {
   resets_at?: string | null;
 }
 
+/**
+ * Evidence carried with Claude's dynamic `limits` projection.
+ *
+ * An explicit empty array proves that no scoped bucket applies. Missing, malformed,
+ * or unsupported data must remain distinguishable so Best Now cannot silently treat
+ * an unknown constraint as zero usage.
+ */
+export type ClaudeModelLimitsState =
+  | 'absent'
+  | 'empty'
+  | 'complete'
+  | 'malformed'
+  | 'unsupported';
+
 export interface UsageInfo {
   fetchedAt: number;
   five_hour?: UsageWindow | null;
@@ -70,6 +84,8 @@ export interface UsageInfo {
   seven_day_sonnet?: UsageWindow | null;
   /** Per-model scoped weekly limits, parsed from the `limits` array. */
   models?: ModelLimit[];
+  /** Completeness evidence for `models`; absent on legacy cached observations. */
+  modelLimitsState?: ClaudeModelLimitsState;
   status: UsageStatus;
   error?: string;
 }
@@ -94,6 +110,9 @@ export interface Profile extends BaseProfile {
   organizationUuidRoot?: string;
   organizationType?: string;
   subscriptionType?: string;
+  /** Last time/source that the plan was confirmed by the official Claude CLI. */
+  planObservedAt?: number;
+  planSource?: 'oauth-token' | 'claude-auth-status';
   claudeAiOauth?: ClaudeAiOauth;
   oauthAccount?: OauthAccount;
   userID?: string;
@@ -142,6 +161,13 @@ export interface CodexRateLimitBucket {
     unlimited?: boolean;
     balance?: number | null;
   } | null;
+  /** Effective monthly spend/credit limit reported by current Codex app-server builds. */
+  individualLimit?: {
+    limit: string;
+    used: string;
+    remainingPercent: number;
+    resetsAt: number;
+  } | null;
 }
 
 export interface CodexUsageInfo {
@@ -150,6 +176,8 @@ export interface CodexUsageInfo {
   bucket?: CodexRateLimitBucket | null;
   buckets?: Record<string, CodexRateLimitBucket>;
   resetCredits?: number | null;
+  /** Newer app-server responses expose a separate workspace spend-control gate. */
+  spendControlReached?: boolean | null;
   error?: string;
 }
 
@@ -191,8 +219,6 @@ export interface ProfilesStore {
   activeProfileIds?: { claude: string | null; codex: string | null };
   tombstones?: ProfileTombstone[];
   claudeVersion?: string;
-  /** Whether a switch auto-closes running `claude` processes (default true). */
-  closeClaudeOnSwitch?: boolean;
   profiles: Profile[];
 }
 
