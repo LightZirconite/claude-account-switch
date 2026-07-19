@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { render, Box, Text, useApp, useInput } from 'ink';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 import clipboard from 'clipboardy';
 
 import {
@@ -11,9 +12,9 @@ import {
   credentialsPath,
   dataDir,
   desktopUserDataDir,
+  exportDir,
   findClaudeExe,
-  importDir,
-  logFile,
+  providerImportDir,
   undottedClaudeCredentialsPath,
 } from './paths';
 import { logger, redactText } from './logger';
@@ -26,12 +27,15 @@ import {
   loadStore,
   mutateStore,
   reconcileStoreWithProviderProof,
+  recoverClaudeImportMetadata,
+  recoverMissingClaudeProfileMetadata,
   getActive,
   addOrUpdateProfile,
   captureDesktopAccount,
   archiveClaudeProfile,
   restoreLatestDeletedProfile,
   exportProfile,
+  groupClaudeImportCandidates,
   scanImportDir,
   importFromPath,
   subscriptionOf,
@@ -42,7 +46,7 @@ import {
   finalizeClaudeAuthorization,
   syntheticClaudeAccountId,
   mutateStoreWithLiveAccount,
-  type ImportCandidate,
+  type ClaudeImportGroup,
 } from './profiles';
 import {
   applyProfile,
@@ -116,6 +120,7 @@ import {
   refreshCodexProfile,
   refreshAllCodexProfiles,
   renameCodexProfile,
+  scanCodexImportDir,
 } from './codexProfiles';
 import {
   CodexLoginCancelledError,
@@ -142,13 +147,56 @@ import {
   accountTableLayout,
   claudeMascotFrame,
   codexMascotFrame,
+  commandHelpPages,
   formatAccountOrdinal,
   formatQuotaWindowLabel,
   quotaColumnPresentation,
   quotaMeter,
 } from './presentation';
+import {
+  archiveImportedSources,
+  discoverCodexImportFiles,
+  importDispositionSummary,
+  normalizeImportPath,
+} from './transfer';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function providerMetadataSummary(verifiedCount: number, total: number): string {
+  if (verifiedCount === total) return `Provider metadata verified for ${total}/${total} account${total === 1 ? '' : 's'}.`;
+  if (verifiedCount > 0) {
+    return `Provider metadata verified for ${verifiedCount}/${total}; saved details remain for the rest and retry automatically.`;
+  }
+  return 'Provider metadata is temporarily unavailable; credentials remain saved and will retry automatically.';
+}
+
+async function recoverImportedCodexMetadata(
+  profiles: CodexProfile[],
+): Promise<{ store: CodexProfilesStore; verifiedCount: number }> {
+  const ids = [...new Set(profiles.map((profile) => profile.id))];
+  let nextIndex = 0;
+  let verifiedCount = 0;
+  const worker = async () => {
+    while (true) {
+      const id = ids[nextIndex++];
+      if (!id) return;
+      const startedAt = Date.now();
+      try {
+        const store = await refreshCodexProfile(id, { forceTokenRefresh: false });
+        const profile = store.profiles.find((candidate) => candidate.id === id);
+        const providerPlanObserved = (profile?.planObservedAt ?? 0) >= startedAt
+          && (profile?.planSource === 'codex-rate-limits' || profile?.planSource === 'codex-account');
+        const providerQuotaObserved = (profile?.usage?.fetchedAt ?? 0) >= startedAt
+          && profile?.usage?.status === 'ok';
+        if (providerPlanObserved || providerQuotaObserved) verifiedCount++;
+      } catch (error) {
+        logger.warn('Codex imported-profile metadata remains unavailable', { profileId: id, error: String(error) });
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(2, ids.length) }, () => worker()));
+  return { store: loadCodexStore(), verifiedCount };
+}
 
 function identityToFields(id: PrimedIdentity) {
   const oa = id.oauthAccount;
@@ -167,15 +215,12 @@ function identityToFields(id: PrimedIdentity) {
 
 function openFolder(dir: string): void {
   try {
-    if (process.platform === 'win32') {
-      spawn('explorer', [dir], { detached: true, stdio: 'ignore' }).unref();
-    } else if (process.platform === 'darwin') {
-      spawn('open', [dir], { detached: true, stdio: 'ignore' }).unref();
-    } else {
-      spawn('xdg-open', [dir], { detached: true, stdio: 'ignore' }).unref();
-    }
-  } catch {
-    /* ignore */
+    const command = process.platform === 'win32' ? 'explorer' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+    const child = spawn(command, [dir], { detached: true, stdio: 'ignore' });
+    child.once('error', (error) => logger.warn('file manager could not be opened', { dir, error: String(error) }));
+    child.unref();
+  } catch (error) {
+    logger.warn('file manager could not be started', { dir, error: String(error) });
   }
 }
 
@@ -432,8 +477,10 @@ type Mode =
   | 'confirmSwitch'
   | 'confirmDelete'
   | 'rename'
+  | 'help'
   | 'importMenu'
   | 'importPath'
+  | 'importing'
   | 'adding'
   | 'capturingDesktopConfirm'
   | 'capturingDesktopLabel'
@@ -443,11 +490,26 @@ type Mode =
   | 'codexConfirmSwitch'
   | 'codexConfirmDelete'
   | 'codexRename'
-  | 'codexImportPath'
-  | 'codexImporting'
   | 'search'
   | 'message';
 type Tone = 'success' | 'error' | 'info';
+
+interface ImportInboxItem {
+  key: string;
+  title: string;
+  detail: string;
+  sourcePaths: string[];
+  format: 'switch-export' | 'raw-credentials';
+  claudeGroup?: ClaudeImportGroup;
+  codexPath?: string;
+}
+
+interface MessageState {
+  title: string;
+  lines: string[];
+  tone: Tone;
+  openFolder?: string;
+}
 
 interface AppProps {
   initialStore: ProfilesStore;
@@ -474,8 +536,9 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const [lastSearch, setLastSearch] = useState<string>('');
   const [pendingSwitch, setPendingSwitch] = useState<{ profile: Profile; pids: ProcInfo[] } | null>(null);
   const [pendingCodexSwitch, setPendingCodexSwitch] = useState<CodexProfile | null>(null);
-  const [importCands, setImportCands] = useState<ImportCandidate[]>([]);
+  const [importItems, setImportItems] = useState<ImportInboxItem[]>([]);
   const [importCursor, setImportCursor] = useState(0);
+  const [helpPage, setHelpPage] = useState(0);
   const [addLines, setAddLines] = useState<string[]>([]);
   const [addBusy, setAddBusy] = useState(false);
   const [codexAddLines, setCodexAddLines] = useState<string[]>([]);
@@ -486,7 +549,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const motionFrame = useMotionFrame(mode === 'list' && !busy);
   const [newVersion, setNewVersion] = useState<string | null>(null);
   const [setupReport, setSetupReport] = useState<InstallReport | null>(null);
-  const [message, setMessage] = useState<{ title: string; lines: string[]; tone: Tone } | null>(null);
+  const [message, setMessage] = useState<MessageState | null>(null);
   const authRef = useRef<ManualAuth | null>(null);
   // React state updates are asynchronous. This ref closes the tiny Enter -> Esc race
   // immediately, before the one-shot token exchange can be misreported as cancelled.
@@ -567,8 +630,8 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     return next;
   }, []);
 
-  const showMessage = useCallback((title: string, lines: string[], tone: Tone) => {
-    setMessage({ title, lines, tone });
+  const showMessage = useCallback((title: string, lines: string[], tone: Tone, openFolderPath?: string) => {
+    setMessage({ title, lines, tone, openFolder: openFolderPath });
     setMode('message');
   }, []);
 
@@ -807,7 +870,8 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     if (!codexSelected) return;
     try {
       const file = await exportCodexProfile(codexSelected, { processInventory: findCodexProcesses });
-      showMessage('Codex account exported', [file, '', 'This file contains login secrets. Keep it private.'], 'success');
+      clipboard.write(file).catch(() => {});
+      showMessage('Codex account exported', [file, '', 'Path copied. This file contains login secrets. Keep it private.'], 'success', exportDir());
     } catch (e) {
       showMessage('Codex export failed', [redactText(e)], 'error');
     }
@@ -816,7 +880,8 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const exportAllCodex = useCallback(async () => {
     try {
       const file = await exportAllCodexProfiles(codexStore, { processInventory: findCodexProcesses });
-      showMessage('All Codex accounts exported', [file, '', 'This file contains login secrets. Keep it private.'], 'success');
+      clipboard.write(file).catch(() => {});
+      showMessage('All Codex accounts exported', [file, '', 'Path copied. This file contains login secrets. Keep it private.'], 'success', exportDir());
     } catch (e) {
       showMessage('Codex export failed', [redactText(e)], 'error');
     }
@@ -884,6 +949,8 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       let s: ProfilesStore;
       try {
         s = reconcileStoreWithProviderProof();
+        const metadata = await recoverMissingClaudeProfileMetadata(claudeVersion);
+        s = metadata.store;
         storeRef.current = s;
         setStore(s);
       } catch (error) {
@@ -912,6 +979,15 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           logger.error('mount usage fetch failed', e, { email: p.email });
         }
         await sleep(600); // be gentle with the rate-limited endpoint
+      }
+      // A quota read may have safely renewed an expired parked token. Retry unresolved
+      // identity once with that newest access token, still without rotating anything here.
+      try {
+        const metadata = await recoverMissingClaudeProfileMetadata(claudeVersion);
+        storeRef.current = metadata.store;
+        setStore(metadata.store);
+      } catch (error) {
+        logger.warn('post-refresh Claude metadata recovery unavailable', { error: String(error) });
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -959,6 +1035,9 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
             await keepTokenAlive(p, KEEP_ALIVE_LEAD_MS, rotate);
           }
         }
+        await recoverMissingClaudeProfileMetadata(claudeVersion).catch((error) => {
+          logger.warn('background Claude imported-profile metadata remains unavailable', { error: String(error) });
+        });
         await refreshClaudePlanProjection().catch((error) => {
           logger.warn('background Claude plan refresh unavailable', { error: String(error) });
         });
@@ -1099,7 +1178,11 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       const label = options.label ?? 'Refreshing usage…';
       setBusy(label);
       try {
-        const reconciled = reconcileStoreWithProviderProof();
+        let reconciled = reconcileStoreWithProviderProof();
+        const metadata = await recoverMissingClaudeProfileMetadata(claudeVersion, {
+          signal: controller.signal,
+        });
+        reconciled = metadata.store;
         storeRef.current = reconciled;
         setStore(reconciled);
         const observedAt = Date.now();
@@ -1144,6 +1227,13 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           await refreshClaudePlanProjection(controller.signal).catch((error) => {
             if (!controller.signal.aborted) {
               logger.warn('manual Claude plan refresh unavailable', { error: String(error) });
+            }
+          });
+          await recoverMissingClaudeProfileMetadata(claudeVersion, {
+            signal: controller.signal,
+          }).catch((error) => {
+            if (!controller.signal.aborted) {
+              logger.warn('post-refresh Claude metadata recovery unavailable', { error: String(error) });
             }
           });
         }
@@ -1687,36 +1777,174 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   );
 
   const openImportMenu = useCallback(() => {
-    let cands: ImportCandidate[] = [];
     try {
-      cands = scanImportDir();
+      const items: ImportInboxItem[] = provider === 'claude'
+        ? groupClaudeImportCandidates(scanImportDir()).map((group) => ({
+            key: group.key,
+            title: group.source,
+            detail: `${group.candidates.length} account${group.candidates.length === 1 ? '' : 's'} · ${group.candidates
+              .slice(0, 2)
+              .map((candidate) => candidate.fields.email)
+              .join(', ')}${group.candidates.length > 2 ? ', …' : ''}`,
+            sourcePaths: group.consumedPaths,
+            format: group.format,
+            claudeGroup: group,
+          }))
+        : scanCodexImportDir().map((file) => ({
+            key: path.resolve(file),
+            title: path.basename(file),
+            detail: file.toLowerCase().endsWith('.codexswitch.json') ? 'Codex switcher export' : 'Official Codex auth.json cache',
+            sourcePaths: [file],
+            format: file.toLowerCase().endsWith('.codexswitch.json') ? 'switch-export' : 'raw-credentials',
+            codexPath: file,
+          }));
+      setImportItems(items);
     } catch (e) {
-      logger.error('scanImportDir failed', e);
+      logger.error('provider import inbox scan failed', e, { provider });
+      setImportItems([]);
     }
-    setImportCands(cands);
     setImportCursor(0);
     setMode('importMenu');
-  }, []);
+  }, [provider]);
 
-  const doImport = useCallback(
-    (cand: ImportCandidate) => {
+  const doImportItem = useCallback(
+    async (item: ImportInboxItem) => {
       try {
-        let p: Profile | undefined;
-        const next = mutateStore((fresh) => {
-          p = addOrUpdateProfile(fresh, cand.fields, cand.label);
-        });
-        if (!p) throw new Error('Claude account was not imported.');
-        storeRef.current = next;
-        setStore(next);
-        setCursor(next.profiles.findIndex((x) => x.id === p!.id));
-        setMode('list');
-        setStatus(`Imported "${p.label}" (${p.email}).`);
+        setMode('importing');
+        if (item.claudeGroup) {
+          const metadata = await recoverClaudeImportMetadata(item.claudeGroup.candidates, claudeVersion);
+          const imported: Profile[] = [];
+          const next = mutateStore((fresh) => {
+            for (const candidate of metadata.candidates) {
+              imported.push(addOrUpdateProfile(fresh, candidate.fields, candidate.label, {
+                credentialSource: candidate.format === 'raw-credentials' ? 'raw-import' : 'portable-import',
+              }));
+            }
+          });
+          const uniqueProfiles = [...new Map(imported.map((profile) => [profile.id, profile])).values()];
+          const disposition = archiveImportedSources('claude', item.sourcePaths, uniqueProfiles);
+          storeRef.current = next;
+          setStore(next);
+          const first = uniqueProfiles[0];
+          if (first) setCursor(next.profiles.findIndex((profile) => profile.id === first.id));
+          showMessage(
+            `Imported ${uniqueProfiles.length} Claude account${uniqueProfiles.length === 1 ? '' : 's'}`,
+            [
+              importDispositionSummary(disposition),
+              providerMetadataSummary(metadata.verifiedCount, metadata.candidates.length),
+              ...(item.format === 'raw-credentials'
+                ? ['Only .credentials.json was required; .claude.json was optional identity metadata.']
+                : []),
+              '⧉ Imported session: another active PC can make token renewal less reliable.',
+              ...disposition.errors.map((error) => `Cleanup warning: ${redactText(error)}`),
+            ],
+            'success',
+            disposition.receiptPath ? path.dirname(disposition.receiptPath) : undefined,
+          );
+          return;
+        }
+
+        if (!item.codexPath) throw new Error('The selected Codex import source disappeared.');
+        let imported = await importCodexFromPath(item.codexPath);
+        if (!imported.length) throw new Error('No reusable Codex account was found in that source.');
+        const importedCount = imported.length;
+        const metadata = await recoverImportedCodexMetadata(imported);
+        const refreshedProfiles = imported
+          .map((profile) => metadata.store.profiles.find((candidate) => candidate.id === profile.id))
+          .filter((profile): profile is CodexProfile => !!profile);
+        if (refreshedProfiles.length) imported = refreshedProfiles;
+        const disposition = archiveImportedSources('codex', item.sourcePaths, imported);
+        const next = reloadCodexStore();
+        if (imported[0]) setCodexCursor(next.profiles.findIndex((profile) => profile.id === imported[0].id));
+        showMessage(
+          `Imported ${imported.length} Codex account${imported.length === 1 ? '' : 's'}`,
+          [
+            importDispositionSummary(disposition),
+            providerMetadataSummary(metadata.verifiedCount, importedCount),
+            '⧉ Imported session: another active PC can make token renewal less reliable.',
+            ...disposition.errors.map((error) => `Cleanup warning: ${redactText(error)}`),
+          ],
+          'success',
+          disposition.receiptPath ? path.dirname(disposition.receiptPath) : undefined,
+        );
       } catch (e) {
         showMessage('Import failed', [redactText(e)], 'error');
       }
     },
-    [showMessage],
+    [claudeVersion, reloadCodexStore, showMessage],
   );
+
+  const doImportPath = useCallback(async (rawTarget: string) => {
+    const target = normalizeImportPath(rawTarget);
+    if (!target) {
+      openImportMenu();
+      return;
+    }
+    setMode('importing');
+    try {
+      if (provider === 'claude') {
+        const discovered = importFromPath(target);
+        const metadata = await recoverClaudeImportMetadata(discovered, claudeVersion);
+        const candidates = metadata.candidates;
+        if (!candidates.length) throw new Error('No reusable Claude credential or switcher export was found at that path.');
+        const imported: Profile[] = [];
+        const next = mutateStore((fresh) => {
+          for (const candidate of candidates) {
+            imported.push(addOrUpdateProfile(fresh, candidate.fields, candidate.label, {
+              credentialSource: candidate.format === 'raw-credentials' ? 'raw-import' : 'portable-import',
+            }));
+          }
+        });
+        const uniqueProfiles = [...new Map(imported.map((profile) => [profile.id, profile])).values()];
+        const sources = [...new Set(candidates.flatMap((candidate) => candidate.consumedPaths))];
+        const disposition = archiveImportedSources('claude', sources, uniqueProfiles);
+        storeRef.current = next;
+        setStore(next);
+        if (uniqueProfiles[0]) setCursor(next.profiles.findIndex((profile) => profile.id === uniqueProfiles[0].id));
+        showMessage(
+          `Imported ${uniqueProfiles.length} Claude account${uniqueProfiles.length === 1 ? '' : 's'}`,
+          [
+            importDispositionSummary(disposition),
+            providerMetadataSummary(metadata.verifiedCount, candidates.length),
+            ...(candidates.some((candidate) => candidate.format === 'raw-credentials')
+              ? ['Only .credentials.json is required; .claude.json is optional identity metadata.']
+              : []),
+            '⧉ Imported session: another active PC can make token renewal less reliable.',
+            ...disposition.errors.map((error) => `Cleanup warning: ${redactText(error)}`),
+          ],
+          'success',
+          disposition.receiptPath ? path.dirname(disposition.receiptPath) : undefined,
+        );
+        return;
+      }
+
+      const sources = discoverCodexImportFiles(target);
+      let imported = await importCodexFromPath(target);
+      if (!imported.length) throw new Error('No reusable Codex auth.json or switcher export was found at that path.');
+      const importedCount = imported.length;
+      const metadata = await recoverImportedCodexMetadata(imported);
+      const refreshedProfiles = imported
+        .map((profile) => metadata.store.profiles.find((candidate) => candidate.id === profile.id))
+        .filter((profile): profile is CodexProfile => !!profile);
+      if (refreshedProfiles.length) imported = refreshedProfiles;
+      const disposition = archiveImportedSources('codex', sources, imported);
+      const next = reloadCodexStore();
+      if (imported[0]) setCodexCursor(next.profiles.findIndex((profile) => profile.id === imported[0].id));
+      showMessage(
+        `Imported ${imported.length} Codex account${imported.length === 1 ? '' : 's'}`,
+        [
+          importDispositionSummary(disposition),
+          providerMetadataSummary(metadata.verifiedCount, importedCount),
+          '⧉ Imported session: another active PC can make token renewal less reliable.',
+          ...disposition.errors.map((error) => `Cleanup warning: ${redactText(error)}`),
+        ],
+        'success',
+        disposition.receiptPath ? path.dirname(disposition.receiptPath) : undefined,
+      );
+    } catch (error) {
+      showMessage('Import failed', [redactText(error)], 'error');
+    }
+  }, [claudeVersion, openImportMenu, provider, reloadCodexStore, showMessage]);
 
   const exportSelected = useCallback(async () => {
     if (!selected) return;
@@ -1734,6 +1962,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           'Copy it to another PC and press "i" (Import) there.',
         ],
         'success',
+        exportDir(),
       );
     } catch (e) {
       showMessage('Export failed', [redactText(e)], 'error');
@@ -1762,6 +1991,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           'Copy it to another PC and press "i" (Import) to restore those portable credentials.',
         ],
         'success',
+        exportDir(),
       );
     } catch (e) {
       showMessage('Export failed', [redactText(e)], 'error');
@@ -1797,21 +2027,8 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         return;
       }
       if (input === '?') {
-        showMessage(`All commands — ${providerName}`, [
-          'Every shortcut remains directly available; this panel only keeps the footer uncluttered.',
-          '↑/↓ or j/k: move · PgUp/PgDn: one page · g/G: first/last · /: search',
-          'Enter: switch to the selected account · Left/Right: change provider tab',
-          'u: refresh quotas · b: Best Now (fresh, reset-aware sustained-work choice)',
-          'l: most raw quota headroom (simpler than Best Now)',
-          'a: add or re-authenticate · i: guided import/path · I: import every account from an export-all bundle/folder',
-          'e/E: export selected/all · r: rename · d: archive credentials · z: restore latest archive',
-          provider === 'claude'
-            ? 'A: capture the optional Claude Desktop session · active Claude tokens remain owned by official Claude'
-            : 'Codex switching validates auth.json and may close confirmed Codex process trees after warning',
-          'S: shortcuts and scheduled maintenance · q: quit · Esc: cancel/back',
-          `Diagnostics log: ${logFile()}`,
-          'Copyright © 2026 LightZirconite · AGPL-3.0-or-later · no warranty · source and license in this repository',
-        ], 'info');
+        setHelpPage(0);
+        setMode('help');
         return;
       }
       if (input === '/') {
@@ -1834,12 +2051,10 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           setCodexCursor((c) => moveCursor(codexProfiles.length, c, 'last', listCapacity));
         } else if (key.return && codexSelected) beginCodexSwitch(codexSelected);
         else if (input === 'a') void startCodexAdd();
-        else if (input === 'i') {
+        else if (input === 'i') openImportMenu();
+        else if (input === 'I') {
           setBuffer('');
-          setMode('codexImportPath');
-        } else if (input === 'I') {
-          setBuffer('');
-          setMode('codexImportPath');
+          setMode('importPath');
         } else if (input === 'e') exportSelectedCodex();
         else if (input === 'E') exportAllCodex();
         else if (input === 'r' && codexSelected) {
@@ -1914,6 +2129,25 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       } else if (input === 'u') void refreshAllUsage();
       else if (input === 'S') openSetup();
       else if (input === 'q' || key.escape) exit();
+      return;
+    }
+
+    if (mode === 'help') {
+      const pageCount = commandHelpPages(provider).length;
+      const directPage = /^[1-9]$/.test(input) ? Number(input) - 1 : -1;
+      if (directPage >= 0 && directPage < pageCount) {
+        setHelpPage(directPage);
+      } else if (input === 'g') {
+        setHelpPage(0);
+      } else if (input === 'G') {
+        setHelpPage(pageCount - 1);
+      } else if (key.leftArrow || key.upArrow || key.pageUp || input === 'k') {
+        setHelpPage((page) => (page - 1 + pageCount) % pageCount);
+      } else if (key.rightArrow || key.downArrow || key.pageDown || input === 'j') {
+        setHelpPage((page) => (page + 1) % pageCount);
+      } else if (key.return || key.escape || input === '?' || input === 'q') {
+        setMode('list');
+      }
       return;
     }
 
@@ -2014,27 +2248,6 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       return;
     }
 
-    if (mode === 'codexImportPath') {
-      if (key.return) {
-        const target = buffer.trim();
-        setMode('codexImporting');
-        void (async () => {
-          try {
-            const imported = await importCodexFromPath(target);
-            reloadCodexStore();
-            setStatus(`Imported ${imported.length} Codex account(s).`);
-          } catch (e) {
-            setStatus(`Codex import failed: ${redactText(e)}`);
-          } finally {
-            setMode('list');
-          }
-        })();
-      } else if (key.escape) setMode('list');
-      else if (key.backspace || key.delete) setBuffer((value) => value.slice(0, -1));
-      else if (input && !key.ctrl && !key.meta) setBuffer((value) => value + input);
-      return;
-    }
-
     if (mode === 'confirmSwitch') {
       if (input === 'y' || key.return) {
         if (pendingSwitch) void doSwitch(pendingSwitch.profile);
@@ -2092,13 +2305,13 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     }
 
     if (mode === 'importMenu') {
-      const total = importCands.length;
+      const total = importItems.length;
       if (key.upArrow) setImportCursor((c) => (c > 0 ? c - 1 : Math.max(0, total - 1)));
       else if (key.downArrow) setImportCursor((c) => (c < total - 1 ? c + 1 : 0));
       else if (key.return) {
-        if (importCands[importCursor]) doImport(importCands[importCursor]);
+        if (importItems[importCursor]) void doImportItem(importItems[importCursor]);
       } else if (input === 'o') {
-        openFolder(importDir());
+        openFolder(providerImportDir(provider));
       } else if (input === 'p') {
         setBuffer('');
         setMode('importPath');
@@ -2112,28 +2325,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
 
     if (mode === 'importPath') {
       if (key.return) {
-        const target = buffer.trim().replace(/^"(.*)"$/, '$1');
-        if (target) {
-          const cands = importFromPath(target);
-          if (cands.length) {
-            try {
-              const next = mutateStore((fresh) => {
-                cands.forEach((c) => addOrUpdateProfile(fresh, c.fields, c.label));
-              });
-              storeRef.current = next;
-              setStore(next);
-              setMode('list');
-              setStatus(`Imported ${cands.length} account(s) from path.`);
-            } catch (e) {
-              showMessage('Import failed', [redactText(e)], 'error');
-            }
-          } else {
-            setStatus('Nothing importable at that path.');
-            setMode('importMenu');
-          }
-        } else {
-          setMode('importMenu');
-        }
+        void doImportPath(buffer);
       } else if (key.escape) {
         setMode('importMenu');
       } else if (key.backspace || key.delete) {
@@ -2212,7 +2404,9 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     }
 
     if (mode === 'message') {
-      if (key.return || key.escape || input === 'q') {
+      if (input === 'o' && message?.openFolder) {
+        openFolder(message.openFolder);
+      } else if (key.return || key.escape || input === 'q') {
         setMessage(null);
         setMode('list');
       }
@@ -2271,13 +2465,29 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   };
   const providerColor = provider === 'claude' ? CLAUDE_ORANGE : CODEX_BLUE;
   const providerName = provider === 'claude' ? 'Claude' : 'Codex';
+  const helpPages = commandHelpPages(provider);
+  const visibleHelpPage = helpPages[Math.max(0, Math.min(helpPage, helpPages.length - 1))];
+  const visibleHelpEntries = visibleHelpPage?.sections.flatMap((section) => section.entries) ?? [];
+  const longestHelpKey = visibleHelpEntries.reduce((length, entry) => Math.max(length, entry.key.length), 0);
+  const compactHelp = rows < 24;
+  const stackedHelpRows = W < 76;
+  const helpKeyWidth = stackedHelpRows
+    ? Math.max(12, W - 4)
+    : Math.max(14, Math.min(36, longestHelpKey + 2, Math.floor(W * 0.42)));
+  const importViewport = viewportFor(importItems.length, importCursor, Math.max(2, Math.min(8, rows - 16)));
 
   return (
     <Box flexDirection="column">
       <Box width={W} justifyContent="center">
-        <Text dimColor={provider !== 'claude'} color={provider === 'claude' ? CLAUDE_ORANGE : undefined}>← Claude</Text>
-        <Text dimColor>  │  </Text>
-        <Text dimColor={provider !== 'codex'} color={provider === 'codex' ? CODEX_BLUE : undefined}>Codex →</Text>
+        {mode === 'help' ? (
+          <Text dimColor>← previous help page  ·  next help page →</Text>
+        ) : (
+          <>
+            <Text dimColor={provider !== 'claude'} color={provider === 'claude' ? CLAUDE_ORANGE : undefined}>← Claude</Text>
+            <Text dimColor>  │  </Text>
+            <Text dimColor={provider !== 'codex'} color={provider === 'codex' ? CODEX_BLUE : undefined}>Codex →</Text>
+          </>
+        )}
       </Box>
       {mode === 'list' ? (provider === 'claude' ? (
         <Box width={W} borderStyle="round" borderColor={CLAUDE_ORANGE} paddingX={1} flexDirection="column">
@@ -2288,7 +2498,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           {newVersion ? <Text color="yellow">Update available: v{newVersion}</Text> : null}
           {compactHero ? (
             <Box marginTop={1} flexDirection="column">
-              <Text wrap="truncate-end"><Text dimColor>active  </Text>{active ? <><Text color="green">{activeGlyph} </Text><Text bold>{accountListLabel(active.label, active.email)}</Text>{' '}<Text color={planColor(active.subscriptionType)}>{formatPlanLabel(active.subscriptionType)}</Text></> : <Text dimColor>none</Text>}</Text>
+              <Text wrap="truncate-end"><Text dimColor>active  </Text>{active ? <><Text color="green">{activeGlyph} </Text><Text bold>{accountListLabel(active.label, active.email, !!active.importedSession)}</Text>{' '}<Text color={planColor(active.subscriptionType)}>{formatPlanLabel(active.subscriptionType)}</Text></> : <Text dimColor>none</Text>}</Text>
               {selected ? <Text><Text dimColor>quota   </Text><Text color={utilColor(selected.usage?.five_hour?.utilization ?? null)}>5h {fmtPct(selected.usage?.five_hour?.utilization)}</Text><Text dimColor> · </Text><Text color={utilColor(selected.usage?.seven_day?.utilization ?? null)}>7d {fmtPct(selected.usage?.seven_day?.utilization)}</Text>{selected.usage?.status === 'stale' ? <Text dimColor> · cached</Text> : null}</Text> : null}
               {claudeBest.target ? <Text><Text dimColor>best    </Text><Text color={claudeBest.confidence === 'high' ? 'green' : 'yellow'}>{claudeBest.target.label}</Text><Text dimColor> · {bestNowDetail(claudeBest)}</Text></Text> : null}
             </Box>
@@ -2298,7 +2508,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                 <ClaudePulseMark frame={motionFrame} />
                 {active ? (
                   <Box marginTop={1} flexDirection="column" alignItems="center" width={leftW - 2}>
-                    <Text wrap="truncate-end"><Text color="green">{activeGlyph} </Text><Text bold>{active.label}</Text></Text>
+                    <Text wrap="truncate-end"><Text color="green">{activeGlyph} </Text><Text bold>{accountListLabel(active.label, active.email, !!active.importedSession)}</Text></Text>
                     <Text color={planColor(active.subscriptionType)}>CLAUDE {formatPlanLabel(active.subscriptionType)}</Text>
                   </Box>
                 ) : <Text dimColor>No active account</Text>}
@@ -2307,8 +2517,9 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                 <Text bold color="white">SELECTED ACCOUNT</Text>
                 {selected ? (
                   <Box flexDirection="column">
-                    <Text wrap="truncate-end"><Text color={selected.id === store.activeProfileId ? 'green' : 'cyanBright'}>{selected.id === store.activeProfileId ? activeGlyph : '○'} </Text><Text bold>{accountListLabel(selected.label, selected.email)}</Text>{'  '}<Text color={planColor(selected.subscriptionType)}>{formatPlanLabel(selected.subscriptionType)}</Text></Text>
-                    <Text dimColor>{accountSecondaryIdentity(selected.label, selected.email) ? `${accountSecondaryIdentity(selected.label, selected.email)} · ` : ''}{selected.id === store.activeProfileId ? 'active' : 'ready to switch'}{selected.planObservedAt ? ` · plan checked ${relMs(selected.planObservedAt)} via ${selected.planSource === 'claude-auth-status' ? 'official CLI' : 'saved OAuth'}` : ''}</Text>
+                    <Text wrap="truncate-end"><Text color={selected.id === store.activeProfileId ? 'green' : 'cyanBright'}>{selected.id === store.activeProfileId ? activeGlyph : '○'} </Text><Text bold>{accountListLabel(selected.label, selected.email, !!selected.importedSession)}</Text>{'  '}<Text color={planColor(selected.subscriptionType)}>{formatPlanLabel(selected.subscriptionType)}</Text></Text>
+                    <Text dimColor>{accountSecondaryIdentity(selected.label, selected.email) ? `${accountSecondaryIdentity(selected.label, selected.email)} · ` : ''}{selected.id === store.activeProfileId ? 'active' : 'ready to switch'}{selected.planObservedAt ? ` · plan checked ${relMs(selected.planObservedAt)} via ${selected.planSource === 'claude-auth-status' ? 'official CLI' : selected.planSource === 'claude-profile' ? 'provider profile' : 'saved OAuth'}` : ''}</Text>
+                    {selected.importedSession ? <Text dimColor>⧉ imported session · another active PC can make token renewal less reliable</Text> : null}
                     {hasCliAuth(selected) && selected.usage && (selected.usage.status === 'ok' || selected.usage.status === 'stale') ? (
                       <>
                         <HeroQuotaLine label="5h" usedPercent={selected.usage.five_hour?.utilization} reset={quotaResetLabel(selected.usage.five_hour?.utilization, selected.usage.five_hour?.resets_at)} />
@@ -2333,7 +2544,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           {newVersion ? <Text color="yellow">Update available: v{newVersion}</Text> : null}
           {compactHero ? (
             <Box marginTop={1} flexDirection="column">
-              <Text wrap="truncate-end"><Text dimColor>active  </Text>{codexActive ? <><Text color="green">{activeGlyph} </Text><Text bold>{accountListLabel(codexActive.label, codexActive.email)}</Text>{' '}<Text color={planColor(codexActive.planType)}>{formatPlanLabel(codexActive.planType)}</Text></> : <Text dimColor>none</Text>}</Text>
+              <Text wrap="truncate-end"><Text dimColor>active  </Text>{codexActive ? <><Text color="green">{activeGlyph} </Text><Text bold>{accountListLabel(codexActive.label, codexActive.email, !!codexActive.importedSession)}</Text>{' '}<Text color={planColor(codexActive.planType)}>{formatPlanLabel(codexActive.planType)}</Text></> : <Text dimColor>none</Text>}</Text>
               {codexSelected ? <Text><Text dimColor>quota   </Text>{codexQuotaColumns.length ? codexQuotaColumns.map((column, index) => {
                 const window = codexSelectedQuota?.[column.key] ?? null;
                 const label = window ? formatQuotaWindowLabel(window.windowDurationMins).toLowerCase() : column.compactLabel.toLowerCase();
@@ -2347,7 +2558,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                 <CodexBotMark frame={motionFrame} />
                 {codexActive ? (
                   <Box marginTop={1} flexDirection="column" alignItems="center" width={leftW - 2}>
-                    <Text wrap="truncate-end"><Text color="green">{activeGlyph} </Text><Text bold>{codexActive.label}</Text></Text>
+                    <Text wrap="truncate-end"><Text color="green">{activeGlyph} </Text><Text bold>{accountListLabel(codexActive.label, codexActive.email, !!codexActive.importedSession)}</Text></Text>
                     <Text color={planColor(codexActive.planType)}>CODEX {formatPlanLabel(codexActive.planType)}</Text>
                   </Box>
                 ) : <Text dimColor>No active account</Text>}
@@ -2356,8 +2567,9 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                 <Text bold color="white">SELECTED ACCOUNT</Text>
                 {codexSelected ? (
                   <Box flexDirection="column">
-                    <Text wrap="truncate-end"><Text color={codexSelected.id === codexStore.activeProfileId ? 'green' : 'cyanBright'}>{codexSelected.id === codexStore.activeProfileId ? activeGlyph : '○'} </Text><Text bold>{accountListLabel(codexSelected.label, codexSelected.email)}</Text>{'  '}<Text color={planColor(codexSelected.planType)}>{formatPlanLabel(codexSelected.planType)}</Text></Text>
+                    <Text wrap="truncate-end"><Text color={codexSelected.id === codexStore.activeProfileId ? 'green' : 'cyanBright'}>{codexSelected.id === codexStore.activeProfileId ? activeGlyph : '○'} </Text><Text bold>{accountListLabel(codexSelected.label, codexSelected.email, !!codexSelected.importedSession)}</Text>{'  '}<Text color={planColor(codexSelected.planType)}>{formatPlanLabel(codexSelected.planType)}</Text></Text>
                     <Text dimColor>{accountSecondaryIdentity(codexSelected.label, codexSelected.email) ? `${accountSecondaryIdentity(codexSelected.label, codexSelected.email)} · ` : ''}{codexSelected.id === codexStore.activeProfileId ? 'active' : 'ready to switch'}{codexSelected.planObservedAt ? ` · plan checked ${relMs(codexSelected.planObservedAt)} via ${codexSelected.planSource === 'codex-rate-limits' ? 'quota entitlement' : codexSelected.planSource === 'codex-account' ? 'account service' : 'saved OAuth'}` : ''}</Text>
+                    {codexSelected.importedSession ? <Text dimColor>⧉ imported session · another active PC can make token renewal less reliable</Text> : null}
                     {codexQuotaColumns.some((column) => codexSelectedQuota?.[column.key]) ? (
                       <>
                         {codexQuotaColumns.map((column) => {
@@ -2387,17 +2599,47 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         </Box>
       )}
 
-      {mode === 'message' && message ? (
+      {mode === 'help' && visibleHelpPage ? (
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor={providerColor} paddingX={1}>
+          <Box justifyContent="space-between">
+            <Text bold color={providerColor}>COMPLETE HELP · {providerName.toUpperCase()}</Text>
+            <Text dimColor>{helpPage + 1}/{helpPages.length} · {visibleHelpPage.title}</Text>
+          </Box>
+          {!compactHelp ? <Text dimColor wrap="wrap">Every public TUI and CLI action is listed. Contextual keys say where they work.</Text> : null}
+          <Box flexWrap="wrap">
+            <Text dimColor>Pages  </Text>
+            {helpPages.map((page, index) => (
+              <Text key={page.shortTitle} color={index === helpPage ? providerColor : undefined} dimColor={index !== helpPage}>
+                {index ? ' · ' : ''}{index + 1} {page.shortTitle}
+              </Text>
+            ))}
+          </Box>
+          <Box marginTop={compactHelp ? 0 : 1} flexDirection="column">
+            {visibleHelpPage.sections.map((section) => (
+              <Box key={section.title} flexDirection="column" marginBottom={compactHelp ? 0 : 1}>
+                <Text bold color={providerColor}>{section.title}</Text>
+                {section.entries.map((entry) => (
+                  <Box key={entry.id} flexDirection={stackedHelpRows ? 'column' : 'row'} marginBottom={stackedHelpRows ? 1 : 0}>
+                    <Box width={helpKeyWidth}><Text bold color="white">{entry.key}</Text></Box>
+                    <Text wrap="wrap">{entry.description}</Text>
+                  </Box>
+                ))}
+              </Box>
+            ))}
+          </Box>
+          <Text dimColor wrap="wrap">Arrows/PgUp/PgDn/j/k pages · 1-9 jump · g/G ends · Enter/Esc/?/q back</Text>
+        </Box>
+      ) : mode === 'message' && message ? (
         <Box width={W} flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
           <Text bold color={tone}>
             {message.tone === 'success' ? '✓ ' : message.tone === 'error' ? '✗ ' : ''}
             {message.title}
           </Text>
           {message.lines.map((l, i) => (
-            <Text key={i}>{l}</Text>
+            <Text key={i} wrap="wrap">{l}</Text>
           ))}
           <Box marginTop={1}>
-            <Text dimColor>[Enter] back</Text>
+            <Text dimColor>[Enter] back{message.openFolder ? ' · [o] open folder' : ''}</Text>
           </Box>
         </Box>
       ) : mode === 'setup' ? (
@@ -2537,73 +2779,54 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           </Box>
         </Box>
       ) : mode === 'importMenu' ? (
-        <Box width={W} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
-          <Text bold color="cyanBright">
-            Import one or many Claude accounts
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor={providerColor} paddingX={1}>
+          <Box justifyContent="space-between">
+            <Text bold color={providerColor}>IMPORT · {providerName.toUpperCase()}</Text>
+            <Text dimColor>{importItems.length} source{importItems.length === 1 ? '' : 's'} ready</Text>
+          </Box>
+          <Text dimColor wrap="wrap">
+            {provider === 'claude'
+              ? '.credentials.json is enough by itself · .claude.json is optional identity metadata · *.ccswitch.json is the preferred portable format'
+              : 'auth.json requires Codex file-backed credential storage · *.codexswitch.json is the preferred portable format'}
           </Text>
-          <Text dimColor>An export-all .ccswitch.json imports every account it contains; press p to type its path.</Text>
+          <Text dimColor wrap="wrap">⧉ marks an imported session; another active PC can make token renewal less reliable.</Text>
           <Box marginTop={1} flexDirection="column">
-            <Text>
-              <Text color="cyan">1.</Text> <Text bold>On the OTHER computer</Text>, copy these 2 files:
-            </Text>
-            <Text>
-              {'     '}
-              <Text color="yellow">%USERPROFILE%\.claude\.credentials.json</Text>
-            </Text>
-            <Text>
-              {'     '}
-              <Text color="yellow">%USERPROFILE%\.claude.json</Text>
-            </Text>
-            <Text dimColor>{'     '}(Linux: ~/.claude/.credentials.json and ~/.claude.json)</Text>
-            <Text dimColor>{'     '}(macOS keeps tokens in Keychain — run this tool there and press "e" to export a saved profile)</Text>
+            <Text><Text color={providerColor}>INBOX</Text> · copy/drop files here, then press r:</Text>
+            <Text color="green" wrap="wrap">{providerImportDir(provider)}</Text>
+            <Text dimColor wrap="wrap">After every represented account commits, inbox files move to processed evidence with a receipt. External paths are never moved.</Text>
           </Box>
           <Box marginTop={1} flexDirection="column">
-            <Text>
-              <Text color="cyan">2.</Text> Put them in this folder on <Text bold>THIS</Text> PC:
-            </Text>
-            <Text color="green">{'     '}{importDir()}</Text>
-          </Box>
-          <Box marginTop={1} flexDirection="column">
-            <Text>
-              <Text color="cyan">3.</Text> Detected accounts to import:
-            </Text>
-            {importCands.length === 0 ? (
-              <Text dimColor>{'     '}(none yet — press "o" to open the folder, then "r" to rescan)</Text>
+            <Text bold>DETECTED</Text>
+            {importItems.length === 0 ? (
+              <Text dimColor>(none · press o to open the inbox, add a file, then press r)</Text>
             ) : (
-              importCands.map((c, i) => (
-                <Text key={i} color={i === importCursor ? 'greenBright' : undefined}>
-                  {i === importCursor ? '   ❯ ' : '     '}
-                  <Text bold={i === importCursor}>{c.fields.email}</Text> <Text dimColor>— {c.source}</Text>
-                </Text>
-              ))
+              importItems.slice(importViewport.start, importViewport.end).map((item, offset) => {
+                const index = importViewport.start + offset;
+                return (
+                  <Text key={item.key} wrap="truncate-end" color={index === importCursor ? 'white' : undefined} backgroundColor={index === importCursor ? '#1A1A1D' : undefined}>
+                    <Text bold color={providerColor}>{index === importCursor ? '❯ ' : '  '}</Text>
+                    <Text bold={index === importCursor}>{item.title}</Text>
+                    <Text dimColor> · {item.detail}</Text>
+                  </Text>
+                );
+              })
             )}
+            {importItems.length > importViewport.end ? <Text dimColor>showing {importViewport.start + 1}–{importViewport.end} of {importItems.length}</Text> : null}
           </Box>
-          <Box marginTop={1}>
-            <Text dimColor>↑/↓ select · ⏎ import · o open folder · r rescan · p type path · Esc back</Text>
-          </Box>
+          <Box marginTop={1}><Text dimColor>↑/↓ select · Enter import whole source · o open inbox · r rescan · p paste/drag path · Esc back</Text></Box>
         </Box>
-      ) : mode === 'codexImporting' ? (
-        <Box width={W} flexDirection="column" borderStyle="round" borderColor={CODEX_BLUE} paddingX={1}>
-          <Text bold color={CODEX_BLUE}>Importing Codex account…</Text>
-          <Text dimColor>Validating credentials and waiting for any in-flight account rotation to finish safely.</Text>
-        </Box>
-      ) : mode === 'codexImportPath' ? (
-        <Box width={W} flexDirection="column" borderStyle="round" borderColor={CODEX_BLUE} paddingX={1}>
-          <Text bold color={CODEX_BLUE}>Import one or many Codex accounts</Text>
-          <Text>Path: <Text color="green">{buffer}</Text><Text>▎</Text></Text>
-          <Box marginTop={1}><Text dimColor>auth.json, export-all bundle, or folder · Enter imports every valid account · Esc cancels</Text></Box>
+      ) : mode === 'importing' ? (
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor={providerColor} paddingX={1}>
+          <Spinner label={`Importing ${providerName} credentials safely…`} color={providerColor} />
+          <Text dimColor>Validating the complete source before commit; cleanup runs only after success.</Text>
         </Box>
       ) : mode === 'importPath' ? (
-        <Box width={W} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
-          <Text bold color="cyan">
-            Import — type a file or folder path
-          </Text>
-          <Text>
-            Path: <Text color="green">{buffer}</Text>
-            <Text>▎</Text>
-          </Text>
-          <Box marginTop={1}>
-            <Text dimColor>Enter to import · Esc to go back</Text>
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor={providerColor} paddingX={1}>
+          <Text bold color={providerColor}>IMPORT PATH · {providerName.toUpperCase()}</Text>
+          <Text wrap="wrap">Path: <Text color="green">{buffer}</Text><Text>▎</Text></Text>
+          <Box marginTop={1} flexDirection="column">
+            <Text dimColor>Type, paste, or drag one file/folder into this terminal.</Text>
+            <Text dimColor>Enter imports every valid account · external source stays untouched · Esc returns</Text>
           </Box>
         </Box>
       ) : mode === 'search' ? (
@@ -2640,7 +2863,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                     <Text color={profile.needsReauth ? 'red' : isActive ? 'green' : 'gray'}>{profile.needsReauth ? '⚠' : isActive ? activeGlyph : '○'}{' '}</Text>
                     {compactTable ? (
                       <>
-                        <Text bold={isCursor} color={profile.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(profile.label, profile.email), codexTableLayout.accountWidth)}</Text>
+                        <Text bold={isCursor} color={profile.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(profile.label, profile.email, !!profile.importedSession), codexTableLayout.accountWidth)}</Text>
                         <ColumnRule />
                         <Text color={planColor(profile.planType)}>{pad(formatPlanLabel(profile.planType), codexTableLayout.planWidth)}</Text>
                         {!ultraCompactTable ? codexQuotaColumns.map((column) => {
@@ -2653,7 +2876,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                       </>
                     ) : (
                       <>
-                        <Text bold={isCursor} color={profile.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(profile.label, profile.email), codexTableLayout.accountWidth)}</Text>
+                        <Text bold={isCursor} color={profile.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(profile.label, profile.email, !!profile.importedSession), codexTableLayout.accountWidth)}</Text>
                         <ColumnRule />
                         <Text color={planColor(profile.planType)}>{pad(formatPlanLabel(profile.planType), codexTableLayout.planWidth)}</Text>
                         {codexQuotaColumns.map((column) => {
@@ -2733,7 +2956,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                     </Text>
                     {compactTable ? (
                       <>
-                        <Text bold={isCursor} color={p.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(p.label, p.email), claudeTableLayout.accountWidth)}</Text>
+                        <Text bold={isCursor} color={p.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(p.label, p.email, !!p.importedSession), claudeTableLayout.accountWidth)}</Text>
                         <ColumnRule />
                         <Text color={planColor(p.subscriptionType)}>{pad(formatPlanLabel(p.subscriptionType), claudeTableLayout.planWidth)}</Text>
                         {!ultraCompactTable ? <>
@@ -2745,7 +2968,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                       </>
                     ) : (
                       <>
-                        <Text bold={isCursor} color={p.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(p.label, p.email), claudeTableLayout.accountWidth)}</Text>
+                        <Text bold={isCursor} color={p.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(p.label, p.email, !!p.importedSession), claudeTableLayout.accountWidth)}</Text>
                         <ColumnRule />
                         <Text color={planColor(p.subscriptionType)}>{pad(formatPlanLabel(p.subscriptionType), claudeTableLayout.planWidth)}</Text>
                         <ColumnRule />
@@ -2843,8 +3066,11 @@ Usage:
   switch.cmd                 Launch the interactive account switcher (TUI)
   switch.cmd login [provider] Add an account via the official Claude/Codex login
   switch.cmd import [--provider claude|codex] <path>
+                             Import one file; external sources remain untouched
   switch.cmd import-all [--provider claude|codex] <bundle-or-folder>
+                             Validate and import every account represented by the source
   switch.cmd export-all [claude|codex]
+                             Write a new timestamped provider-tagged bundle
   switch.cmd doctor [all|claude|codex]  Diagnose accounts without printing secrets
   switch.cmd --dry-run       Show exactly which keys a switch would change (no writes)
   switch.cmd restore <claude|codex> [backup-path]
@@ -2852,8 +3078,14 @@ Usage:
   switch.cmd install         Configure Codex auth + shortcuts + auto keep-alive
   switch.cmd uninstall       Remove shortcuts + the scheduled keep-alive job
   switch.cmd keep-alive          Refresh due tokens now and report accounts needing renewal
-  switch.cmd keep-alive install  Schedule keep-alive only (no shortcuts)
+  switch.cmd keep-alive install|uninstall
+                             Add/remove only the keep-alive schedule (no shortcuts)
   switch.cmd --help          This help
+
+Interactive transfer:
+  i                          Open the current provider's managed import inbox
+  I                          Paste or drag an existing file/folder path
+  Successful inbox sources move to import/processed with a receipt.
 
 Data & logs live in ~/.claude-switch/
 
@@ -2960,6 +3192,7 @@ async function printClaudeDoctor(): Promise<void> {
       p.needsReauth ? 'needs re-add' : null,
       refreshable ? 'cli' : null,
       p.desktopSnapshotDir ? 'desktop' : null,
+      p.importedSession ? `imported ${p.importedSession.format}` : null,
     ].filter(Boolean).join(', ') || 'saved';
     console.log(`  - ${p.label} <${p.email}> [${flags}]`);
     console.log(`    access: ${oauth?.accessToken ? relMs(asTime(oauth.expiresAt)) : 'missing'}; login: ${relMs(asTime(oauth?.refreshTokenExpiresAt))}; usage: ${usageAge(p)}`);
@@ -3027,7 +3260,11 @@ async function printCodexDoctor(): Promise<void> {
       const complete = key === 'primary' ? bucket.primaryComplete : bucket.secondaryComplete;
       return complete ? [] : [`${key}=?`];
     });
-    const flags = [profile.id === store.activeProfileId ? 'active' : null, profile.needsReauth ? 'needs re-add' : null]
+    const flags = [
+      profile.id === store.activeProfileId ? 'active' : null,
+      profile.needsReauth ? 'needs re-add' : null,
+      profile.importedSession ? `imported ${profile.importedSession.format}` : null,
+    ]
       .filter(Boolean).join(', ') || 'saved';
     const planLabel = formatPlanLabel(profile.planType);
     const providerDetail = profile.planType && planLabel.toLowerCase() !== profile.planType.toLowerCase()
@@ -3101,6 +3338,9 @@ async function runKeepAliveOnce(): Promise<void> {
     if (p.claudeAiOauth.refreshToken !== before) refreshed++;
     if (p.needsReauth) dead++;
   }
+  await recoverMissingClaudeProfileMetadata(detectClaudeVersion()).catch((error) => {
+    logger.warn('headless Claude imported-profile metadata remains unavailable', { error: String(error) });
+  });
   store = loadStore();
   logger.info('keep-alive run complete', { refreshed, dead, total: store.profiles.length });
   console.log(`keep-alive: refreshed ${refreshed} token(s)${dead ? `, ${dead} account(s) need re-add` : ''}.`);
@@ -3294,31 +3534,62 @@ async function main(): Promise<void> {
 
   if (args[0] === 'import' || args[0] === 'import-all') {
     const providerArg = args[1] === '--provider' ? args[2] : args[1] === 'codex' || args[1] === 'claude' ? args[1] : 'claude';
-    const target = args[1] === '--provider' ? args[3] : args[1] === 'codex' || args[1] === 'claude' ? args[2] : args[1];
+    const rawTarget = args[1] === '--provider' ? args[3] : args[1] === 'codex' || args[1] === 'claude' ? args[2] : args[1];
+    const target = rawTarget ? normalizeImportPath(rawTarget) : '';
     if (!target) {
       console.log('Import path is required.');
       return;
     }
+    if (providerArg !== 'claude' && providerArg !== 'codex') {
+      throw new Error(`Unsupported import provider "${providerArg}". Use claude or codex.`);
+    }
     if (providerArg === 'codex') {
-      const imported = await importCodexFromPath(target);
+      const sources = discoverCodexImportFiles(target);
+      let imported = await importCodexFromPath(target);
+      if (!imported.length) {
+        console.log(`Nothing importable at: ${target}`);
+        return;
+      }
+      const importedCount = imported.length;
+      const metadata = await recoverImportedCodexMetadata(imported);
+      const refreshedProfiles = imported
+        .map((profile) => metadata.store.profiles.find((candidate) => candidate.id === profile.id))
+        .filter((profile): profile is CodexProfile => !!profile);
+      if (refreshedProfiles.length) imported = refreshedProfiles;
       for (const profile of imported) console.log(`Imported Codex "${profile.label}" (${profile.email})`);
+      console.log(providerMetadataSummary(metadata.verifiedCount, importedCount));
+      console.log('⧉ Imported session: another active PC can make token renewal less reliable.');
+      const disposition = archiveImportedSources('codex', sources, imported);
+      console.log(importDispositionSummary(disposition));
+      for (const error of disposition.errors) console.log(`Cleanup warning: ${redactText(error)}`);
       return;
     }
-    const cands = importFromPath(target);
-    if (!cands.length) {
+    const discovered = importFromPath(target);
+    if (!discovered.length) {
       console.log(`Nothing importable at: ${target}`);
       return;
     }
+    const metadata = await recoverClaudeImportMetadata(discovered, detectClaudeVersion());
+    const cands = metadata.candidates;
+    const imported: Profile[] = [];
     mutateStore((store) => {
       for (const c of cands) {
-        try {
-          const p = addOrUpdateProfile(store, c.fields, c.label);
-          console.log(`Imported "${p.label}" (${p.email})`);
-        } catch (e) {
-          console.log(`Skipped invalid account from ${c.source}: ${(e as Error).message}`);
-        }
+        imported.push(addOrUpdateProfile(store, c.fields, c.label, {
+          credentialSource: c.format === 'raw-credentials' ? 'raw-import' : 'portable-import',
+        }));
       }
     });
+    const uniqueProfiles = [...new Map(imported.map((profile) => [profile.id, profile])).values()];
+    for (const profile of uniqueProfiles) console.log(`Imported "${profile.label}" (${profile.email})`);
+    console.log(providerMetadataSummary(metadata.verifiedCount, cands.length));
+    console.log('⧉ Imported session: another active PC can make token renewal less reliable.');
+    const disposition = archiveImportedSources(
+      'claude',
+      [...new Set(cands.flatMap((candidate) => candidate.consumedPaths))],
+      uniqueProfiles,
+    );
+    console.log(importDispositionSummary(disposition));
+    for (const error of disposition.errors) console.log(`Cleanup warning: ${redactText(error)}`);
     return;
   }
 

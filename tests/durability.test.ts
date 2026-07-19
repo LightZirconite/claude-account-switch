@@ -1207,6 +1207,83 @@ test('two stale-lock waiters fail closed without deleting or reacquiring the obs
   assert.equal(fs.existsSync(lockDir), true);
 });
 
+test('opt-in async lock recovery reclaims a valid dead owner immediately after restart', async () => {
+  resetRoot();
+  const lockName = 'async-restart-recovery';
+  const lockDir = path.join(dataDir(), 'locks', `${lockName}.lock`);
+  writeJson(path.join(lockDir, 'owner.json'), {
+    pid: 2_147_483_647,
+    ownerId: 'dead-owner-before-restart',
+    at: Date.now(),
+    name: lockName,
+  });
+  let entered = false;
+
+  await withFileLock(lockName, async () => {
+    entered = true;
+  }, { staleMs: 60_000, timeoutMs: 1_000, recoverAbandoned: true });
+
+  assert.equal(entered, true);
+  assert.equal(fs.existsSync(lockDir), false);
+  assert.equal(fs.existsSync(path.join(dataDir(), 'locks', `${lockName}.abandoned-takeover.lock`)), false);
+});
+
+test('concurrent opt-in async recoverers serialize without deleting the replacement lock', async () => {
+  resetRoot();
+  const lockName = 'async-restart-recovery-race';
+  const lockDir = path.join(dataDir(), 'locks', `${lockName}.lock`);
+  writeJson(path.join(lockDir, 'owner.json'), {
+    pid: 2_147_483_647,
+    ownerId: 'dead-owner-generation',
+    at: Date.now() - 60_000,
+    name: lockName,
+  });
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(lockDir, old, old);
+  let active = 0;
+  let maxActive = 0;
+  let entries = 0;
+  const enter = () => withFileLock(lockName, async () => {
+    entries++;
+    active++;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    active--;
+  }, { staleMs: 1, timeoutMs: 1_000, recoverAbandoned: true });
+
+  await Promise.all([enter(), enter()]);
+
+  assert.equal(entries, 2);
+  assert.equal(maxActive, 1);
+  assert.equal(fs.existsSync(lockDir), false);
+});
+
+test('Codex live reconciliation opts into safe restart lock recovery', async () => {
+  resetRoot();
+  const auth = codexAuth('codex-restart-recovery', 'restart@example.test');
+  writeJson(codexAuthPath(), auth);
+  const lockName = 'codex-live-auth';
+  const lockDir = path.join(dataDir(), 'locks', `${lockName}.lock`);
+  writeJson(path.join(lockDir, 'owner.json'), {
+    pid: 2_147_483_647,
+    ownerId: 'dead-codex-worker',
+    at: Date.now(),
+    name: lockName,
+  });
+
+  const reconciled = await reconcileLiveCodex(false, {
+    inspect: async () => ({
+      credentialStore: 'file',
+      account: { type: 'chatgpt', email: 'restart@example.test', planType: 'pro' },
+      requiresOpenaiAuth: false,
+      rateLimits: null,
+    }),
+  });
+
+  assert.equal(reconciled.profile?.accountId, auth.tokens.account_id);
+  assert.equal(fs.existsSync(lockDir), false);
+});
+
 test('missing Codex account projection preserves the active file-backed profile and aborts refresh', async () => {
   resetRoot();
   const auth = codexAuth('codex-live-ambiguous', 'ambiguous@example.test');

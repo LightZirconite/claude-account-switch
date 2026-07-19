@@ -8,21 +8,28 @@ import {
   claudeProfileCredentialsPath,
   profilesPath,
   ensureDataDirs,
-  exportDir,
   importDir,
+  providerImportDir,
   backupsDir,
   desktopStoreDir,
   DESKTOP_BUNDLE_ENTRIES,
   findClaudeExe,
 } from './paths';
+import { normalizeImportPath, uniqueExportPath } from './transfer';
 import { getLiveAccount, readLiveAccountUnlocked, updateLiveCredentials } from './claudeStore';
 import { snapshotLiveDesktopInto, newDesktopProfileId, validateDesktopProfileSnapshot } from './desktopStore';
 import { logger } from './logger';
+import { terminalSafeMetadata } from './providerMetadata';
 import { withFileLock, withFileLockSync } from './locks';
 import { atomicWriteFile, ensurePrivateDir } from './atomicFile';
 import { DEFAULT_SCOPES, primeIdentity, supportsIsolatedClaudeAuth, type PrimedIdentity } from './oauth';
 import { findClaudeProcesses, type ProcInfo } from './processes';
 import { readClaudeAuthStatusSync, type ClaudeAuthStatus } from './claudeStatus';
+import {
+  fetchClaudeProfileMetadata,
+  type ClaudeProfileFetchOptions,
+  type ClaudeProfileObservation,
+} from './claudeProfile';
 import {
   hasCliAuth,
   hasRefreshableOauth,
@@ -55,6 +62,7 @@ type ClaudeRecoveryProfile = Pick<Profile, 'id' | 'provider' | 'label' | 'email'
     | 'userID'
     | 'desktopSnapshotDir'
     | 'desktopCapturedAt'
+    | 'importedSession'
     | 'lastUsedAt'>>;
 
 interface ClaudeCredentialEnvelope {
@@ -101,6 +109,7 @@ function recoveryProfile(profile: Profile): ClaudeRecoveryProfile {
     'userID',
     'desktopSnapshotDir',
     'desktopCapturedAt',
+    'importedSession',
     'lastUsedAt',
   ];
   for (const key of optionalKeys) {
@@ -261,6 +270,19 @@ function parseStore(text: string): ProfilesStore | null {
       p.label = typeof p.label === 'string' && p.label.trim() ? p.label : p.email || p.id;
       p.createdAt = Number.isFinite(p.createdAt) ? p.createdAt : Date.now();
       p.updatedAt = Number.isFinite(p.updatedAt) ? p.updatedAt : p.createdAt;
+      const provenance = p.importedSession;
+      if (provenance
+        && (provenance.format !== 'raw-file' && provenance.format !== 'portable-export'
+          || !Number.isFinite(provenance.importedAt)
+          || provenance.importedAt <= 0)) {
+        delete p.importedSession;
+      }
+      // v2.1 and earlier did not persist import provenance. A synthetic identity is
+      // conclusive evidence that this row came from a lone raw credential file.
+      if (!p.importedSession
+        && (p.accountUuid?.startsWith('imported:') || /^\(imported\)$/i.test(p.email.trim()))) {
+        p.importedSession = { format: 'raw-file', importedAt: p.createdAt };
+      }
     }
     const requestedClaudeActive = s.activeProfileIds?.claude ?? s.activeProfileId ?? null;
     const requestedCodexActive = s.activeProfileIds?.codex ?? null;
@@ -659,6 +681,7 @@ function deduplicateExactCredentialChains(store: ProfilesStore): void {
         winner.desktopSnapshotDir = duplicate.desktopSnapshotDir;
         winner.desktopCapturedAt = duplicate.desktopCapturedAt;
       }
+      winner.importedSession ??= duplicate.importedSession;
       if (store.activeProfileId === duplicate.id) store.activeProfileId = winner.id;
       store.profiles = store.profiles.filter((profile) => profile.id !== duplicate.id);
       if (!(store.tombstones ?? []).some((tombstone) => tombstone.id === duplicate.id)) {
@@ -786,7 +809,7 @@ export function loadStore(): ProfilesStore {
 function accountsSignature(store: ProfilesStore): string {
   return JSON.stringify(
     store.profiles
-      .map((p) => [p.id, p.label, p.email, p.accountUuid])
+      .map((p) => [p.id, p.label, p.email, p.accountUuid, p.importedSession?.format, p.importedSession?.importedAt])
       .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
   );
 }
@@ -818,6 +841,7 @@ function copyCredentials(from: Profile, to: Profile): void {
   to.oauthAccount = from.oauthAccount;
   to.userID = from.userID;
   to.needsReauth = from.needsReauth;
+  to.importedSession = from.importedSession;
 }
 
 function mergeWithDisk(next: ProfilesStore): ProfilesStore {
@@ -1141,7 +1165,9 @@ export function mutateStoreWithLiveAccount(
  * "claude_max" -> "max").
  */
 export function subscriptionOf(oauth: ClaudeAiOauth | null, organizationType?: string): string | undefined {
-  const direct = oauth?.subscriptionType as string | undefined;
+  const direct = typeof oauth?.subscriptionType === 'string'
+    ? terminalSafeMetadata(oauth.subscriptionType).trim().slice(0, 80)
+    : undefined;
   if (direct) return direct;
   if (organizationType) {
     const m = organizationType.match(/claude_(\w+)/i);
@@ -1163,6 +1189,53 @@ export interface LiveProfileFields {
   claudeAiOauth: ClaudeAiOauth;
   oauthAccount: OauthAccount;
   userID?: string;
+}
+
+/** Merge only schema-validated, read-only provider metadata into imported fields. */
+export function fieldsWithClaudeProfileMetadata(
+  fields: LiveProfileFields,
+  observation: ClaudeProfileObservation,
+): LiveProfileFields {
+  const email = observation.email ?? fields.email;
+  const organizationUuid = observation.organizationUuid ?? fields.organizationUuid;
+  const organizationType = observation.organizationType ?? fields.organizationType;
+  const displayName = observation.displayName ?? observation.fullName ?? fields.oauthAccount.displayName;
+  const subscriptionType = observation.subscriptionType
+    ?? subscriptionOf(fields.claudeAiOauth, organizationType)
+    ?? fields.subscriptionType;
+  return {
+    ...fields,
+    email,
+    accountUuid: observation.accountUuid,
+    organizationUuid,
+    organizationUuidRoot: fields.organizationUuidRoot ?? observation.organizationUuid,
+    organizationType,
+    subscriptionType,
+    ...(subscriptionType
+      ? { planObservedAt: observation.observedAt, planSource: 'claude-profile' as const }
+      : {}),
+    // Keep the provider-owned credential object byte-for-byte equivalent. Metadata
+    // recovery must never turn into an implicit auth-file rewrite or token mutation.
+    claudeAiOauth: fields.claudeAiOauth,
+    oauthAccount: {
+      ...fields.oauthAccount,
+      accountUuid: observation.accountUuid,
+      ...(email && !/^\((?:unknown|imported|new account)\)$/i.test(email) ? { emailAddress: email } : {}),
+      ...(observation.organizationUuid ? { organizationUuid: observation.organizationUuid } : {}),
+      ...(organizationType ? { organizationType } : {}),
+      ...(observation.organizationName ? { organizationName: observation.organizationName } : {}),
+      ...(displayName ? { displayName } : {}),
+      ...(observation.billingType ? { billingType: observation.billingType } : {}),
+    },
+  };
+}
+
+export function needsClaudeProfileMetadata(profile: Profile): boolean {
+  return hasCliAuth(profile) && (
+    profile.accountUuid.startsWith('imported:')
+    || !profile.oauthAccount.accountUuid?.trim()
+    || /^\((?:unknown|imported)\)$/i.test(profile.email.trim())
+  );
 }
 
 /** A stable, non-reversible identity used only until Claude reports the real account. */
@@ -1248,6 +1321,9 @@ export function finalizeClaudeAuthorization(
       }, { expectedPreviousRefreshToken: selectedPreviousRefresh });
     }
     copyFieldsInto(selected, fields);
+    // Completing an explicit provider login establishes an independent session on this
+    // machine, so an older copied-session warning no longer applies.
+    delete selected.importedSession;
     if (label) selected.label = label;
     else if (selected === pending
       && (selected.label === 'Pending Claude authorization'
@@ -1797,10 +1873,9 @@ export function reconcileStoreWithProviderProof(
 // ---------- Import from files (another PC) ----------
 
 /**
- * Build profile fields from raw Claude files copied from another machine.
- * `credsFile` = a .credentials.json (or credentials.json); `claudeJsonFile` optional
- * = a .claude.json to pull `oauthAccount`/`userID` from. Missing identity is tolerated
- * and self-heals on first switch.
+ * Build profile fields from the one provider-owned Claude credential file.
+ * `.claude.json` is optional metadata only: it improves the initial e-mail/account label,
+ * but is not required to preserve or use the OAuth credential.
  */
 export function fieldsFromRawFiles(credsFile: string, claudeJsonFile?: string): LiveProfileFields | null {
   let claudeAiOauth: ClaudeAiOauth | null = null;
@@ -1808,13 +1883,13 @@ export function fieldsFromRawFiles(credsFile: string, claudeJsonFile?: string): 
   try {
     const creds = JSON.parse(fs.readFileSync(credsFile, 'utf8'));
     claudeAiOauth = creds.claudeAiOauth ?? null;
-    organizationUuidRoot = creds.organizationUuid;
+    organizationUuidRoot = typeof creds.organizationUuid === 'string' ? creds.organizationUuid : undefined;
   } catch (e) {
     logger.error('import: failed to read credentials file', e, { credsFile });
     return null;
   }
-  if (!claudeAiOauth?.accessToken || !claudeAiOauth?.refreshToken) {
-    logger.error('import: credentials file has no claudeAiOauth tokens', undefined, { credsFile });
+  if (!claudeAiOauth?.accessToken || !hasRefreshableOauth(claudeAiOauth)) {
+    logger.error('import: credentials file has no reusable claudeAiOauth credential', undefined, { credsFile });
     return null;
   }
 
@@ -1828,24 +1903,52 @@ export function fieldsFromRawFiles(credsFile: string, claudeJsonFile?: string): 
       if (!tree || errors.length) throw new Error('Invalid Claude JSONC identity file.');
       const accountNode = findNodeAtLocation(tree, ['oauthAccount']);
       const userNode = findNodeAtLocation(tree, ['userID']);
-      if (accountNode) oauthAccount = getNodeValue(accountNode) as OauthAccount;
-      if (userNode) userID = getNodeValue(userNode) as string;
+      if (accountNode) {
+        const account = getNodeValue(accountNode) as unknown;
+        if (!account || typeof account !== 'object') throw new Error('Invalid oauthAccount metadata.');
+        oauthAccount = account as OauthAccount;
+      }
+      if (userNode) {
+        const candidateUserId = getNodeValue(userNode) as unknown;
+        if (typeof candidateUserId === 'string') userID = candidateUserId;
+      }
     } catch (e) {
+      oauthAccount = { accountUuid: '' };
+      userID = undefined;
       logger.warn('import: could not read .claude.json (identity will self-heal)', { claudeJsonFile });
     }
   }
 
+  const safeEmail = typeof oauthAccount.emailAddress === 'string'
+    ? terminalSafeMetadata(oauthAccount.emailAddress).trim().slice(0, 320)
+    : '';
+  const safeDisplayName = typeof oauthAccount.displayName === 'string'
+    ? terminalSafeMetadata(oauthAccount.displayName).trim().slice(0, 160)
+    : undefined;
+  oauthAccount = {
+    ...oauthAccount,
+    ...(safeEmail ? { emailAddress: safeEmail } : {}),
+    ...(safeDisplayName ? { displayName: safeDisplayName } : {}),
+  };
+  const importedAccountUuid = typeof oauthAccount.accountUuid === 'string' ? oauthAccount.accountUuid.trim() : '';
+  const importedOrganizationUuid = typeof oauthAccount.organizationUuid === 'string'
+    ? oauthAccount.organizationUuid.trim()
+    : organizationUuidRoot ?? '';
+  const organizationType = typeof oauthAccount.organizationType === 'string'
+    ? terminalSafeMetadata(oauthAccount.organizationType).trim().slice(0, 80) || undefined
+    : undefined;
+
   return {
-    email: oauthAccount.emailAddress ?? '(imported)',
-    accountUuid: oauthAccount.accountUuid || `imported:${crypto
+    email: safeEmail || '(imported)',
+    accountUuid: importedAccountUuid || `imported:${crypto
       .createHash('sha256')
       .update(`${claudeAiOauth.accessToken}\0${claudeAiOauth.refreshToken}`)
       .digest('hex')
       .slice(0, 32)}`,
-    organizationUuid: oauthAccount.organizationUuid ?? organizationUuidRoot ?? '',
+    organizationUuid: importedOrganizationUuid,
     organizationUuidRoot,
-    organizationType: oauthAccount.organizationType,
-    subscriptionType: subscriptionOf(claudeAiOauth, oauthAccount.organizationType),
+    organizationType,
+    subscriptionType: subscriptionOf(claudeAiOauth, organizationType),
     claudeAiOauth,
     oauthAccount,
     userID,
@@ -1853,27 +1956,266 @@ export function fieldsFromRawFiles(credsFile: string, claudeJsonFile?: string): 
 }
 
 function fieldsFromExportRecord(data: PortableExport): LiveProfileFields {
+  if (!data || typeof data !== 'object' || (data.version !== 1 && data.version !== 2)) {
+    throw new Error('Unsupported Claude portable export version.');
+  }
+  if (data.provider && data.provider !== 'claude') throw new Error('Portable export belongs to another provider.');
+  if (typeof data.email !== 'string' || typeof data.accountUuid !== 'string' || !data.accountUuid.trim()) {
+    throw new Error('Claude portable export is missing its stable account identity.');
+  }
+  if (!data.claudeAiOauth?.accessToken || !hasRefreshableOauth(data.claudeAiOauth)) {
+    throw new Error('Claude portable export does not contain a reusable OAuth credential.');
+  }
+  if (!data.oauthAccount || typeof data.oauthAccount !== 'object') {
+    throw new Error('Claude portable export is missing its account metadata.');
+  }
+  if (data.oauthAccount.accountUuid && data.oauthAccount.accountUuid !== data.accountUuid) {
+    throw new Error('Claude portable export account identities do not match.');
+  }
+  if (typeof data.label !== 'string') throw new Error('Claude portable export label is malformed.');
+  const email = terminalSafeMetadata(data.email).trim().slice(0, 320) || '(imported)';
+  const oauthAccount: OauthAccount = {
+    ...data.oauthAccount,
+    accountUuid: data.accountUuid,
+    ...(typeof data.oauthAccount.emailAddress === 'string'
+      ? { emailAddress: terminalSafeMetadata(data.oauthAccount.emailAddress).trim().slice(0, 320) }
+      : {}),
+    ...(typeof data.oauthAccount.displayName === 'string'
+      ? { displayName: terminalSafeMetadata(data.oauthAccount.displayName).trim().slice(0, 160) }
+      : {}),
+    ...(typeof data.oauthAccount.organizationType === 'string'
+      ? { organizationType: terminalSafeMetadata(data.oauthAccount.organizationType).trim().slice(0, 80) }
+      : {}),
+  };
   return {
-    email: data.email,
+    email,
     accountUuid: data.accountUuid,
     organizationUuid: data.organizationUuid,
     organizationUuidRoot: data.organizationUuidRoot,
-    organizationType: data.organizationType,
-    subscriptionType: data.subscriptionType,
+    organizationType: typeof data.organizationType === 'string'
+      ? terminalSafeMetadata(data.organizationType).trim().slice(0, 80) || undefined
+      : undefined,
+    subscriptionType: typeof data.subscriptionType === 'string'
+      ? terminalSafeMetadata(data.subscriptionType).trim().slice(0, 80) || undefined
+      : undefined,
     claudeAiOauth: data.claudeAiOauth,
-    oauthAccount: data.oauthAccount,
-    userID: data.userID,
+    oauthAccount,
+    userID: typeof data.userID === 'string' ? data.userID : undefined,
   };
 }
 
 export interface ImportCandidate {
   source: string; // description shown to user
+  sourcePath: string;
+  consumedPaths: string[];
+  format: 'switch-export' | 'raw-credentials';
   fields: LiveProfileFields;
   label?: string; // preferred label (from an export)
 }
 
+export interface ClaudeImportMetadataRecovery {
+  candidates: ImportCandidate[];
+  verifiedCount: number;
+  unavailableCount: number;
+}
+
+/**
+ * Verify imported identities before the first durable mutation. Provider/network failure
+ * deliberately keeps the validated file metadata so an offline import still succeeds.
+ */
+export async function recoverClaudeImportMetadata(
+  candidates: ImportCandidate[],
+  claudeVersion: string,
+  options: ClaudeProfileFetchOptions = {},
+): Promise<ClaudeImportMetadataRecovery> {
+  const recovered = new Array<ImportCandidate>(candidates.length);
+  let nextIndex = 0;
+  let verifiedCount = 0;
+  const worker = async () => {
+    while (true) {
+      if (options.signal?.aborted) throw new Error('Claude metadata recovery cancelled before import; nothing was committed.');
+      const index = nextIndex++;
+      const candidate = candidates[index];
+      if (!candidate) return;
+      try {
+        const observation = await fetchClaudeProfileMetadata(
+          candidate.fields.claudeAiOauth.accessToken,
+          claudeVersion,
+          options,
+        );
+        recovered[index] = {
+          ...candidate,
+          fields: fieldsWithClaudeProfileMetadata(candidate.fields, observation),
+        };
+        verifiedCount++;
+      } catch (error) {
+        if (options.signal?.aborted) throw new Error('Claude metadata recovery cancelled before import; nothing was committed.');
+        recovered[index] = candidate;
+        logger.warn('import: Claude provider metadata unavailable; validated file metadata retained', {
+          source: path.basename(candidate.sourcePath),
+          error: String(error),
+        });
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(2, candidates.length) }, () => worker()));
+  return {
+    candidates: recovered,
+    verifiedCount,
+    unavailableCount: candidates.length - verifiedCount,
+  };
+}
+
+export interface ClaudeMetadataRecoveryResult {
+  store: ProfilesStore;
+  checkedCount: number;
+  verifiedCount: number;
+  unavailableCount: number;
+}
+
+const inFlightClaudeMetadata = new Map<string, Promise<boolean>>();
+
+function waitForClaudeMetadataFlight(task: Promise<boolean>, signal?: AbortSignal): Promise<boolean> {
+  if (!signal) return task;
+  if (signal.aborted) return Promise.reject(new Error('Claude metadata recovery cancelled.'));
+  return new Promise<boolean>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(new Error('Claude metadata recovery cancelled.'));
+    };
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    signal.addEventListener('abort', onAbort, { once: true });
+    task.then(
+      (value) => { cleanup(); resolve(value); },
+      (error) => { cleanup(); reject(error); },
+    );
+  });
+}
+
+async function recoverOneClaudeProfileMetadata(
+  profileId: string,
+  claudeVersion: string,
+  options: ClaudeProfileFetchOptions,
+): Promise<boolean> {
+  const existingFlight = inFlightClaudeMetadata.get(profileId);
+  if (existingFlight) return waitForClaudeMetadataFlight(existingFlight, options.signal);
+  const task = (async () => {
+    const observed = loadStore().profiles.find((profile) => profile.id === profileId);
+    if (!observed || !hasCliAuth(observed) || !needsClaudeProfileMetadata(observed)) return true;
+    const observedRefreshToken = observed.claudeAiOauth.refreshToken;
+    let observation: ClaudeProfileObservation;
+    try {
+      observation = await fetchClaudeProfileMetadata(
+        observed.claudeAiOauth.accessToken,
+        claudeVersion,
+        options,
+      );
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      logger.warn('Claude imported-profile metadata remains unavailable', {
+        profileId,
+        error: String(error),
+      });
+      return false;
+    }
+
+    let committed = false;
+    mutateStore((store) => {
+      const target = store.profiles.find((profile) => profile.id === profileId);
+      if (!target || !hasCliAuth(target)
+        || target.claudeAiOauth.refreshToken !== observedRefreshToken) return;
+      const stableCurrentId = target.accountUuid && !target.accountUuid.startsWith('imported:')
+        ? target.accountUuid
+        : target.oauthAccount.accountUuid?.trim();
+      if (stableCurrentId && stableCurrentId !== observation.accountUuid) {
+        logger.warn('Claude provider metadata identity mismatch; saved profile left unchanged', { profileId });
+        return;
+      }
+      const collision = store.profiles.find((profile) => profile.id !== profileId
+        && (profile.accountUuid === observation.accountUuid
+          || profile.oauthAccount?.accountUuid === observation.accountUuid));
+      const archived = (store.tombstones ?? []).some((tombstone) =>
+        tombstone.provider === 'claude'
+          && tombstone.archivedProfile?.provider === 'claude'
+          && tombstone.archivedProfile.accountUuid === observation.accountUuid
+          && (!tombstone.restoredAt || tombstone.deletedAt > tombstone.restoredAt));
+      if (collision || archived) {
+        logger.warn('Claude provider metadata matched an existing or archived identity; imported row left unchanged', {
+          profileId,
+          collisionProfileId: collision?.id,
+          archived,
+        });
+        return;
+      }
+      const previousNeedsReauth = target.needsReauth;
+      const fields = fieldsWithClaudeProfileMetadata({
+        email: target.email,
+        accountUuid: target.accountUuid,
+        organizationUuid: target.organizationUuid,
+        organizationUuidRoot: target.organizationUuidRoot,
+        organizationType: target.organizationType,
+        subscriptionType: target.subscriptionType,
+        planObservedAt: target.planObservedAt,
+        planSource: target.planSource,
+        claudeAiOauth: target.claudeAiOauth,
+        oauthAccount: target.oauthAccount,
+        userID: target.userID,
+      }, observation);
+      copyFieldsInto(target, fields);
+      target.needsReauth = previousNeedsReauth;
+      target.importedSession ??= { format: 'raw-file', importedAt: target.createdAt };
+      if (/^\((?:unknown|imported)\)$/i.test(target.label.trim())) {
+        target.label = fields.oauthAccount.displayName || fields.email;
+      }
+      committed = true;
+    });
+    return committed;
+  })();
+  inFlightClaudeMetadata.set(profileId, task);
+  try {
+    return await task;
+  } finally {
+    if (inFlightClaudeMetadata.get(profileId) === task) inFlightClaudeMetadata.delete(profileId);
+  }
+}
+
+/** Retry unresolved legacy/raw imports without making normal startup depend on the network. */
+export async function recoverMissingClaudeProfileMetadata(
+  claudeVersion: string,
+  options: ClaudeProfileFetchOptions = {},
+): Promise<ClaudeMetadataRecoveryResult> {
+  const ids = loadStore().profiles.filter(needsClaudeProfileMetadata).map((profile) => profile.id);
+  let nextIndex = 0;
+  let verifiedCount = 0;
+  const worker = async () => {
+    while (true) {
+      if (options.signal?.aborted) throw new Error('Claude metadata recovery cancelled.');
+      const id = ids[nextIndex++];
+      if (!id) return;
+      if (await recoverOneClaudeProfileMetadata(id, claudeVersion, options)) verifiedCount++;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(2, ids.length) }, () => worker()));
+  return {
+    store: loadStore(),
+    checkedCount: ids.length,
+    verifiedCount,
+    unavailableCount: ids.length - verifiedCount,
+  };
+}
+
+export interface ClaudeImportGroup {
+  key: string;
+  source: string;
+  sourcePath: string;
+  consumedPaths: string[];
+  format: ImportCandidate['format'];
+  candidates: ImportCandidate[];
+}
+
 /** Turn any *.ccswitch.json (single export OR full "export-all") into candidates. */
-function candidatesFromCcswitchFile(file: string): ImportCandidate[] {
+function candidatesFromCcswitchFile(file: string, strict = false): ImportCandidate[] {
+  const sourcePath = path.resolve(file);
   const src = path.basename(file);
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -1881,80 +2223,137 @@ function candidatesFromCcswitchFile(file: string): ImportCandidate[] {
       if (data.provider && data.provider !== 'claude') return [];
       return (data.accounts as PortableExport[]).map((a) => ({
         source: `${src} → ${a.email}`,
+        sourcePath,
+        consumedPaths: [sourcePath],
+        format: 'switch-export' as const,
         fields: fieldsFromExportRecord(a),
-        label: a.label,
+        label: terminalSafeMetadata(a.label).trim().slice(0, 160) || undefined,
       }));
     }
     if (data?.kind === 'claude-account-switch/export') {
       if (data.provider && data.provider !== 'claude') return [];
-      return [{ source: src, fields: fieldsFromExportRecord(data as PortableExport), label: (data as PortableExport).label }];
+      return [{
+        source: src,
+        sourcePath,
+        consumedPaths: [sourcePath],
+        format: 'switch-export',
+        fields: fieldsFromExportRecord(data as PortableExport),
+        label: terminalSafeMetadata((data as PortableExport).label).trim().slice(0, 160) || undefined,
+      }];
     }
     // Unknown JSON — maybe a raw .credentials.json
     const raw = fieldsFromRawFiles(file);
-    return raw ? [{ source: src, fields: raw }] : [];
+    return raw ? [{ source: src, sourcePath, consumedPaths: [sourcePath], format: 'raw-credentials', fields: raw }] : [];
   } catch (e) {
     logger.error('import: failed to parse .ccswitch.json', e, { file });
+    if (strict) {
+      throw new Error(`${path.basename(file)} is not a reusable Claude credential export: ${String((e as Error).message ?? e)}`);
+    }
     return [];
   }
 }
 
-/**
- * Scan the import folder (~/.claude-switch/import) for anything importable:
- * *.ccswitch.json (single or full backup), or a raw .credentials.json (+ .claude.json).
- */
-export function scanImportDir(): ImportCandidate[] {
-  ensureDataDirs();
+function candidatesFromClaudeDirectory(directory: string, strict = false): ImportCandidate[] {
   const out: ImportCandidate[] = [];
-  let entries: string[] = [];
+  let entries: fs.Dirent[] = [];
   try {
-    entries = fs.readdirSync(importDir());
+    entries = fs.readdirSync(directory, { withFileTypes: true });
   } catch {
     return out;
   }
-  const full = (n: string) => path.join(importDir(), n);
+  const files = entries.filter((entry) => entry.isFile()).map((entry) => entry.name);
+  const full = (name: string) => path.join(directory, name);
 
-  for (const n of entries.filter((n) => n.endsWith('.ccswitch.json'))) {
-    out.push(...candidatesFromCcswitchFile(full(n)));
+  for (const name of files.filter((entry) => entry.toLowerCase().endsWith('.ccswitch.json')).sort()) {
+    out.push(...candidatesFromCcswitchFile(full(name), strict));
   }
 
-  const credFile = entries.find((n) => n === '.credentials.json' || n === 'credentials.json');
-  const cjFile = entries.find((n) => n === '.claude.json');
+  const byLowerName = new Map(files.map((name) => [name.toLowerCase(), name]));
+  const credFile = byLowerName.get('.credentials.json') ?? byLowerName.get('credentials.json');
+  const cjFile = byLowerName.get('.claude.json');
   if (credFile) {
-    const f = fieldsFromRawFiles(full(credFile), cjFile ? full(cjFile) : undefined);
-    if (f) out.push({ source: `${credFile}${cjFile ? ' + ' + cjFile : ''}`, fields: f });
+    const credentials = path.resolve(full(credFile));
+    const identity = cjFile ? path.resolve(full(cjFile)) : undefined;
+    const fields = fieldsFromRawFiles(credentials, identity);
+    if (!fields && strict) throw new Error(`${credFile} is not a reusable Claude .credentials.json file.`);
+    if (fields) out.push({
+      source: `${credFile}${cjFile ? ` + optional ${cjFile}` : ''}`,
+      sourcePath: credentials,
+      consumedPaths: identity ? [credentials, identity] : [credentials],
+      format: 'raw-credentials',
+      fields,
+    });
   }
   return out;
 }
 
+/**
+ * Scan the provider-specific Claude inbox and the legacy shared inbox. A successful
+ * caller can move `consumedPaths` to processed evidence without guessing companions.
+ */
+export function scanImportDir(): ImportCandidate[] {
+  ensureDataDirs();
+  const seen = new Set<string>();
+  return [providerImportDir('claude'), importDir()]
+    .flatMap((directory) => candidatesFromClaudeDirectory(directory))
+    .filter((candidate) => {
+      const key = `${candidate.sourcePath}\0${candidate.fields.accountUuid}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
 /** Resolve an arbitrary path (file or directory) into import candidates. */
 export function importFromPath(target: string): ImportCandidate[] {
-  const out: ImportCandidate[] = [];
+  const normalized = normalizeImportPath(target);
   let stat: fs.Stats;
   try {
-    stat = fs.statSync(target);
+    stat = fs.statSync(normalized);
   } catch {
-    return out;
+    return [];
   }
   if (stat.isDirectory()) {
-    const cred = ['.credentials.json', 'credentials.json'].map((n) => path.join(target, n)).find((p) => fs.existsSync(p));
-    const cj = path.join(target, '.claude.json');
-    if (cred) {
-      const f = fieldsFromRawFiles(cred, fs.existsSync(cj) ? cj : undefined);
-      if (f) out.push({ source: path.basename(target), fields: f });
-    }
-    for (const n of fs.readdirSync(target).filter((n) => n.endsWith('.ccswitch.json'))) {
-      out.push(...candidatesFromCcswitchFile(path.join(target, n)));
-    }
-    return out;
+    return candidatesFromClaudeDirectory(path.resolve(normalized), true);
   }
-  // single file
-  if (target.endsWith('.ccswitch.json')) {
-    out.push(...candidatesFromCcswitchFile(target));
-  } else {
-    const f = fieldsFromRawFiles(target);
-    if (f) out.push({ source: path.basename(target), fields: f });
+  if (!stat.isFile()) return [];
+  const sourcePath = path.resolve(normalized);
+  if (sourcePath.toLowerCase().endsWith('.ccswitch.json')) return candidatesFromCcswitchFile(sourcePath, true);
+
+  const adjacentIdentity = path.join(path.dirname(sourcePath), '.claude.json');
+  const identity = fs.existsSync(adjacentIdentity) && path.basename(sourcePath).toLowerCase() !== '.claude.json'
+    ? path.resolve(adjacentIdentity)
+    : undefined;
+  const fields = fieldsFromRawFiles(sourcePath, identity);
+  return fields ? [{
+    source: path.basename(sourcePath),
+    sourcePath,
+    consumedPaths: identity ? [sourcePath, identity] : [sourcePath],
+    format: 'raw-credentials',
+    fields,
+  }] : [];
+}
+
+export function groupClaudeImportCandidates(candidates: ImportCandidate[]): ClaudeImportGroup[] {
+  const groups = new Map<string, ClaudeImportGroup>();
+  for (const candidate of candidates) {
+    const key = path.resolve(candidate.sourcePath);
+    const existing = groups.get(key);
+    if (existing) {
+      existing.candidates.push(candidate);
+      existing.consumedPaths = [...new Set([...existing.consumedPaths, ...candidate.consumedPaths])];
+      continue;
+    }
+    groups.set(key, {
+      key,
+      source: path.basename(candidate.sourcePath),
+      sourcePath: candidate.sourcePath,
+      consumedPaths: [...new Set(candidate.consumedPaths)],
+      format: candidate.format,
+      candidates: [candidate],
+    });
   }
-  return out;
+  return [...groups.values()].sort((a, b) => a.source.localeCompare(b.source));
 }
 
 /**
@@ -1965,7 +2364,7 @@ export function addOrUpdateProfile(
   store: ProfilesStore,
   fields: LiveProfileFields,
   label?: string,
-  options: { credentialSource?: 'portable-import' | 'validated-login' } = {},
+  options: { credentialSource?: 'raw-import' | 'portable-import' | 'validated-login' } = {},
 ): Profile {
   if (!hasRefreshableOauth(fields.claudeAiOauth)) {
     throw new Error('Imported Claude Code credentials are missing a refresh token.');
@@ -2020,10 +2419,24 @@ export function addOrUpdateProfile(
     existing.needsReauth = false; // a fresh login means the account is healthy again
     existing.updatedAt = Date.now();
     if (label) existing.label = label;
+    if (options.credentialSource === 'validated-login') {
+      delete existing.importedSession;
+    } else {
+      existing.importedSession = {
+        format: options.credentialSource === 'raw-import' ? 'raw-file' : 'portable-export',
+        importedAt: Date.now(),
+      };
+    }
     logger.info('import: updated existing profile', { email: existing.email });
     return existing;
   }
   const profile = makeProfile(fields, label);
+  if (options.credentialSource !== 'validated-login') {
+    profile.importedSession = {
+      format: options.credentialSource === 'raw-import' ? 'raw-file' : 'portable-export',
+      importedAt: Date.now(),
+    };
+  }
   store.profiles.push(profile);
   logger.info('import: added new profile', { email: profile.email });
   return profile;
@@ -2115,8 +2528,7 @@ export async function exportProfile(
       const record = toExportRecord(current);
       if (!record) throw new Error('This profile has no Claude Code credentials to export (Desktop-only accounts are not portable).');
       ensureDataDirs();
-      const safeLabel = current.label.replace(/[^\w.-]+/g, '_').slice(0, 40) || 'account';
-      const file = path.join(exportDir(), `${safeLabel}.ccswitch.json`);
+      const file = uniqueExportPath(current.label || 'claude-account', '.ccswitch.json');
       atomicWriteFile(file, JSON.stringify(record, null, 2) + '\n');
       logger.info('exported profile', { email: current.email, file });
       return file;
@@ -2160,7 +2572,7 @@ export async function exportAllProfiles(
         exportedAt: Date.now(),
         accounts,
       };
-      const file = path.join(exportDir(), `all-accounts.ccswitch.json`);
+      const file = uniqueExportPath('all-claude-accounts', '.ccswitch.json');
       atomicWriteFile(file, JSON.stringify(data, null, 2) + '\n');
       logger.info('exported portable Claude Code profiles', {
         exportedCount: accounts.length,

@@ -67,13 +67,14 @@ The account actions apply only to the visible provider.
 | Key | Action |
 | --- | --- |
 | Left/Right | switch between Claude and Codex tabs |
-| Up/Down | move that provider's independent cursor |
+| Up/Down or j/k | move that provider's independent cursor |
 | PageUp/PageDown, g/G | move by a viewport / jump to first or last account |
 | / | find the next account by label, email or plan |
-| ? | explain every navigation and account-management shortcut |
+| ? | open the complete nine-page TUI and CLI command reference |
 | Enter | switch to the selected account |
 | a | copy a remote authorization URL, then paste the returned code/callback |
-| i / I | import interactively / import an export-all bundle or folder |
+| A (Claude) | capture an optional machine-bound Claude Desktop session |
+| i / I | open the provider inbox / paste or drag a file or folder path |
 | e / E | export selected / all portable credentials for the visible provider |
 | r | rename the selected account |
 | d | archive the selected non-active account without destroying credentials |
@@ -90,16 +91,21 @@ accounts. A `0%` five-hour bucket with no provider reset timestamp is shown as
 display yet.
 
 The TUI removes duplicate label/email columns, numbers and separates dense account rows, and
-keeps only essential hints in the footer. Press `?` to list every shortcut; every shortcut
-remains directly available without opening a submenu. One low-frequency animation clock drives
-the provider mascot, active marker and selection cursor.
+keeps only essential hints in the footer. Press `?` for the complete nine-page reference:
+navigation, quota decisions, accounts, imports, exports, contextual controls, every public CLI
+command, and safety rules. Arrows, PageUp/PageDown or j/k change pages; 1-9 jumps directly to a
+category, while every list shortcut remains available without entering a submenu. One
+low-frequency animation clock drives the provider mascot, active marker and selection cursor.
 Set `NO_ANIMATION=1` or `REDUCE_MOTION=1` to render every decorative element statically.
+An unobtrusive `⧉` beside an account means its login session was imported from another
+machine; the selected-account panel and help explain the concurrent-machine tradeoff.
 
 Codex plan labels prefer the effective entitlement returned by
 `account/rateLimits/read` over `account/read`, because the account projection can lag after
 an upgrade. OpenAI's internal `prolite` value is displayed as the customer-facing `PRO` plan;
 the raw provider value remains available in `doctor codex` for diagnostics. Claude plan labels
-continue to come from the official `claude auth status --json` projection.
+come from the official `claude auth status --json` projection or the validated read-only
+provider profile returned for an imported access token.
 
 Codex quota columns are derived from the rolling windows actually returned by the official App
 Server instead of assuming that both counters always exist. OpenAI currently documents a shared
@@ -206,7 +212,18 @@ pretending file and Keychain auth have identical lifecycle semantics.
 - Last known quotas remain visible as `stale` when a live refresh fails.
 - Credential exports take provider and per-account rotation locks, reconcile and reread the
   durable stores, and refuse to run while process safety is unknown. They therefore cannot
-  serialize an invalid predecessor from a stale TUI object.
+  serialize an invalid predecessor from a stale TUI object. Export names are timestamped and
+  never overwrite an older recovery artifact.
+- Claude and Codex have separate private import inboxes. A complete source is validated before
+  its first account is committed. After a successful inbox import, the exact consumed files are
+  moved under `import/processed/<provider>/` with a secret-free receipt and SHA-256 fingerprints.
+  Files selected from the Desktop, USB media, or a shared/network directory are intentionally
+  left in place; importing never silently deletes an arbitrary source.
+- Imports immediately attempt a bounded, read-only provider metadata recovery. Claude sends
+  only the current access token to its profile projection (never the refresh token); Codex uses
+  the official App Server with forced refresh disabled. Responses are schema-validated before
+  replacing account IDs, e-mail, organization or plan. Network/provider failure never rolls
+  back a valid file import: missing details retry on startup and with `u`.
 - Cancelled/failed Codex login sandboxes remain under `backups/codex-abandoned/`; `doctor codex`
   inventories valid and damaged evidence, while `z` can explicitly recover the newest valid
   login without deleting its diagnostic archive.
@@ -227,6 +244,40 @@ Current provider references:
 - [Claude session security controls](https://support.claude.com/en/articles/13163631-configuring-session-security-settings)
 - [Codex authentication](https://developers.openai.com/codex/auth)
 - [Codex App Server](https://developers.openai.com/codex/app-server)
+
+## Import and export
+
+Press `i` on either provider tab to open its guided inbox and `o` to open that folder in
+Explorer/Finder/the desktop file manager. Copy or drag a credential/export into the folder,
+return to the switcher, press `r`, select the detected source, and press Enter. Press `I` instead
+to type, paste, or drag an existing file/folder path directly into the terminal.
+
+For **Claude Code on Windows and Linux**, the official subscription credential is the single
+file `~/.claude/.credentials.json` (or `.credentials.json` under `CLAUDE_CONFIG_DIR`). That file
+is enough to import the reusable login. The separate `~/.claude.json` file is optional identity
+metadata that can improve the initial e-mail/label; it is not a second required credential.
+macOS stores Claude credentials in Keychain, so use this switcher's `e`/`E` portable export on
+the source Mac instead of copying a raw file. The undotted `credentials.json` name remains
+accepted only as an explicit legacy import alias; it is never treated as Claude's live store.
+
+For **Codex**, raw migration uses `~/.codex/auth.json` only when the official effective
+`cli_auth_credentials_store` is `file`. OpenAI documents copying that cache to a headless
+machine; keyring-backed credentials cannot be reconstructed from a nonexistent file. The
+provider-tagged `*.ccswitch.json` and `*.codexswitch.json` formats are preferred because they
+carry unambiguous provider/account metadata and support one-account or export-all bundles.
+
+After validation, the switcher asks the provider for current account metadata and updates the
+label/e-mail, stable identity, organization and plan when those fields are available. Claude's
+profile projection is provider-internal rather than a documented compatibility contract, so
+its response is treated as optional and strictly validated. An unavailable or changed endpoint
+does not make the import fail; the saved file metadata remains usable and recovery retries later.
+
+Raw credential copying duplicates a session, not an account. The original PC does not stop
+working merely because a file was copied, but two computers can then hold the same rotating
+OAuth chain. No local switcher can coordinate refresh-token rotation across disconnected
+machines. For long-running concurrent use, authenticate independently on each PC; use raw copy
+primarily for migration/recovery. Provider revocation or documented login expiry can still
+require re-authentication.
 
 Codex profiles deliberately store file-backed `auth.json` copies. Managed reconciliation,
 refresh and switching therefore require this effective setting in `~/.codex/config.toml`:
@@ -282,7 +333,9 @@ Claude and Codex homes when it is installed. This switcher store is independent 
 - `transactions/claude-live-auth.json`: pending two-file recovery journal (normally absent)
 - `backups/`: account-set, deleted-account and pre-switch rollback snapshots
 - `logs/switch.log`: activity log with secret values redacted
-- `import/` and `exports/`: portable files containing secrets; protect them like passwords
+- `import/claude/` and `import/codex/`: provider-specific active inboxes containing secrets
+- `import/processed/<provider>/`: consumed inbox evidence plus secret-free import receipts
+- `exports/`: timestamped portable files containing secrets; older exports are never overwritten
 
 Credential envelopes are plain JSON protected by user-directory permissions, not
 application-level encryption. Never commit or share them. Legacy profile stores are migrated

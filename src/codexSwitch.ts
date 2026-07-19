@@ -657,7 +657,7 @@ export async function restoreCodexLiveBackup(
         cause: error,
       });
     }
-  });
+  }, { recoverAbandoned: true });
   } finally {
     try {
       releaseSelectedBackup();
@@ -756,7 +756,11 @@ export async function applyCodexAuthTransaction<T>(
   validate: () => Promise<T>,
   options: { processInventory?: () => CodexProcessInfo[] } = {},
 ): Promise<CodexAuthTransactionResult<T>> {
-  return withFileLock('codex-live-auth', () => applyCodexAuthTransactionUnlocked(profileId, validate, options));
+  return withFileLock(
+    'codex-live-auth',
+    () => applyCodexAuthTransactionUnlocked(profileId, validate, options),
+    { recoverAbandoned: true },
+  );
 }
 
 function inspectionMatchesTarget(
@@ -980,7 +984,7 @@ export async function switchCodexProfile(
     logger.info('codex account switched', { email: target.email, backupDir: applied.backupDir });
     return { ok: true, profileId, backupDir: applied.backupDir, message: `Codex is now authenticated as ${target.email}.` };
     }, { timeoutMs: lockTimeoutBefore(mutationDeadlineAt) });
-  }, { timeoutMs: lockTimeoutBefore(mutationDeadlineAt) });
+  }, { timeoutMs: lockTimeoutBefore(mutationDeadlineAt), recoverAbandoned: true });
 }
 
 function jobDir(): string {

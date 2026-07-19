@@ -146,6 +146,7 @@ test('Codex quota entitlement supersedes a stale account plan after an upgrade',
 test('terminal presentation removes duplicate identities and unsafe plan controls', () => {
   assert.equal(accountListLabel('Work', 'work@example.test'), 'Work');
   assert.equal(accountListLabel('', 'fallback@example.test'), 'fallback@example.test');
+  assert.equal(accountListLabel('Work', 'work@example.test', true), '⧉ Work');
   assert.equal(accountSecondaryIdentity('Work', 'work@example.test'), 'work@example.test');
   assert.equal(accountSecondaryIdentity('same@example.test', 'same@example.test'), null);
   assert.equal(sanitizePlanType('  pro\u001b[31mlite  '), 'prolite');

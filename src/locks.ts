@@ -35,6 +35,12 @@ interface LockOwner {
   name: string;
 }
 
+interface FileLockOptions {
+  staleMs?: number;
+  timeoutMs?: number;
+  recoverAbandoned?: boolean;
+}
+
 function validOwner(owner: LockOwner | null, expectedName: string): owner is LockOwner {
   return !!owner
     && Number.isInteger(owner.pid)
@@ -112,9 +118,9 @@ function tryAcquire(name: string, staleMs: number): HeldLock | null {
 function reclaimAbandonedLock(name: string, staleMs: number): boolean {
   const takeoverName = `${name}.abandoned-takeover`;
   const takeover = tryAcquire(takeoverName, staleMs);
-  if (!takeover) {
-    throw new Error(`Another process is already recovering the abandoned lock: ${name}`);
-  }
+  // Recovery is already fenced by another process. Let this waiter retry the
+  // primary lock instead of turning a safe, transient takeover into a failure.
+  if (!takeover) return false;
   try {
     const selected = lockPath(name);
     let stat: fs.Stats;
@@ -160,6 +166,31 @@ function reclaimAbandonedLock(name: string, staleMs: number): boolean {
   }
 }
 
+function tryAcquireWithRecovery(
+  name: string,
+  staleMs: number,
+  recoverAbandoned: boolean,
+): HeldLock | null {
+  let held: HeldLock | null;
+  try {
+    held = tryAcquire(name, staleMs);
+  } catch (error) {
+    if (!(error instanceof AbandonedFileLockError) || !recoverAbandoned) throw error;
+    reclaimAbandonedLock(name, staleMs);
+    return null;
+  }
+  if (held || !recoverAbandoned) return held;
+
+  const owner = readOwner(lockPath(name));
+  // A valid dead owner is conclusive even before the generic stale interval. This
+  // makes recovery immediate after a crash or reboot while corrupt owner metadata
+  // remains subject to the stale interval and the generation fence above.
+  if (validOwner(owner, name) && !processAlive(owner.pid)) {
+    reclaimAbandonedLock(name, staleMs);
+  }
+  return null;
+}
+
 function release(held: HeldLock): void {
   try {
     const owner = readOwner(held.path);
@@ -174,29 +205,15 @@ function release(held: HeldLock): void {
 export function withFileLockSync<T>(
   name: string,
   fn: () => T,
-  opts: { staleMs?: number; timeoutMs?: number; recoverAbandoned?: boolean } = {},
+  opts: FileLockOptions = {},
 ): T {
   const staleMs = opts.staleMs ?? DEFAULT_STALE_MS;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
   let held: HeldLock | null = null;
   while (!held) {
-    try {
-      held = tryAcquire(name, staleMs);
-    } catch (error) {
-      if (!(error instanceof AbandonedFileLockError) || !opts.recoverAbandoned) throw error;
-      if (reclaimAbandonedLock(name, staleMs)) continue;
-    }
+    held = tryAcquireWithRecovery(name, staleMs, opts.recoverAbandoned === true);
     if (held) break;
-    if (opts.recoverAbandoned) {
-      const selected = lockPath(name);
-      const owner = readOwner(selected);
-      // A valid dead owner is conclusive even before the generic stale interval. This
-      // is what makes immediate post-crash journal recovery possible.
-      if (validOwner(owner, name) && !processAlive(owner.pid)) {
-        if (reclaimAbandonedLock(name, staleMs)) continue;
-      }
-    }
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for lock: ${name}`);
     sleepSync(POLL_MS);
   }
@@ -210,14 +227,14 @@ export function withFileLockSync<T>(
 export async function withFileLock<T>(
   name: string,
   fn: () => Promise<T>,
-  opts: { staleMs?: number; timeoutMs?: number } = {},
+  opts: FileLockOptions = {},
 ): Promise<T> {
   const staleMs = opts.staleMs ?? DEFAULT_STALE_MS;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
   let held: HeldLock | null = null;
   while (!held) {
-    held = tryAcquire(name, staleMs);
+    held = tryAcquireWithRecovery(name, staleMs, opts.recoverAbandoned === true);
     if (held) break;
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for lock: ${name}`);
     await sleep(POLL_MS);

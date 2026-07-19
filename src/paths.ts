@@ -2,6 +2,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import type { ProviderId } from './types';
 
 /** Directory Claude Code uses for its config (~/.claude by default). */
 export function claudeConfigDir(): string {
@@ -85,6 +86,14 @@ export function logFile(): string {
 export function importDir(): string {
   return path.join(dataDir(), 'import');
 }
+/** Provider-specific inbox. Files successfully ingested from here are archived automatically. */
+export function providerImportDir(provider: ProviderId): string {
+  return path.join(importDir(), provider);
+}
+/** Processed import evidence is retained outside the active inbox for recovery/audit. */
+export function processedImportDir(provider: ProviderId): string {
+  return path.join(importDir(), 'processed', provider);
+}
 export function exportDir(): string {
   return path.join(dataDir(), 'exports');
 }
@@ -133,8 +142,21 @@ export const DESKTOP_BUNDLE_ENTRIES = [
 export function ensureDataDirs(): void {
   fs.mkdirSync(path.join(dataDir(), 'logs'), { recursive: true });
   fs.mkdirSync(backupsDir(), { recursive: true });
-  fs.mkdirSync(importDir(), { recursive: true });
-  fs.mkdirSync(exportDir(), { recursive: true });
+  for (const privateDir of [
+    importDir(),
+    providerImportDir('claude'),
+    providerImportDir('codex'),
+    processedImportDir('claude'),
+    processedImportDir('codex'),
+    exportDir(),
+  ]) {
+    fs.mkdirSync(privateDir, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(privateDir, 0o700);
+    } catch (error) {
+      if (process.platform !== 'win32') throw error;
+    }
+  }
   fs.mkdirSync(desktopStoreDir(), { recursive: true });
   fs.mkdirSync(claudeCredentialsRoot(), { recursive: true, mode: 0o700 });
   fs.mkdirSync(codexCredentialsRoot(), { recursive: true, mode: 0o700 });

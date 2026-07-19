@@ -2,6 +2,17 @@
 
 export type ProviderId = 'claude' | 'codex';
 
+export type ImportedSessionFormat = 'raw-file' | 'portable-export';
+
+/**
+ * Provenance for a credential copied into this machine. It remains visible until an
+ * independent official login replaces the imported session on this computer.
+ */
+export interface ImportedSessionInfo {
+  format: ImportedSessionFormat;
+  importedAt: number;
+}
+
 export interface BaseProfile {
   id: string;
   provider: ProviderId;
@@ -11,6 +22,7 @@ export interface BaseProfile {
   updatedAt?: number;
   lastUsedAt?: number;
   needsReauth?: boolean;
+  importedSession?: ImportedSessionInfo;
 }
 
 /** The `claudeAiOauth` block stored in ~/.claude/.credentials.json */
@@ -117,9 +129,9 @@ export interface Profile extends BaseProfile {
   organizationUuidRoot?: string;
   organizationType?: string;
   subscriptionType?: string;
-  /** Last time/source that the plan was confirmed by the official Claude CLI. */
+  /** Last time/source that the plan was confirmed by a Claude provider projection. */
   planObservedAt?: number;
-  planSource?: 'oauth-token' | 'claude-auth-status';
+  planSource?: 'oauth-token' | 'claude-auth-status' | 'claude-profile';
   claudeAiOauth?: ClaudeAiOauth;
   oauthAccount?: OauthAccount;
   userID?: string;

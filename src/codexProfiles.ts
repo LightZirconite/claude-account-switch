@@ -9,8 +9,8 @@ import {
   codexProfileHome,
   codexProfilesPath,
   ensureDataDirs,
-  exportDir,
   importDir,
+  providerImportDir,
 } from './paths';
 import { logger, redactText } from './logger';
 import { withFileLock, withFileLockSync } from './locks';
@@ -32,8 +32,16 @@ import {
   selectBestNow,
   type BestNowDecision,
 } from './scheduling';
-import { sanitizePlanType } from './providerMetadata';
-import type { CodexAuthFile, CodexProfile, CodexProfilesStore, CodexUsageInfo, ProfileTombstone } from './types';
+import { sanitizePlanType, terminalSafeMetadata } from './providerMetadata';
+import type {
+  CodexAuthFile,
+  CodexProfile,
+  CodexProfilesStore,
+  CodexUsageInfo,
+  ImportedSessionInfo,
+  ProfileTombstone,
+} from './types';
+import { discoverCodexImportFiles, uniqueExportPath } from './transfer';
 
 const STORE_VERSION = 1;
 const ABANDONED_PENDING_AGE_MS = 15 * 60_000;
@@ -89,6 +97,15 @@ function normalizeStore(value: unknown): CodexProfilesStore | null {
   // the malformed rows on the next save.
   if (!raw.profiles.every(validProfile)) return null;
   const profiles = raw.profiles;
+  for (const profile of profiles) {
+    const provenance = profile.importedSession;
+    if (provenance
+      && (provenance.format !== 'raw-file' && provenance.format !== 'portable-export'
+        || !Number.isFinite(provenance.importedAt)
+        || provenance.importedAt <= 0)) {
+      delete profile.importedSession;
+    }
+  }
   if (new Set(profiles.map((profile) => profile.id)).size !== profiles.length
     || new Set(profiles.map((profile) => profile.accountId)).size !== profiles.length) return null;
   if (raw.tombstones !== undefined && !Array.isArray(raw.tombstones)) return null;
@@ -619,6 +636,7 @@ function mergeStores(incoming: CodexProfilesStore, disk: CodexProfilesStore | nu
       current.planObservedAt = old.planObservedAt;
       current.planSource = old.planSource;
       current.needsReauth = old.needsReauth;
+      current.importedSession = old.importedSession;
       current.updatedAt = old.updatedAt;
     }
   }
@@ -653,7 +671,14 @@ function snapshotStore(previousText: string): void {
 
 function accountSetSignature(store: CodexProfilesStore): string {
   return JSON.stringify(store.profiles
-    .map((profile) => [profile.id, profile.accountId, profile.label, profile.email])
+    .map((profile) => [
+      profile.id,
+      profile.accountId,
+      profile.label,
+      profile.email,
+      profile.importedSession?.format,
+      profile.importedSession?.importedAt,
+    ])
     .sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
 }
 
@@ -801,7 +826,9 @@ function metadataFromAuth(auth: CodexAuthFile): { accountId: string; email: stri
   const authClaims = accessPayload?.['https://api.openai.com/auth'] as Record<string, unknown> | undefined;
   return {
     accountId: auth.tokens.account_id,
-    email: typeof idPayload?.email === 'string' ? idPayload.email : '(unknown ChatGPT account)',
+    email: typeof idPayload?.email === 'string'
+      ? terminalSafeMetadata(idPayload.email).trim().slice(0, 320) || '(unknown ChatGPT account)'
+      : '(unknown ChatGPT account)',
     planType: sanitizePlanType(
       typeof authClaims?.chatgpt_plan_type === 'string' ? authClaims.chatgpt_plan_type : undefined,
     ),
@@ -901,7 +928,7 @@ function upsertAuth(
   auth: CodexAuthFile,
   inspection?: CodexInspection,
   label?: string,
-  options: { allowArchivedRestore?: boolean } = {},
+  options: { allowArchivedRestore?: boolean; importedSession?: ImportedSessionInfo | null } = {},
 ): { store: CodexProfilesStore; profile: CodexProfile } {
   validateCodexAuth(auth);
   const meta = metadataFromAuth(auth);
@@ -931,6 +958,8 @@ function upsertAuth(
       existing.needsReauth = false;
       existing.updatedAt = Date.now();
       if (inspection) existing.usage = usageFromInspection(inspection, existing.usage);
+      if (options.importedSession === null) delete existing.importedSession;
+      else if (options.importedSession) existing.importedSession = options.importedSession;
       selected = existing;
     } else {
       const id = crypto.randomUUID();
@@ -943,6 +972,7 @@ function upsertAuth(
         createdAt: Date.now(),
         updatedAt: Date.now(),
         needsReauth: false,
+        ...(options.importedSession ? { importedSession: options.importedSession } : {}),
         usage: inspection ? usageFromInspection(inspection) : undefined,
       };
       applyResolvedCodexPlan(selected, inspection, meta.planType);
@@ -1052,7 +1082,11 @@ export async function reconcileLiveCodex(
   forceTokenRefresh = false,
   options: { inspect?: (refreshToken: boolean) => Promise<CodexInspection> } = {},
 ): Promise<{ store: CodexProfilesStore; profile: CodexProfile | null }> {
-  return withFileLock('codex-live-auth', () => reconcileLiveCodexUnlocked(forceTokenRefresh, options));
+  return withFileLock(
+    'codex-live-auth',
+    () => reconcileLiveCodexUnlocked(forceTokenRefresh, options),
+    { recoverAbandoned: true },
+  );
 }
 
 export async function addCodexAccount(
@@ -1079,7 +1113,7 @@ export async function addCodexAccount(
     const result = await withFileLock(codexCredentialLockName(auth.tokens.account_id), async () => {
       // Escape must also win while a concurrent rotation/import is releasing the account.
       throwIfCodexLoginCancelled(signal);
-      return upsertAuth(auth, inspection, undefined, { allowArchivedRestore: true });
+      return upsertAuth(auth, inspection, undefined, { allowArchivedRestore: true, importedSession: null });
     });
     committed = true;
     return result;
@@ -1310,7 +1344,7 @@ export async function archiveCodexProfile(
       await assertCodexProfileCanBeArchivedUnlocked(id, inspect);
       return deleteCodexProfileUnlocked(id);
     });
-  });
+  }, { recoverAbandoned: true });
 }
 
 export interface DeletedCodexProfileRestore {
@@ -1617,12 +1651,11 @@ export async function exportCodexProfile(
         throw new Error('The selected Codex credential identity changed while export was waiting. Retry the export.');
       }
       ensureDataDirs();
-      const safe = current.label.replace(/[^\w.-]+/g, '_').slice(0, 40) || 'codex-account';
-      const file = path.join(exportDir(), `${safe}.codexswitch.json`);
+      const file = uniqueExportPath(current.label || 'codex-account', '.codexswitch.json');
       atomicWriteFile(file, `${JSON.stringify(portable(current), null, 2)}\n`);
       return file;
     });
-  });
+  }, { recoverAbandoned: true });
 }
 
 export async function exportAllCodexProfiles(
@@ -1649,57 +1682,99 @@ export async function exportAllCodexProfiles(
         exportedAt: Date.now(),
         accounts: current.profiles.map(portable),
       };
-      const file = path.join(exportDir(), 'all-codex-accounts.codexswitch.json');
+      const file = uniqueExportPath('all-codex-accounts', '.codexswitch.json');
       atomicWriteFile(file, `${JSON.stringify(data, null, 2)}\n`);
       return file;
     });
-  });
+  }, { recoverAbandoned: true });
 }
 
-async function importRecord(record: PortableCodexProfile): Promise<CodexProfile> {
-  if (record.provider !== 'codex' || !record.auth) throw new Error('Not a Codex account export.');
+interface PreparedCodexImport {
+  auth: CodexAuthFile;
+  label?: string;
+  importFormat: ImportedSessionInfo['format'];
+}
+
+function preparePortableCodexRecord(record: PortableCodexProfile): PreparedCodexImport {
+  if (record?.kind !== 'claude-codex-account-switch/export'
+    || record.version !== 2
+    || record.provider !== 'codex'
+    || !record.auth) {
+    throw new Error('Not a supported Codex account export.');
+  }
   const auth = validateCodexAuth(record.auth);
   if (record.accountId && record.accountId !== auth.tokens.account_id) {
     throw new Error('Codex export metadata does not match its credential account id.');
   }
-  return withFileLock(codexCredentialLockName(auth.tokens.account_id), async () => {
+  if (record.label != null && typeof record.label !== 'string') {
+    throw new Error('Codex export label is malformed.');
+  }
+  return {
+    auth,
+    label: record.label ? terminalSafeMetadata(record.label).trim().slice(0, 160) || undefined : undefined,
+    importFormat: 'portable-export',
+  };
+}
+
+async function importPreparedRecord(record: PreparedCodexImport): Promise<CodexProfile> {
+  return withFileLock(codexCredentialLockName(record.auth.tokens.account_id), async () => {
+    const auth = record.auth;
     assertImportDoesNotDowngrade(auth);
-    return upsertAuth(auth, undefined, record.label).profile;
+    return upsertAuth(auth, undefined, record.label, {
+      importedSession: { format: record.importFormat, importedAt: Date.now() },
+    }).profile;
   });
 }
 
 export async function importCodexFromPath(target: string): Promise<CodexProfile[]> {
-  const files = fs.statSync(target).isDirectory()
-    ? fs.readdirSync(target).map((name) => path.join(target, name)).filter((file) => /(?:auth\.json|\.codexswitch\.json)$/i.test(file))
-    : [target];
-  const imported: CodexProfile[] = [];
+  const files = discoverCodexImportFiles(target);
+  const prepared: PreparedCodexImport[] = [];
   for (const file of files) {
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as PortableCodexProfile | PortableCodexAll | CodexAuthFile;
-    if ((raw as PortableCodexAll).kind === 'claude-codex-account-switch/export-all') {
-      for (const record of (raw as PortableCodexAll).accounts) imported.push(await importRecord(record));
-    } else if ((raw as PortableCodexProfile).kind === 'claude-codex-account-switch/export') {
-      imported.push(await importRecord(raw as PortableCodexProfile));
-    } else {
-      let auth: CodexAuthFile;
-      try {
-        auth = validateCodexAuth(raw);
-      } catch (error) {
-        throw new Error(`${file} is not a reusable Codex ChatGPT auth export: ${String((error as Error).message ?? error)}`);
+    let raw: PortableCodexProfile | PortableCodexAll | CodexAuthFile;
+    try {
+      raw = JSON.parse(fs.readFileSync(file, 'utf8')) as PortableCodexProfile | PortableCodexAll | CodexAuthFile;
+      if ((raw as PortableCodexAll).kind === 'claude-codex-account-switch/export-all') {
+        const bundle = raw as PortableCodexAll;
+        if (bundle.version !== 2 || bundle.provider !== 'codex' || !Array.isArray(bundle.accounts)) {
+          throw new Error('Not a supported Codex export-all bundle.');
+        }
+        prepared.push(...bundle.accounts.map(preparePortableCodexRecord));
+      } else if ((raw as PortableCodexProfile).kind === 'claude-codex-account-switch/export') {
+        prepared.push(preparePortableCodexRecord(raw as PortableCodexProfile));
+      } else {
+        prepared.push({ auth: validateCodexAuth(raw), importFormat: 'raw-file' });
       }
-      imported.push(await withFileLock(codexCredentialLockName(auth.tokens.account_id), async () => {
-        assertImportDoesNotDowngrade(auth);
-        return upsertAuth(auth).profile;
-      }));
+    } catch (error) {
+      throw new Error(`${path.basename(file)} is not a reusable Codex ChatGPT auth export: ${String((error as Error).message ?? error)}`);
     }
   }
+
+  // Validate the complete batch before the first durable mutation. Two different
+  // rotating chains claiming one account in the same bundle are ambiguous and unsafe.
+  const byAccount = new Map<string, PreparedCodexImport>();
+  for (const record of prepared) {
+    const existing = byAccount.get(record.auth.tokens.account_id);
+    if (existing && !sameCodexCredential(existing.auth, record.auth)) {
+      throw new Error('Codex import contains conflicting credentials for the same account. Nothing was imported.');
+    }
+    if (!existing) byAccount.set(record.auth.tokens.account_id, record);
+  }
+  const imported: CodexProfile[] = [];
+  for (const record of byAccount.values()) imported.push(await importPreparedRecord(record));
   return imported;
 }
 
 export function scanCodexImportDir(): string[] {
   ensureDataDirs();
-  return fs.readdirSync(importDir())
-    .filter((name) => /(?:auth\.json|\.codexswitch\.json)$/i.test(name))
-    .map((name) => path.join(importDir(), name));
+  const seen = new Set<string>();
+  return [providerImportDir('codex'), importDir()]
+    .flatMap((directory) => discoverCodexImportFiles(directory))
+    .filter((file) => {
+      const key = path.resolve(file);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 }
 
 export function codexCredentialRootForDoctor(): string {
