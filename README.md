@@ -149,14 +149,18 @@ pretending file and Keychain auth have identical lifecycle semantics.
   non-switchable recovery profile. Workspace organization IDs are never treated as account
   identity because Team/Enterprise members can share them; the known account envelope and
   the ambiguous candidate both remain intact.
-- A rotated Claude token is written first to mirrored, independently readable per-account
-  envelopes and an append-before-replace CAS generation; at least one durable canonical copy is
-  required before metadata changes or the account lock is released. Stale metadata cannot
-  replace a newer refresh-token generation, missing mirrors are repaired later, and valid
-  predecessor history is bounded to the newest 24 generations so lifetime stores remain fast.
-- The official Claude client exclusively owns refresh-token rotation for the active
-  account. The switcher only reconciles that live state and shows cached quotas when its
-  access token is expired; scheduled maintenance refreshes parked accounts only.
+- Parked Claude rotations are written first to mirrored, independently readable per-account
+  envelopes and an append-before-replace CAS generation. For the active account, the switcher
+  may rotate only while two process checks prove that no official Claude client is running; it
+  atomically updates the official live file first, then promotes the saved envelope with an
+  exact predecessor CAS. Metadata never changes before a durable credential copy exists, stale
+  writers cannot replace newer generations, and valid history is bounded to the newest 24.
+- If Claude is running, it exclusively owns the active refresh token and the switcher preserves
+  cached quota instead of rotating underneath it. After a reboot or while Claude is closed,
+  startup, `u`, and scheduled maintenance can safely renew the expired active token under the
+  provider lock, so the active account no longer remains stale merely because the PC was off.
+- Codex does not need this Claude-specific quiescence path: active Codex renewal stays inside
+  the official App Server `account/read(refreshToken=true)` lifecycle and its isolated adapter.
 - If the running official client replaces the active OAuth chain completely, reconciliation
   promotes it only when the stable account UUID plus the official status e-mail and
   organization all identify the same saved profile. A mismatch remains quarantined; e-mail

@@ -74,7 +74,13 @@ test('Claude refresh summary distinguishes protected active cache from real fail
 
   assert.equal(
     describeClaudeRefreshResult([freshOne, protectedActive, freshTwo], protectedActive.id, now),
-    'Claude refresh: 2/3 fresh and complete; 1 active cached (live token left to official Claude).',
+    'Claude refresh: 2/3 fresh and complete; 1 active cached (live token protected).',
+  );
+
+  protectedActive.usage = { ...protectedActive.usage!, error: 'HTTP 503' };
+  assert.equal(
+    describeClaudeRefreshResult([freshOne, protectedActive, freshTwo], protectedActive.id, now),
+    'Claude refresh: 2/3 fresh and complete; 1 unavailable or incomplete.',
   );
 
   protectedActive.usage = { ...protectedActive.usage!, status: 'ok' };

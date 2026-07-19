@@ -4,11 +4,13 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  claudeJsonPath,
   claudeProfileCredentialsPath,
   codexAuthPath,
   codexProfileHome,
   codexProfilesPath,
   profilesPath,
+  credentialsPath,
 } from '../src/paths';
 import {
   archiveClaudeProfile,
@@ -39,7 +41,7 @@ import {
   remainingTrackedProcessIds,
   requestGracefulAppClose,
 } from '../src/codexSwitch';
-import { applyProfile } from '../src/claudeStore';
+import { applyProfile, getLiveAccount, updateLiveCredentials } from '../src/claudeStore';
 import { withFileLock } from '../src/locks';
 import { moveProviderCursor, switchProviderTab } from '../src/navigation';
 import { buildManualAuth } from '../src/oauth';
@@ -496,6 +498,203 @@ test('active Claude usage never rotates an expired live refresh token', async ()
     const persisted = loadStore().profiles[0];
     assert.equal(persisted.claudeAiOauth!.refreshToken, originalRefresh);
     assert.equal(persisted.needsReauth, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('an expired active Claude token is safely renewed after reboot when no client is running', async () => {
+  resetRoot();
+  const active = claudeProfile('active-reboot', 'active-reboot@example.test');
+  active.claudeAiOauth!.expiresAt = Date.now() - 15 * 60 * 60 * 1000;
+  active.usage = {
+    fetchedAt: Date.now() - 18 * 60 * 60 * 1000,
+    status: 'stale',
+    modelLimitsState: 'empty',
+    five_hour: { utilization: 42, resets_at: new Date(Date.now() + 60_000).toISOString() },
+    seven_day: { utilization: 30, resets_at: new Date(Date.now() + 86_400_000).toISOString() },
+  };
+  saveStore(store([active], 3));
+  writeJson(credentialsPath(), {
+    claudeAiOauth: active.claudeAiOauth,
+    organizationUuid: active.organizationUuid,
+  });
+  writeJson(claudeJsonPath(), {
+    oauthAccount: { ...active.oauthAccount, organizationUuid: active.organizationUuid },
+  });
+
+  const previousRefresh = active.claudeAiOauth!.refreshToken;
+  const rotatedRefresh = `${previousRefresh}-rotated`;
+  const rotatedAccess = 'access-active-reboot-rotated';
+  const originalFetch = globalThis.fetch;
+  let tokenCalls = 0;
+  let quotaCalls = 0;
+  let processChecks = 0;
+  globalThis.fetch = (async () => {
+    quotaCalls++;
+    return {
+      status: 200,
+      ok: true,
+      json: async () => ({
+        five_hour: { utilization: 7, resets_at: new Date(Date.now() + 60 * 60 * 1000).toISOString() },
+        seven_day: { utilization: 31, resets_at: new Date(Date.now() + 7 * 86_400_000).toISOString() },
+        limits: [],
+      }),
+    } as Response;
+  }) as typeof fetch;
+
+  try {
+    const result = await fetchUsage(active, 'test', {
+      force: true,
+      allowRefresh: false,
+      activeRefresh: {
+        processInventory: () => {
+          processChecks++;
+          return [];
+        },
+        tokenRefresh: async (refresh) => {
+          tokenCalls++;
+          assert.equal(refresh, previousRefresh);
+          return {
+            accessToken: rotatedAccess,
+            refreshToken: rotatedRefresh,
+            expiresAt: Date.now() + 8 * 60 * 60 * 1000,
+            scopes: ['user:inference'],
+          };
+        },
+      },
+    });
+
+    assert.equal(result.status, 'ok');
+    assert.equal(result.five_hour?.utilization, 7);
+    assert.equal(tokenCalls, 1);
+    assert.equal(quotaCalls, 1);
+    assert.equal(processChecks, 3);
+    assert.equal(active.claudeAiOauth!.refreshToken, rotatedRefresh);
+    assert.equal(getLiveAccount().claudeAiOauth?.refreshToken, rotatedRefresh);
+    const persisted = loadStore().profiles.find((profile) => profile.id === active.id);
+    assert.equal(persisted?.claudeAiOauth?.refreshToken, rotatedRefresh);
+    assert.equal(persisted?.needsReauth, false);
+    const envelope = JSON.parse(fs.readFileSync(claudeProfileCredentialsPath(active.id), 'utf8')) as {
+      claudeAiOauth: { refreshToken: string };
+    };
+    assert.equal(envelope.claudeAiOauth.refreshToken, rotatedRefresh);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('an expired active Claude token remains untouched while an official client is running', async () => {
+  resetRoot();
+  const active = claudeProfile('active-running', 'active-running@example.test');
+  active.claudeAiOauth!.expiresAt = Date.now() - 1;
+  active.usage = {
+    fetchedAt: Date.now() - 60 * 60 * 1000,
+    status: 'ok',
+    modelLimitsState: 'empty',
+    five_hour: { utilization: 18, resets_at: new Date(Date.now() + 60_000).toISOString() },
+    seven_day: { utilization: 40, resets_at: new Date(Date.now() + 86_400_000).toISOString() },
+  };
+  saveStore(store([active], 3));
+  writeJson(credentialsPath(), {
+    claudeAiOauth: active.claudeAiOauth,
+    organizationUuid: active.organizationUuid,
+  });
+  writeJson(claudeJsonPath(), {
+    oauthAccount: { ...active.oauthAccount, organizationUuid: active.organizationUuid },
+  });
+  const previousRefresh = active.claudeAiOauth!.refreshToken;
+  const originalFetch = globalThis.fetch;
+  let networkCalls = 0;
+  let tokenCalls = 0;
+  globalThis.fetch = (async () => {
+    networkCalls++;
+    throw new Error('quota endpoint must not run without a valid active access token');
+  }) as typeof fetch;
+
+  try {
+    const result = await fetchUsage(active, 'test', {
+      force: true,
+      allowRefresh: false,
+      activeRefresh: {
+        processInventory: () => [{ pid: 4242, name: 'claude.exe' }],
+        tokenRefresh: async () => {
+          tokenCalls++;
+          throw new Error('active refresh must not start while Claude is running');
+        },
+      },
+    });
+
+    assert.equal(result.status, 'stale');
+    assert.equal(result.staleReason, 'active-client-running');
+    assert.match(result.error ?? '', /Claude is running/);
+    assert.equal(tokenCalls, 0);
+    assert.equal(networkCalls, 0);
+    assert.equal(active.claudeAiOauth!.refreshToken, previousRefresh);
+    assert.equal(getLiveAccount().claudeAiOauth?.refreshToken, previousRefresh);
+    assert.equal(loadStore().profiles[0].claudeAiOauth?.refreshToken, previousRefresh);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a live Claude rotation appearing during active refresh is never overwritten', async () => {
+  resetRoot();
+  const active = claudeProfile('active-race', 'active-race@example.test');
+  active.claudeAiOauth!.expiresAt = Date.now() - 1;
+  active.usage = {
+    fetchedAt: Date.now() - 60 * 60 * 1000,
+    status: 'stale',
+    modelLimitsState: 'empty',
+    five_hour: { utilization: 12, resets_at: new Date(Date.now() + 60_000).toISOString() },
+    seven_day: { utilization: 23, resets_at: new Date(Date.now() + 86_400_000).toISOString() },
+  };
+  saveStore(store([active], 3));
+  writeJson(credentialsPath(), {
+    claudeAiOauth: active.claudeAiOauth,
+    organizationUuid: active.organizationUuid,
+  });
+  writeJson(claudeJsonPath(), {
+    oauthAccount: { ...active.oauthAccount, organizationUuid: active.organizationUuid },
+  });
+  const predecessor = active.claudeAiOauth!.refreshToken;
+  const externalRefresh = `${predecessor}-official`;
+  const candidateRefresh = `${predecessor}-switcher`;
+  const originalFetch = globalThis.fetch;
+  let quotaCalls = 0;
+  globalThis.fetch = (async () => {
+    quotaCalls++;
+    throw new Error('quota endpoint must not run after a live-generation race');
+  }) as typeof fetch;
+
+  try {
+    const result = await fetchUsage(active, 'test', {
+      force: true,
+      allowRefresh: false,
+      activeRefresh: {
+        processInventory: () => [],
+        tokenRefresh: async () => {
+          updateLiveCredentials({
+            ...active.claudeAiOauth!,
+            accessToken: 'access-active-race-official',
+            refreshToken: externalRefresh,
+            expiresAt: Date.now() + 8 * 60 * 60 * 1000,
+          }, active.organizationUuid);
+          return {
+            accessToken: 'access-active-race-switcher',
+            refreshToken: candidateRefresh,
+            expiresAt: Date.now() + 8 * 60 * 60 * 1000,
+          };
+        },
+      },
+    });
+
+    assert.equal(result.status, 'stale');
+    assert.equal(result.staleReason, 'active-token-protected');
+    assert.equal(quotaCalls, 0);
+    assert.equal(getLiveAccount().claudeAiOauth?.refreshToken, externalRefresh);
+    assert.notEqual(getLiveAccount().claudeAiOauth?.refreshToken, candidateRefresh);
+    assert.equal(loadStore().profiles[0].claudeAiOauth?.refreshToken, predecessor);
   } finally {
     globalThis.fetch = originalFetch;
   }

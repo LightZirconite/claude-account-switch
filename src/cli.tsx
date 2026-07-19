@@ -68,6 +68,7 @@ import {
   ensureFreshToken,
   fetchUsage,
   hasFreshCompleteClaudeUsage,
+  keepActiveTokenAlive,
   keepTokenAlive,
   leastLoaded,
 } from './usage';
@@ -809,7 +810,11 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       const a = getActive(s);
       if (a) {
         try {
-          const info = await fetchUsage(a, claudeVersion, { onRotate, allowRefresh: false });
+          const info = await fetchUsage(a, claudeVersion, {
+            onRotate,
+            allowRefresh: false,
+            activeRefresh: true,
+          });
           persistUsage(a.id, info);
         } catch (e) {
           logger.error('mount usage fetch failed', e);
@@ -863,12 +868,13 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         }
         for (const p of safeStore.profiles) {
           if (!hasCliAuth(p) || p.needsReauth) continue;
-          // Skip the ACTIVE account: a running `claude` session rotates its token
-          // independently, so refreshing our (possibly already-stale) copy here could
-          // desync and falsely flag it. The 2-min active-usage interval — which
-          // reconciles from the live files first — keeps the active account alive.
-          if (p.id === safeStore.activeProfileId) continue;
-          await keepTokenAlive(p, KEEP_ALIVE_LEAD_MS, rotate);
+          if (p.id === safeStore.activeProfileId) {
+            // After a reboot there is no in-memory official owner. Renew the live token
+            // under the provider/process guards; if Claude is running, this safely no-ops.
+            await keepActiveTokenAlive(p, KEEP_ALIVE_LEAD_MS, rotate);
+          } else {
+            await keepTokenAlive(p, KEEP_ALIVE_LEAD_MS, rotate);
+          }
         }
         await refreshClaudePlanProjection().catch((error) => {
           logger.warn('background Claude plan refresh unavailable', { error: String(error) });
@@ -895,6 +901,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       fetchUsage(p, claudeVersion, {
         onRotate,
         allowRefresh: p.id !== storeRef.current.activeProfileId,
+        activeRefresh: p.id === storeRef.current.activeProfileId ? true : undefined,
       })
         .then((info) => {
           persistUsage(p.id, info);
@@ -971,6 +978,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       void fetchUsage(a, claudeVersion, {
         force: true,
         allowRefresh: false,
+        activeRefresh: true,
         onRotate: (p) => {
           const current = loadStore();
           storeRef.current = current;
@@ -1038,6 +1046,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
               force: true,
               onRotate,
               allowRefresh: profile.id !== current.activeProfileId,
+              activeRefresh: profile.id === current.activeProfileId ? true : undefined,
             });
             persistUsage(profile.id, info);
           } catch (e) {
@@ -2991,8 +3000,8 @@ function printDryRun(target: Profile, rep: DryRunReport): void {
 /**
  * Headless keep-alive: refresh every account's OAuth token that's near expiry and persist
  * the rotation — so accounts stay alive even when the switcher UI isn't open. Run by the OS
- * scheduler (see keep-alive install). The ACTIVE account is always left to the official
- * Claude client: refreshing it here can invalidate a rotating token held by a live session.
+ * scheduler (see keep-alive install). The ACTIVE account is renewed only when process
+ * inventory proves that no official Claude client can hold its rotating token in memory.
  */
 async function runKeepAliveOnce(): Promise<void> {
   const liveRecovery = recoverClaudeLiveAuthTransaction();
@@ -3030,10 +3039,12 @@ async function runKeepAliveOnce(): Promise<void> {
       continue;
     }
     if (!hasCliAuth(p)) continue;
-    const isActive = p.id === store.activeProfileId;
-    if (isActive) continue; // the official Claude client exclusively owns live token rotation
     const before = p.claudeAiOauth.refreshToken;
-    await keepTokenAlive(p, LEAD_MS, onRotate);
+    if (p.id === store.activeProfileId) {
+      await keepActiveTokenAlive(p, LEAD_MS, onRotate);
+    } else {
+      await keepTokenAlive(p, LEAD_MS, onRotate);
+    }
     if (p.claudeAiOauth.refreshToken !== before) refreshed++;
     if (p.needsReauth) dead++;
   }

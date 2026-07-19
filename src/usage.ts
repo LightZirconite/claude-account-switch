@@ -3,7 +3,7 @@
 import { logger, redactText } from './logger';
 import { withFileLock } from './locks';
 import { refreshToken, type TokenSet } from './oauth';
-import { getLiveAccount } from './claudeStore';
+import { getLiveAccount, updateLiveCredentials } from './claudeStore';
 import {
   assertNoAmbiguousClaudeCredentialOwners,
   findByAccountUuid,
@@ -18,12 +18,15 @@ import {
 } from './scheduling';
 import {
   hasCliAuth,
+  type ClaudeAiOauth,
   type ClaudeModelLimitsState,
+  type ClaudeUsageStaleReason,
   type LiveAccount,
   type ModelLimit,
   type Profile,
   type UsageInfo,
 } from './types';
+import { findClaudeProcesses, type ProcInfo } from './processes';
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CACHE_MS = 10 * 60 * 1000; // usage only changes every few hours
@@ -211,14 +214,21 @@ export function describeClaudeRefreshResult(
   const fresh = tracked.filter((profile) => !profile.needsReauth
     && hasFreshCompleteClaudeUsage(profile, now)).length;
   const needsReauth = tracked.filter((profile) => profile.needsReauth).length;
-  const activeCached = tracked.filter((profile) => !profile.needsReauth
+  const activeCachedProfiles = tracked.filter((profile) => !profile.needsReauth
     && profile.id === activeProfileId
-    && profile.usage?.status === 'stale').length;
+    && profile.usage?.status === 'stale'
+    && (profile.usage.staleReason !== undefined || !profile.usage.error));
+  const activeCached = activeCachedProfiles.length;
+  const activeClientRunning = activeCachedProfiles.filter((profile) =>
+    profile.usage?.staleReason === 'active-client-running').length;
+  const activeRefreshUnavailable = activeCachedProfiles.filter((profile) =>
+    profile.usage?.staleReason === 'active-refresh-unavailable').length;
+  const activeProtected = Math.max(0, activeCached - activeClientRunning - activeRefreshUnavailable);
   const unavailable = Math.max(0, tracked.length - fresh - needsReauth - activeCached);
   const details: string[] = [];
-  if (activeCached) {
-    details.push(`${activeCached} active cached (live token left to official Claude)`);
-  }
+  if (activeClientRunning) details.push(`${activeClientRunning} active cached (close Claude to renew its expired token)`);
+  if (activeRefreshUnavailable) details.push(`${activeRefreshUnavailable} active cached (safe live-token renewal unavailable)`);
+  if (activeProtected) details.push(`${activeProtected} active cached (live token protected)`);
   if (needsReauth) {
     details.push(`${needsReauth} ${needsReauth === 1 ? 'needs' : 'need'} re-add`);
   }
@@ -294,6 +304,273 @@ function revalidateParkedProfile(profile: Profile): Profile | null {
     return null;
   }
   return persisted;
+}
+
+export interface ActiveClaudeRefreshOptions {
+  /** Test seam; production performs the real OS process inventory. */
+  processInventory?: () => ProcInfo[];
+  /** Test seam; production uses the same bounded OAuth refresh adapter as parked accounts. */
+  tokenRefresh?: (refreshToken: string) => Promise<TokenSet>;
+}
+
+interface ActiveClaudeAccessResult {
+  accessToken: string | null;
+  staleReason?: ClaudeUsageStaleReason;
+  error?: string;
+}
+
+function liveIdentityExactlyMatchesProfile(live: LiveAccount, profile: Profile): boolean {
+  const liveAccountUuid = live.oauthAccount?.accountUuid?.trim();
+  const profileAccountUuids = new Set([profile.accountUuid, profile.oauthAccount?.accountUuid]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .map((value) => value.trim()));
+  if (!liveAccountUuid || !profileAccountUuids.has(liveAccountUuid)) return false;
+  if (!live.claudeAiOauth?.refreshToken
+    || live.claudeAiOauth.refreshToken !== profile.claudeAiOauth?.refreshToken) return false;
+
+  const liveOrganizations = [live.organizationUuidRoot, live.oauthAccount?.organizationUuid]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .map((value) => value.trim());
+  const profileOrganizations = new Set([
+    profile.organizationUuidRoot,
+    profile.organizationUuid,
+    profile.oauthAccount?.organizationUuid,
+  ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .map((value) => value.trim()));
+  return liveOrganizations.every((organization) => profileOrganizations.has(organization));
+}
+
+function rotatedClaudeOauth(current: ClaudeAiOauth, refreshed: TokenSet): ClaudeAiOauth {
+  return {
+    ...current,
+    accessToken: refreshed.accessToken,
+    refreshToken: refreshed.refreshToken,
+    expiresAt: refreshed.expiresAt,
+    ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
+  };
+}
+
+/**
+ * Renew the ACTIVE Claude credential only while the official client is fully quiescent.
+ *
+ * A machine restart leaves no in-memory Claude owner, so keeping the active refresh token
+ * permanently read-only merely lets its access token expire. This path takes the same
+ * provider lock as switching, proves exact live identity + token ownership, checks the OS
+ * process inventory twice, rotates once, and durably updates the official file before the
+ * saved envelope. A running Claude process still makes the operation fail closed.
+ */
+async function ensureActiveClaudeAccessToken(
+  profile: Profile,
+  refreshLeadMs: number,
+  onRotate?: (profile: Profile) => void,
+  options: ActiveClaudeRefreshOptions = {},
+): Promise<ActiveClaudeAccessResult> {
+  const processInventory = options.processInventory ?? findClaudeProcesses;
+  const tokenRefresh = options.tokenRefresh ?? refreshToken;
+  let rotatedProfile: Profile | null = null;
+
+  const result = await withFileLock('claude-provider-switch', async (): Promise<ActiveClaudeAccessResult> => {
+    const disk = loadStore();
+    assertNoAmbiguousClaudeCredentialOwners(disk);
+    const persisted = disk.profiles.find((candidate) => candidate.id === profile.id)
+      ?? findByAccountUuid(disk, profile.accountUuid);
+    if (!persisted || disk.activeProfileId !== persisted.id || !hasCliAuth(persisted) || persisted.needsReauth) {
+      return {
+        accessToken: null,
+        staleReason: 'active-token-protected',
+        error: 'active Claude profile changed before token renewal',
+      };
+    }
+
+    let live = getLiveAccount();
+    if (!liveIdentityExactlyMatchesProfile(live, persisted) || !live.claudeAiOauth) {
+      return {
+        accessToken: null,
+        staleReason: 'active-token-protected',
+        error: 'live Claude identity or credential generation changed before token renewal',
+      };
+    }
+    persisted.claudeAiOauth = live.claudeAiOauth;
+    copyAuthState(persisted, profile);
+    if (live.claudeAiOauth.accessToken
+      && live.claudeAiOauth.expiresAt > Date.now() + refreshLeadMs) {
+      return { accessToken: live.claudeAiOauth.accessToken };
+    }
+    if (process.platform === 'darwin') {
+      return {
+        accessToken: null,
+        staleReason: 'active-refresh-unavailable',
+        error: 'safe active OAuth rotation is unavailable for macOS Keychain credentials',
+      };
+    }
+
+    const inspectProcesses = (): ProcInfo[] => {
+      try {
+        return processInventory();
+      } catch (error) {
+        throw new Error(`Claude process safety could not be verified before active token renewal: ${redactText(error)}`);
+      }
+    };
+    let running = inspectProcesses();
+    if (running.length) {
+      logger.info('usage: active token renewal deferred while Claude is running', {
+        profileId: persisted.id,
+        processCount: running.length,
+      });
+      return {
+        accessToken: null,
+        staleReason: 'active-client-running',
+        error: 'Claude is running; its live token was not rotated',
+      };
+    }
+
+    // Re-read both authorities immediately before the irreversible OAuth request. A
+    // queued switch or official-client write must never be mistaken for this account.
+    const latestDisk = loadStore();
+    assertNoAmbiguousClaudeCredentialOwners(latestDisk);
+    const latest = latestDisk.profiles.find((candidate) => candidate.id === persisted.id);
+    live = getLiveAccount();
+    running = inspectProcesses();
+    if (!latest
+      || latestDisk.activeProfileId !== latest.id
+      || !hasCliAuth(latest)
+      || latest.needsReauth
+      || running.length
+      || !liveIdentityExactlyMatchesProfile(live, latest)
+      || !live.claudeAiOauth) {
+      return {
+        accessToken: null,
+        staleReason: running.length ? 'active-client-running' : 'active-token-protected',
+        error: running.length
+          ? 'Claude started before active token renewal'
+          : 'active Claude state changed at the token-renewal boundary',
+      };
+    }
+    if (live.claudeAiOauth.accessToken
+      && live.claudeAiOauth.expiresAt > Date.now() + refreshLeadMs) {
+      latest.claudeAiOauth = live.claudeAiOauth;
+      copyAuthState(latest, profile);
+      return { accessToken: live.claudeAiOauth.accessToken };
+    }
+
+    const flightKey = latest.id;
+    const last = lastRefreshAttempt.get(flightKey) ?? 0;
+    if (Date.now() - last < MIN_INTERVAL_MS) {
+      return {
+        accessToken: null,
+        staleReason: 'active-refresh-unavailable',
+        error: 'active Claude token renewal is cooling down after a recent attempt',
+      };
+    }
+    const previousRefreshToken = live.claudeAiOauth.refreshToken;
+    lastRefreshAttempt.set(flightKey, Date.now());
+
+    let refreshed: TokenSet;
+    try {
+      refreshed = await tokenRefresh(previousRefreshToken);
+    } catch (error) {
+      logger.warn('usage: quiescent active token refresh failed', {
+        profileId: latest.id,
+        error: String(error),
+      });
+      return {
+        accessToken: null,
+        staleReason: 'active-refresh-unavailable',
+        error: `active Claude token renewal failed: ${redactText(error)}`,
+      };
+    }
+
+    const oauth = rotatedClaudeOauth(live.claudeAiOauth, refreshed);
+    const candidate: Profile = {
+      ...latest,
+      claudeAiOauth: oauth,
+      needsReauth: false,
+      updatedAt: Date.now(),
+    };
+
+    // The provider request is irreversible, but an official client can still appear in
+    // its network window because it does not honor the switcher's file lock. Never replace
+    // a different generation or identity that reached the live store in the meantime.
+    const beforeCommit = getLiveAccount();
+    const liveStillHasPredecessor = liveIdentityExactlyMatchesProfile(beforeCommit, latest);
+    const liveAlreadyHasRotation = liveIdentityExactlyMatchesProfile(beforeCommit, candidate)
+      && beforeCommit.claudeAiOauth?.accessToken === oauth.accessToken;
+    if (!liveStillHasPredecessor && !liveAlreadyHasRotation) {
+      logger.warn('usage: live Claude generation changed during active token refresh; provider state preserved', {
+        profileId: candidate.id,
+      });
+      return {
+        accessToken: null,
+        staleReason: 'active-token-protected',
+        error: 'live Claude credentials changed during token renewal',
+      };
+    }
+    try {
+      const appeared = processInventory();
+      if (appeared.length) {
+        logger.warn('usage: Claude appeared after active token rotation; syncing the durable live generation', {
+          profileId: candidate.id,
+          processCount: appeared.length,
+        });
+      }
+    } catch (error) {
+      // Rotation has already happened server-side. Process-inspection uncertainty cannot
+      // justify leaving the official file on the now-invalid predecessor.
+      logger.warn('usage: post-rotation Claude process inspection was unavailable', {
+        profileId: candidate.id,
+        error: String(error),
+      });
+    }
+
+    // The OAuth server has invalidated the predecessor. Make the official live file
+    // authoritative first so a crash cannot strand Claude on that invalid generation.
+    // The saved envelope is then promoted with an exact compare-and-swap.
+    try {
+      if (!liveAlreadyHasRotation) {
+        updateLiveCredentials(oauth, candidate.organizationUuidRoot ?? candidate.organizationUuid);
+      }
+      const confirmed = getLiveAccount();
+      if (!liveIdentityExactlyMatchesProfile(confirmed, candidate)
+        || confirmed.claudeAiOauth?.accessToken !== oauth.accessToken) {
+        throw new Error('live Claude credentials did not validate after active token renewal');
+      }
+    } catch (error) {
+      logger.error('usage: active token rotated but live credential sync failed', error, {
+        profileId: candidate.id,
+      });
+      throw new CredentialPersistenceError(
+        `The active Claude token rotated but could not be committed to the official credential file: ${redactText(error)}`,
+      );
+    }
+
+    try {
+      persistProfileCredentials(candidate, { expectedPreviousRefreshToken: previousRefreshToken });
+      mutateStore((fresh) => {
+        const current = fresh.profiles.find((entry) => entry.id === candidate.id)
+          ?? findByAccountUuid(fresh, candidate.accountUuid);
+        if (!current || fresh.activeProfileId !== current.id) {
+          throw new Error('Active Claude profile changed while the rotated credential was being committed.');
+        }
+        copyAuthState(candidate, current);
+        current.updatedAt = candidate.updatedAt;
+      });
+    } catch (error) {
+      logger.error('usage: live active token saved but durable profile promotion failed', error, {
+        profileId: candidate.id,
+      });
+      throw new CredentialPersistenceError(
+        `Claude's official credential file contains the new token, but its saved profile could not be updated: ${redactText(error)}`,
+      );
+    }
+
+    copyAuthState(candidate, profile);
+    rotatedProfile = candidate;
+    logger.info('usage: safely renewed quiescent active Claude token', { profileId: candidate.id });
+    return { accessToken: oauth.accessToken };
+  });
+
+  if (rotatedProfile) onRotate?.(rotatedProfile);
+  return result;
 }
 
 /**
@@ -489,10 +766,28 @@ export async function keepTokenAlive(
   }
 }
 
+/** Keep the live account warm after reboot, but only when no official Claude process exists. */
+export async function keepActiveTokenAlive(
+  profile: Profile,
+  leadMs: number,
+  onRotate?: (profile: Profile) => void,
+  options: ActiveClaudeRefreshOptions = {},
+): Promise<boolean> {
+  if (!hasCliAuth(profile) || profile.needsReauth) return false;
+  const before = profile.claudeAiOauth.refreshToken;
+  const result = await ensureActiveClaudeAccessToken(profile, leadMs, onRotate, options);
+  return !!result.accessToken && profile.claudeAiOauth.refreshToken !== before;
+}
+
 export async function fetchUsage(
   profile: Profile,
   claudeVersion: string,
-  opts: { force?: boolean; onRotate?: (p: Profile) => void; allowRefresh?: boolean } = {},
+  opts: {
+    force?: boolean;
+    onRotate?: (p: Profile) => void;
+    allowRefresh?: boolean;
+    activeRefresh?: true | ActiveClaudeRefreshOptions;
+  } = {},
 ): Promise<UsageInfo> {
   const now = Date.now();
   // React effects can still hold an older profile object after another path persisted a
@@ -531,20 +826,42 @@ export async function fetchUsage(
 async function fetchUsageUncached(
   profile: Profile,
   claudeVersion: string,
-  opts: { onRotate?: (p: Profile) => void; allowRefresh?: boolean },
+  opts: {
+    onRotate?: (p: Profile) => void;
+    allowRefresh?: boolean;
+    activeRefresh?: true | ActiveClaudeRefreshOptions;
+  },
   now: number,
 ): Promise<UsageInfo> {
-  const access = await ensureAccessToken(profile, opts.onRotate, 60_000, opts.allowRefresh !== false);
+  const activeResult = opts.activeRefresh
+    ? await ensureActiveClaudeAccessToken(
+        profile,
+        60_000,
+        opts.onRotate,
+        opts.activeRefresh === true ? {} : opts.activeRefresh,
+      )
+    : null;
+  const access = activeResult
+    ? activeResult.accessToken
+    : await ensureAccessToken(profile, opts.onRotate, 60_000, opts.allowRefresh !== false);
   if (!access) {
     // Keep showing the last known usage (dimmed as 'stale') so a needs-reauth account
     // still displays its last rate-limit numbers instead of a blank error.
     if (profile.usage && (profile.usage.status === 'ok' || profile.usage.status === 'stale')) {
-      return { ...profile.usage, status: 'stale' };
+      return {
+        ...profile.usage,
+        status: 'stale',
+        ...(activeResult?.staleReason ? { staleReason: activeResult.staleReason } : {}),
+        ...(activeResult?.error ? { error: activeResult.error } : {}),
+      };
     }
     return {
       fetchedAt: now,
       status: 'error',
-      error: profile.needsReauth ? 'login expired — re-add with "a"' : 'no valid access token',
+      error: profile.needsReauth
+        ? 'login expired — re-add with "a"'
+        : activeResult?.error ?? 'no valid access token',
+      ...(activeResult?.staleReason ? { staleReason: activeResult.staleReason } : {}),
     };
   }
 
@@ -565,7 +882,7 @@ async function fetchUsageUncached(
     if (!res.ok) {
       logger.warn('usage: http error', { email: profile.email, status: res.status });
       if (profile.usage && (profile.usage.status === 'ok' || profile.usage.status === 'stale')) {
-        return { ...profile.usage, status: 'stale', error: `HTTP ${res.status}` };
+        return { ...profile.usage, status: 'stale', error: `HTTP ${res.status}`, staleReason: undefined };
       }
       return { fetchedAt: now, status: 'error', error: `HTTP ${res.status}` };
     }
@@ -579,7 +896,7 @@ async function fetchUsageUncached(
   } catch (e) {
     logger.error('usage: fetch error', e, { email: profile.email });
     if (profile.usage && (profile.usage.status === 'ok' || profile.usage.status === 'stale')) {
-      return { ...profile.usage, status: 'stale', error: redactText(e) };
+      return { ...profile.usage, status: 'stale', error: redactText(e), staleReason: undefined };
     }
     return { fetchedAt: now, status: 'error', error: redactText(e) };
   }

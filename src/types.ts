@@ -55,6 +55,11 @@ export interface UsageWindow {
 
 export type UsageStatus = 'ok' | 'rate_limited' | 'error' | 'stale' | 'never';
 
+export type ClaudeUsageStaleReason =
+  | 'active-client-running'
+  | 'active-refresh-unavailable'
+  | 'active-token-protected';
+
 /** A per-model scoped limit (e.g. Opus / Sonnet / Fable weekly bucket). */
 export interface ModelLimit {
   name: string;
@@ -88,6 +93,8 @@ export interface UsageInfo {
   modelLimitsState?: ClaudeModelLimitsState;
   status: UsageStatus;
   error?: string;
+  /** Why an otherwise preserved Claude quota snapshot could not be refreshed. */
+  staleReason?: ClaudeUsageStaleReason;
 }
 
 /**
