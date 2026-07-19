@@ -192,6 +192,10 @@ export interface CodexProfile extends BaseProfile {
   provider: 'codex';
   accountId: string;
   planType?: string;
+  /** Last provider-backed observation used to resolve the displayed Codex plan. */
+  planObservedAt?: number;
+  /** Quota entitlement wins because account/read can lag immediately after an upgrade. */
+  planSource?: 'codex-rate-limits' | 'codex-account' | 'oauth-token';
   usage?: CodexUsageInfo;
 }
 

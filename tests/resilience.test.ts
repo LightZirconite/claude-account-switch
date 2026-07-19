@@ -29,6 +29,7 @@ import {
   loadCodexStore,
   readCodexAuth,
   recoverAbandonedCodexHomes,
+  resolveCodexPlan,
   restoreLatestDeletedCodexProfile,
   renameCodexProfile,
   saveCodexStore,
@@ -48,6 +49,18 @@ import { buildManualAuth } from '../src/oauth';
 import { bestNow, fetchUsage, parseClaudeUsagePayload } from '../src/usage';
 import { parseClaudeAuthStatusPayload } from '../src/claudeStatus';
 import { selectBestNow } from '../src/scheduling';
+import { formatPlanLabel, sanitizePlanType } from '../src/providerMetadata';
+import {
+  accountListLabel,
+  accountSecondaryIdentity,
+  accountTableLayout,
+  claudeMascotFrame,
+  codexMascotFrame,
+  formatAccountOrdinal,
+  formatQuotaWindowLabel,
+  quotaColumnPresentation,
+  quotaMeter,
+} from '../src/presentation';
 import type { CodexAuthFile, CodexProfile, Profile, ProfilesStore } from '../src/types';
 
 let root = '';
@@ -115,6 +128,75 @@ function codexAuth(accountId: string, email: string): CodexAuthFile {
 test.afterEach(() => {
   if (root) fs.rmSync(root, { recursive: true, force: true });
   root = '';
+});
+
+test('Codex quota entitlement supersedes a stale account plan after an upgrade', () => {
+  const resolved = resolveCodexPlan({
+    account: { type: 'chatgpt', email: 'upgraded@example.test', planType: 'plus' },
+    rateLimits: {
+      rateLimits: { limitId: 'codex', planType: 'prolite' },
+      rateLimitsByLimitId: {},
+    },
+  }, 'plus', 'plus');
+
+  assert.deepEqual(resolved, { planType: 'prolite', source: 'codex-rate-limits' });
+  assert.equal(formatPlanLabel(resolved.planType), 'PRO');
+});
+
+test('terminal presentation removes duplicate identities and unsafe plan controls', () => {
+  assert.equal(accountListLabel('Work', 'work@example.test'), 'Work');
+  assert.equal(accountListLabel('', 'fallback@example.test'), 'fallback@example.test');
+  assert.equal(accountSecondaryIdentity('Work', 'work@example.test'), 'work@example.test');
+  assert.equal(accountSecondaryIdentity('same@example.test', 'same@example.test'), null);
+  assert.equal(sanitizePlanType('  pro\u001b[31mlite  '), 'prolite');
+  assert.equal(formatPlanLabel('pro_lite'), 'PRO');
+  assert.equal(quotaMeter(25, 8), '━━──────');
+  assert.equal(quotaMeter(null, 4), '────');
+});
+
+test('account table layouts remain exact-width and mascot art is intrinsically centered', () => {
+  for (const width of [16, 40, 51, 52, 80, 95, 96, 107, 150]) {
+    for (const requestedUsageColumns of [0, 1, 2]) {
+      const layout = accountTableLayout(width, 123, requestedUsageColumns);
+      const renderedWidth = layout.prefixWidth + layout.accountWidth + 2 + layout.planWidth
+        + layout.usageColumnCount * (2 + layout.usageWidth)
+        + (layout.compact ? 0 : 2 + layout.stateWidth);
+      assert.equal(renderedWidth, width);
+    }
+  }
+  assert.equal(formatAccountOrdinal(0, 2), '01');
+  assert.equal(formatAccountOrdinal(122, 3), '123');
+  assert.equal(formatQuotaWindowLabel(300), '5H');
+  assert.equal(formatQuotaWindowLabel(10_080, 'long'), '7-DAY');
+  assert.equal(formatQuotaWindowLabel(null), 'limit');
+  assert.deepEqual(quotaColumnPresentation([10_080], 0, 1), {
+    compactLabel: '7D',
+    longLabel: '7-DAY',
+    mixedDuration: false,
+  });
+  assert.deepEqual(quotaColumnPresentation([10_080, 43_200], 0, 1), {
+    compactLabel: 'WINDOW',
+    longLabel: 'WINDOW',
+    mixedDuration: true,
+  });
+
+  const claude = claudeMascotFrame(2);
+  assert.deepEqual(
+    [claude.signal, claude.crown, claude.body, claude.feet].map((line) => line.trim()),
+    [claude.signal, claude.crown, claude.body, claude.feet],
+  );
+  assert.equal(claude.crown.length, claude.feet.length);
+
+  const codex = codexMascotFrame(2);
+  const codexLines = [
+    `╭──${codex.signal}──╮`,
+    `╭─┤ ${codex.eyes} ├─╮`,
+    `╰─┤ ${codex.mouth} ├─╯`,
+    '╰─────╯',
+  ];
+  assert.deepEqual(codexLines.map((line) => line.trim()), codexLines);
+  assert.equal(codexLines[0].length, codexLines[3].length);
+  assert.equal(codexLines[1].length, codexLines[2].length);
 });
 
 test('Claude quota payloads are validated before they can influence scheduling', () => {
@@ -903,8 +985,40 @@ test('Codex quota aggregation uses every limit id consistently', () => {
   const quota = effectiveCodexQuota(account);
   assert.equal(quota.primary?.usedPercent, 80);
   assert.equal(quota.secondary?.usedPercent, 70);
+  assert.equal(quota.primary?.windowDurationMins, 300);
+  assert.equal(quota.secondary?.windowDurationMins, 10_080);
   assert.equal(quota.primaryComplete, true);
   assert.equal(quota.secondaryComplete, true);
+});
+
+test('Codex quota projection follows a temporarily absent rolling window and restores it', () => {
+  const account: CodexProfile = {
+    id: 'dynamic-window',
+    provider: 'codex',
+    accountId: 'dynamic-window-account',
+    email: 'dynamic@example.test',
+    label: 'dynamic',
+    createdAt: Date.now(),
+    usage: {
+      fetchedAt: Date.now(),
+      status: 'ok',
+      bucket: {
+        limitId: 'codex',
+        primary: null,
+        secondary: { usedPercent: 30, resetsAt: 400, windowDurationMins: 10_080 },
+      },
+    },
+  };
+
+  const absent = effectiveCodexQuota(account);
+  assert.equal(absent.primary, null);
+  assert.equal(absent.primaryComplete, true);
+  assert.equal(absent.secondary?.windowDurationMins, 10_080);
+
+  account.usage!.bucket!.primary = { usedPercent: 12, resetsAt: 300, windowDurationMins: 300 };
+  const restored = effectiveCodexQuota(account);
+  assert.equal(restored.primary?.usedPercent, 12);
+  assert.equal(restored.primary?.windowDurationMins, 300);
 });
 
 test('Codex quota aggregation waits for every reserve-blocking bucket to reset', () => {

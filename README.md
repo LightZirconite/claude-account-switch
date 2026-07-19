@@ -89,6 +89,23 @@ accounts. A `0%` five-hour bucket with no provider reset timestamp is shown as
 `available now`: the rolling window has not started, so there is no honest clock time to
 display yet.
 
+The TUI removes duplicate label/email columns, numbers and separates dense account rows, and
+keeps only essential hints in the footer. Press `?` to list every shortcut; every shortcut
+remains directly available without opening a submenu. One low-frequency animation clock drives
+the provider mascot, active marker and selection cursor.
+Set `NO_ANIMATION=1` or `REDUCE_MOTION=1` to render every decorative element statically.
+
+Codex plan labels prefer the effective entitlement returned by
+`account/rateLimits/read` over `account/read`, because the account projection can lag after
+an upgrade. OpenAI's internal `prolite` value is displayed as the customer-facing `PRO` plan;
+the raw provider value remains available in `doctor codex` for diagnostics. Claude plan labels
+continue to come from the official `claude auth status --json` projection.
+
+Codex quota columns are derived from the rolling windows actually returned by the official App
+Server instead of assuming that both counters always exist. OpenAI currently documents a shared
+[five-hour window](https://developers.openai.com/codex/pricing), but if that window is temporarily
+omitted for an account, the TUI hides it; a later successful refresh restores it automatically.
+
 **Best Now** is deliberately different from `l`. It trusts fresh, complete quota snapshots
 before cached or partial ones, keeps a 5% reserve in every applicable window, then spends
 useful capacity from the window that resets soonest. Equivalent choices keep the active
@@ -294,5 +311,12 @@ isolation, remote callback validation and abandoned-login preservation.
 
 ## License
 
-Created by **LightZirconite**. Licensed under the
-[PolyForm Noncommercial License 1.0.0](LICENSE). Attribution must be retained.
+Copyright © 2026 **LightZirconite**. The project is free software under the
+[GNU Affero General Public License v3.0 or later](LICENSE). Keep the copyright,
+license and source notices when redistributing it.
+
+The copyright holder may also offer a separate commercial license to organizations that
+want to integrate or redistribute the project without the AGPL copyleft obligations. See
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md). Open-source availability and attribution
+do not guarantee revenue; paid licensing, support and sponsorship remain separate business
+options controlled by LightZirconite.

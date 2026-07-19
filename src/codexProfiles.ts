@@ -32,6 +32,7 @@ import {
   selectBestNow,
   type BestNowDecision,
 } from './scheduling';
+import { sanitizePlanType } from './providerMetadata';
 import type { CodexAuthFile, CodexProfile, CodexProfilesStore, CodexUsageInfo, ProfileTombstone } from './types';
 
 const STORE_VERSION = 1;
@@ -219,6 +220,8 @@ function recoverOrphanedCredentialHomes(store: CodexProfilesStore): number {
         email: meta.email,
         label: meta.email,
         planType: meta.planType,
+        planObservedAt: meta.planType ? Date.now() : undefined,
+        planSource: meta.planType ? 'oauth-token' : undefined,
         createdAt: fs.statSync(path.join(codexCredentialsRoot(), entry.name)).birthtimeMs || Date.now(),
         updatedAt: Date.now(),
         needsReauth: false,
@@ -613,6 +616,8 @@ function mergeStores(incoming: CodexProfilesStore, disk: CodexProfilesStore | nu
       current.label = old.label;
       current.email = old.email;
       current.planType = old.planType;
+      current.planObservedAt = old.planObservedAt;
+      current.planSource = old.planSource;
       current.needsReauth = old.needsReauth;
       current.updatedAt = old.updatedAt;
     }
@@ -797,8 +802,58 @@ function metadataFromAuth(auth: CodexAuthFile): { accountId: string; email: stri
   return {
     accountId: auth.tokens.account_id,
     email: typeof idPayload?.email === 'string' ? idPayload.email : '(unknown ChatGPT account)',
-    planType: typeof authClaims?.chatgpt_plan_type === 'string' ? authClaims.chatgpt_plan_type : undefined,
+    planType: sanitizePlanType(
+      typeof authClaims?.chatgpt_plan_type === 'string' ? authClaims.chatgpt_plan_type : undefined,
+    ),
   };
+}
+
+export interface CodexPlanResolution {
+  planType?: string;
+  source?: CodexProfile['planSource'];
+}
+
+/**
+ * Resolve the effective Codex entitlement without letting a lagging account/read
+ * projection hide a newer plan returned by the quota backend. Stored metadata remains
+ * a stronger fallback than the OAuth JWT because that JWT can predate a plan change.
+ */
+export function resolveCodexPlan(
+  inspection?: Pick<CodexInspection, 'account' | 'rateLimits'>,
+  previousPlan?: string,
+  tokenPlan?: string,
+): CodexPlanResolution {
+  const directQuotaPlan = sanitizePlanType(inspection?.rateLimits?.rateLimits?.planType);
+  const bucketPlans = Object.values(inspection?.rateLimits?.rateLimitsByLimitId ?? {});
+  const primaryBucketPlan = sanitizePlanType(
+    bucketPlans.find((bucket) => bucket.limitId === 'codex')?.planType
+      ?? bucketPlans.find((bucket) => bucket.planType)?.planType,
+  );
+  const quotaPlan = directQuotaPlan ?? primaryBucketPlan;
+  if (quotaPlan) return { planType: quotaPlan, source: 'codex-rate-limits' };
+
+  const accountPlan = sanitizePlanType(inspection?.account?.planType);
+  if (accountPlan) return { planType: accountPlan, source: 'codex-account' };
+
+  const storedPlan = sanitizePlanType(previousPlan);
+  if (storedPlan) return { planType: storedPlan };
+
+  const oauthPlan = sanitizePlanType(tokenPlan);
+  return oauthPlan ? { planType: oauthPlan, source: 'oauth-token' } : {};
+}
+
+function applyResolvedCodexPlan(
+  profile: CodexProfile,
+  inspection: Pick<CodexInspection, 'account' | 'rateLimits'> | undefined,
+  tokenPlan?: string,
+): void {
+  const resolution = resolveCodexPlan(inspection, profile.planType, tokenPlan);
+  if (!resolution.planType) return;
+  profile.planType = resolution.planType;
+  if (resolution.source) {
+    profile.planSource = resolution.source;
+    profile.planObservedAt = Date.now();
+  }
 }
 
 function usageFromInspection(inspection: CodexInspection, previous?: CodexUsageInfo): CodexUsageInfo {
@@ -869,7 +924,7 @@ function upsertAuth(
     }
     if (existing) {
       existing.email = inspection?.account?.email || meta.email;
-      existing.planType = inspection?.account?.planType || inspection?.rateLimits?.rateLimits?.planType || meta.planType;
+      applyResolvedCodexPlan(existing, inspection, meta.planType);
       if (label) existing.label = label;
       // readCodexAuth already proves that this is a managed ChatGPT credential.
       // account/read metadata can lag the completed login notification.
@@ -885,12 +940,12 @@ function upsertAuth(
         accountId: meta.accountId,
         email: inspection?.account?.email || meta.email,
         label: label || inspection?.account?.email || meta.email,
-        planType: inspection?.account?.planType || inspection?.rateLimits?.rateLimits?.planType || meta.planType,
         createdAt: Date.now(),
         updatedAt: Date.now(),
         needsReauth: false,
         usage: inspection ? usageFromInspection(inspection) : undefined,
       };
+      applyResolvedCodexPlan(selected, inspection, meta.planType);
       current.profiles.push(selected);
     }
     // Credentials are written while the store lock is held and before metadata is
@@ -1080,7 +1135,7 @@ export async function refreshCodexProfile(
         const target = store.profiles.find((p) => p.id === profileId);
         if (!target) return;
         target.email = inspection.account?.email || target.email;
-        target.planType = inspection.account?.planType || inspection.rateLimits?.rateLimits?.planType || target.planType;
+        applyResolvedCodexPlan(target, inspection);
         target.usage = usageFromInspection(inspection, target.usage);
         target.needsReauth = false;
         target.updatedAt = Date.now();
@@ -1319,8 +1374,8 @@ export function setActiveCodexProfile(id: string): CodexProfilesStore {
 }
 
 export interface EffectiveCodexQuotaProjection {
-  primary: { usedPercent: number; resetsAt: number } | null;
-  secondary: { usedPercent: number; resetsAt: number } | null;
+  primary: { usedPercent: number; resetsAt: number; windowDurationMins: number | null } | null;
+  secondary: { usedPercent: number; resetsAt: number; windowDurationMins: number | null } | null;
   additional: Array<{ name: string; usedPercent: number; resetsAt: number }>;
   primaryComplete: boolean;
   secondaryComplete: boolean;
@@ -1380,6 +1435,9 @@ export function effectiveCodexQuota(profile: CodexProfile): EffectiveCodexQuotaP
     const reserveBlockers = windows.filter((window) => window.usedPercent >= reserveThreshold);
     const resetWindows = reserveBlockers.length ? reserveBlockers : constraining;
     const hasUnknownBlockingReset = reserveBlockers.some((window) => window.resetsAt <= 0);
+    const durations = [...new Set(windows
+      .map((window) => window.windowDurationMins)
+      .filter((duration) => Number.isFinite(duration) && duration > 0))];
     return {
       usedPercent,
       // Every independent bucket must keep the reserve. If several buckets block use,
@@ -1388,6 +1446,7 @@ export function effectiveCodexQuota(profile: CodexProfile): EffectiveCodexQuotaP
       resetsAt: hasUnknownBlockingReset
         ? 0
         : Math.max(...resetWindows.map((window) => window.resetsAt > 0 ? window.resetsAt : 0)),
+      windowDurationMins: durations.length === 1 ? durations[0] : null,
     };
   };
   const additional = buckets.flatMap((bucket) => {

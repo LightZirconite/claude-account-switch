@@ -112,6 +112,7 @@ import {
   recoverAbandonedCodexHomes,
   restoreLatestCodexRecovery,
   reconcileLiveCodex,
+  resolveCodexPlan,
   refreshCodexProfile,
   refreshAllCodexProfiles,
   renameCodexProfile,
@@ -134,6 +135,18 @@ import {
 import { moveCursor, switchProviderTab, viewportFor } from './navigation';
 import { type BestNowDecision } from './scheduling';
 import { readClaudeAuthStatus } from './claudeStatus';
+import { formatPlanLabel } from './providerMetadata';
+import {
+  accountListLabel,
+  accountSecondaryIdentity,
+  accountTableLayout,
+  claudeMascotFrame,
+  codexMascotFrame,
+  formatAccountOrdinal,
+  formatQuotaWindowLabel,
+  quotaColumnPresentation,
+  quotaMeter,
+} from './presentation';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -189,19 +202,57 @@ function relTime(ms?: number): string {
 const CLAUDE_ORANGE = '#D97757'; // Claude brand coral/orange
 // Current Windows Codex app manifest uses this royal-blue brand background.
 const CODEX_BLUE = '#3143FF';
-const CodexTerminalMark = () => (
-  <Box flexDirection="column" alignItems="center">
-    <Text bold color={CODEX_BLUE}>{'      .-~~~~-.'}</Text>
-    <Text bold color={CODEX_BLUE}>{"   .-'        '-."}</Text>
-    <Text bold color={CODEX_BLUE}>{" .'      "}<Text color="white">{'>_'}</Text>{"       '."}</Text>
-    <Text bold color={CODEX_BLUE}>{'(        ______     )'}</Text>
-    <Text bold color={CODEX_BLUE}>{" '.              .'"}</Text>
-    <Text bold color={CODEX_BLUE}>{"   '-.________.-'"}</Text>
-  </Box>
-);
-// Fable promo: keep the per-model bucket visible through July 19, then auto-hide.
-const FABLE_PROMO_END = new Date('2026-07-20T00:00:00').getTime();
 
+function motionIsAllowed(): boolean {
+  return Boolean(process.stdout.isTTY)
+    && process.env.CI !== 'true'
+    && process.env.TERM !== 'dumb'
+    && process.env.NO_ANIMATION !== '1'
+    && process.env.REDUCE_MOTION !== '1';
+}
+
+function useMotionFrame(enabled: boolean): number {
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    if (!enabled || !motionIsAllowed()) {
+      setFrame(0);
+      return undefined;
+    }
+    // One intentionally slow timer drives every decorative motion. This avoids the
+    // flicker and CPU cost of multiple fast intervals in ordinary terminals.
+    const timer = setInterval(() => setFrame((value) => (value + 1) % 8), 650);
+    return () => clearInterval(timer);
+  }, [enabled]);
+  return frame;
+}
+
+function ClaudePulseMark({ frame }: { frame: number }) {
+  const mascot = claudeMascotFrame(frame);
+  return (
+    <Box flexDirection="column" alignItems="center">
+      <Text bold color={CLAUDE_ORANGE}>{mascot.signal}</Text>
+      <Text bold color={CLAUDE_ORANGE}>{mascot.crown}</Text>
+      <Text bold color={CLAUDE_ORANGE}>{mascot.body}</Text>
+      <Text bold color={CLAUDE_ORANGE}>{mascot.feet}</Text>
+      <Text dimColor>CLAUDE READY</Text>
+    </Box>
+  );
+}
+
+function CodexBotMark({ frame }: { frame: number }) {
+  const mascot = codexMascotFrame(frame);
+  return (
+    <Box flexDirection="column" alignItems="center">
+      <Text bold color={CODEX_BLUE}>{`╭──${mascot.signal}──╮`}</Text>
+      <Text bold color={CODEX_BLUE}>{'╭─┤ '}<Text color="white">{mascot.eyes}</Text>{' ├─╮'}</Text>
+      <Text bold color={CODEX_BLUE}>{'╰─┤ '}<Text color="cyanBright">{mascot.mouth}</Text>{' ├─╯'}</Text>
+      <Text bold color={CODEX_BLUE}>{'╰─────╯'}</Text>
+      <Text dimColor>CODEX READY</Text>
+    </Box>
+  );
+}
+
+const ColumnRule = () => <Text color="#3F3F46">{'│ '}</Text>;
 const Divider = ({ width, color = 'gray' as string }: { width: number; color?: string }) => (
   <Text color={color}>{'─'.repeat(Math.max(1, width))}</Text>
 );
@@ -281,12 +332,15 @@ function quotaResetLabel(usedPercent: number | null | undefined, iso?: string | 
   return `resets ${resetAt(iso)}`;
 }
 
-function bestNowDetail(decision: BestNowDecision<unknown>): string {
+function bestNowDetail(
+  decision: BestNowDecision<unknown>,
+  labels: { primary: string; secondary: string } = { primary: '5h', secondary: '7d' },
+): string {
   if (decision.reason === 'primary-reset-soon' && decision.primaryResetsAt) {
-    return `5h ${Math.round(decision.primaryUsedPercent ?? 0)}% · resets in ${resetIn(new Date(decision.primaryResetsAt).toISOString())}`;
+    return `${labels.primary} ${Math.round(decision.primaryUsedPercent ?? 0)}% · resets in ${resetIn(new Date(decision.primaryResetsAt).toISOString())}`;
   }
   if (decision.reason === 'secondary-reset-soon' && decision.secondaryResetsAt) {
-    return `7d ${Math.round(decision.secondaryUsedPercent ?? 0)}% · resets in ${resetIn(new Date(decision.secondaryResetsAt).toISOString())}`;
+    return `${labels.secondary} ${Math.round(decision.secondaryUsedPercent ?? 0)}% · resets in ${resetIn(new Date(decision.secondaryResetsAt).toISOString())}`;
   }
   if (decision.reason === 'additional-reset-soon' && decision.limitingResetsAt) {
     return `${decision.limitingWindowName ?? 'scoped'} ${Math.round(decision.limitingUsedPercent ?? 0)}% · resets in ${resetIn(new Date(decision.limitingResetsAt).toISOString())}`;
@@ -327,16 +381,44 @@ function planColor(sub?: string): string {
   return 'cyan';
 }
 
-// A fixed 12-char cell: "  46% ██████" — number first so it aligns under its header.
-function UsageCell({ win }: { win?: { utilization: number | null } | null }) {
+function HeroQuotaLine({
+  label,
+  usedPercent,
+  reset,
+}: {
+  label: string;
+  usedPercent?: number | null;
+  reset?: string | null;
+}) {
+  const color = utilColor(usedPercent ?? null);
+  return (
+    <Text>
+      <Text dimColor>{label.padEnd(4)}</Text>
+      <Text bold color={color}>{fmtPct(usedPercent).padStart(4)}</Text>{' '}
+      <Text color={color}>{quotaMeter(usedPercent, 10)}</Text>
+      {reset ? <Text dimColor>{`  ${reset}`}</Text> : null}
+    </Text>
+  );
+}
+
+// A fixed 12-char cell. Mixed-duration columns spend four characters on the
+// provider window label and shrink only the decorative bar, never the percentage.
+function UsageCell({
+  win,
+  windowLabel,
+}: {
+  win?: { utilization: number | null } | null;
+  windowLabel?: string | null;
+}) {
   const u = win?.utilization ?? null;
-  const width = 6;
+  const width = windowLabel ? 2 : 6;
   const filled = u == null ? 0 : Math.max(0, Math.min(width, Math.round((u / 100) * width)));
   const bar = u == null ? '─'.repeat(width) : '█'.repeat(filled) + '░'.repeat(width - filled);
   const pct = (u == null ? '·' : `${Math.round(u)}%`).padStart(4);
   const color = utilColor(u);
   return (
     <Text>
+      {windowLabel ? <Text dimColor>{pad(windowLabel.toLowerCase(), 4)}</Text> : null}
       <Text color={color}>{pct}</Text>
       {' '}
       <Text color={color}>{bar}</Text>
@@ -401,6 +483,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const [desktopBusy, setDesktopBusy] = useState(false);
   const desktopLabelRef = useRef('');
   const [busy, setBusy] = useState<string | null>(null);
+  const motionFrame = useMotionFrame(mode === 'list' && !busy);
   const [newVersion, setNewVersion] = useState<string | null>(null);
   const [setupReport, setSetupReport] = useState<InstallReport | null>(null);
   const [message, setMessage] = useState<{ title: string; lines: string[]; tone: Tone } | null>(null);
@@ -925,11 +1008,12 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         const current = loadCodexStore();
         const profile = current.profiles.find((candidate) => candidate.id === selectedId);
         if (!profile || profile.needsReauth) return;
-        if (profile.usage?.status === 'ok' && Date.now() - profile.usage.fetchedAt < 10 * 60 * 1000) return;
         try {
           const next = profile.id === current.activeProfileId
             ? (await reconcileLiveCodex(false)).store
-            : await refreshCodexProfile(profile.id, { forceTokenRefresh: false });
+            : profile.usage?.status === 'ok' && Date.now() - profile.usage.fetchedAt < 10 * 60 * 1000
+              ? current
+              : await refreshCodexProfile(profile.id, { forceTokenRefresh: false });
           codexStoreRef.current = next;
           setCodexStore(next);
         } catch (error) {
@@ -1713,17 +1797,20 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         return;
       }
       if (input === '?') {
-        showMessage(`Keyboard help — ${providerName}`, [
+        showMessage(`All commands — ${providerName}`, [
+          'Every shortcut remains directly available; this panel only keeps the footer uncluttered.',
           '↑/↓ or j/k: move · PgUp/PgDn: one page · g/G: first/last · /: search',
           'Enter: switch to the selected account · Left/Right: change provider tab',
           'u: refresh quotas · b: Best Now (fresh, reset-aware sustained-work choice)',
           'l: most raw quota headroom (simpler than Best Now)',
-          'a: add or re-authenticate · i: import menu/path · I: import an export-all bundle or folder',
+          'a: add or re-authenticate · i: guided import/path · I: import every account from an export-all bundle/folder',
           'e/E: export selected/all · r: rename · d: archive credentials · z: restore latest archive',
           provider === 'claude'
             ? 'A: capture the optional Claude Desktop session · active Claude tokens remain owned by official Claude'
             : 'Codex switching validates auth.json and may close confirmed Codex process trees after warning',
           'S: shortcuts and scheduled maintenance · q: quit · Esc: cancel/back',
+          `Diagnostics log: ${logFile()}`,
+          'Copyright © 2026 LightZirconite · AGPL-3.0-or-later · no warranty · source and license in this repository',
         ], 'info');
         return;
       }
@@ -2139,12 +2226,49 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const compactHero = W < 80 || rows < 24;
   const ultraCompactTable = W < 52;
   const compactTable = W < 96;
-  const compactLabelW = ultraCompactTable ? Math.max(6, W - 13) : Math.max(10, W - 25);
-  const emailW = Math.max(16, W - (4 + 18 + 8 + 6 + 12 + 12 + 11));
-  const leftW = Math.min(42, Math.max(24, Math.floor((W - 4) * 0.4)));
+  const leftW = Math.min(30, Math.max(22, Math.floor((W - 4) * 0.29)));
+  const activeGlyph = motionFrame % 4 === 2 ? '◉' : '●';
+  const cursorGlyph = motionFrame % 2 === 0 ? '❯ ' : '› ';
   const claudeBest = bestNow(profiles, store.activeProfileId);
   const codexBest = bestNowCodex(codexProfiles, codexStore.activeProfileId);
   const codexSelectedQuota = codexSelected ? effectiveCodexQuota(codexSelected) : null;
+  const freshCodexQuotaProfiles = codexProfiles.filter((profile) =>
+    profile.usage?.status === 'ok' && Date.now() - profile.usage.fetchedAt <= 10 * 60_000);
+  const codexQuotaEvidence = freshCodexQuotaProfiles.length ? freshCodexQuotaProfiles : codexProfiles;
+  const codexQuotaColumnEvidence = (['primary', 'secondary'] as const).flatMap((key) => {
+    const visibleWindows = codexQuotaEvidence
+      .map((profile) => effectiveCodexQuota(profile)[key])
+      .filter((candidate) => candidate !== null);
+    if (!visibleWindows.length) return [];
+    const durationWindows = codexProfiles
+      .map((profile) => effectiveCodexQuota(profile)[key])
+      .filter((candidate) => candidate !== null);
+    return [{
+      key,
+      durations: (durationWindows.length ? durationWindows : visibleWindows)
+        .map((window) => window.windowDurationMins),
+    }];
+  });
+  const codexQuotaColumns = codexQuotaColumnEvidence.map((column, index, columns) => ({
+    ...column,
+    ...quotaColumnPresentation(column.durations, index, columns.length),
+  }));
+  const claudeTableLayout = accountTableLayout(W, profiles.length, 2);
+  const codexTableLayout = accountTableLayout(W, codexProfiles.length, codexQuotaColumns.length);
+  const headerPrefix = (layout: ReturnType<typeof accountTableLayout>) => layout.showIndex
+    ? `${'  '}${pad('#', layout.indexWidth + 1)}${'  '}`
+    : '    ';
+  const claudeHeaderPrefix = headerPrefix(claudeTableLayout);
+  const codexHeaderPrefix = headerPrefix(codexTableLayout);
+  const codexBestQuota = codexBest.target ? effectiveCodexQuota(codexBest.target) : null;
+  const codexBestLabels = {
+    primary: codexBestQuota?.primary
+      ? formatQuotaWindowLabel(codexBestQuota.primary.windowDurationMins).toLowerCase()
+      : 'primary',
+    secondary: codexBestQuota?.secondary
+      ? formatQuotaWindowLabel(codexBestQuota.secondary.windowDurationMins).toLowerCase()
+      : 'secondary',
+  };
   const providerColor = provider === 'claude' ? CLAUDE_ORANGE : CODEX_BLUE;
   const providerName = provider === 'claude' ? 'Claude' : 'Codex';
 
@@ -2157,186 +2281,97 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       </Box>
       {mode === 'list' ? (provider === 'claude' ? (
         <Box width={W} borderStyle="round" borderColor={CLAUDE_ORANGE} paddingX={1} flexDirection="column">
-          <Text bold>
-            <Text color={CLAUDE_ORANGE}>Claude</Text> <Text color="white">Account Switch</Text>{' '}
-            <Text dimColor>v{APP_VERSION}</Text>
-            {newVersion ? <Text color="yellow"> · update available (v{newVersion})</Text> : null}
-          </Text>
+          <Box justifyContent="space-between">
+            <Text bold><Text color={CLAUDE_ORANGE}>Claude</Text> Account Switch <Text dimColor>v{APP_VERSION}</Text></Text>
+            <Text dimColor>{profiles.length} accounts · AGPL</Text>
+          </Box>
+          {newVersion ? <Text color="yellow">Update available: v{newVersion}</Text> : null}
           {compactHero ? (
             <Box marginTop={1} flexDirection="column">
-              <Text wrap="truncate-end"><Text dimColor>active: </Text>{active ? <><Text color="green">● </Text><Text bold>{active.label}</Text><Text dimColor> · {active.email}</Text></> : <Text dimColor>none</Text>}</Text>
-              {selected ? (
-                <>
-                  <Text wrap="truncate-end"><Text dimColor>{selected.id === store.activeProfileId ? 'selected/active: ' : 'selected: '}</Text><Text bold>{selected.label}</Text>{' '}<Text color={planColor(selected.subscriptionType)}>{(selected.subscriptionType ?? '?').toUpperCase()}</Text></Text>
-                  <Text dimColor wrap="truncate-end">{selected.email}</Text>
-                  <Text><Text dimColor>quota </Text><Text color={utilColor(selected.usage?.five_hour?.utilization ?? null)}>5h {fmtPct(selected.usage?.five_hour?.utilization)}</Text><Text dimColor> · </Text><Text color={utilColor(selected.usage?.seven_day?.utilization ?? null)}>7d {fmtPct(selected.usage?.seven_day?.utilization)}</Text>{selected.usage?.status === 'stale' ? <Text dimColor> · cached</Text> : null}</Text>
-                  {asTime(selected.claudeAiOauth?.refreshTokenExpiresAt) ? <Text dimColor wrap="truncate-end">login renewal {relMs(asTime(selected.claudeAiOauth?.refreshTokenExpiresAt))}</Text> : null}
-                </>
-              ) : null}
-              <Text dimColor>{profiles.length} saved{claudeBest.target ? ` · best now: ${claudeBest.target.label}` : ''}</Text>
+              <Text wrap="truncate-end"><Text dimColor>active  </Text>{active ? <><Text color="green">{activeGlyph} </Text><Text bold>{accountListLabel(active.label, active.email)}</Text>{' '}<Text color={planColor(active.subscriptionType)}>{formatPlanLabel(active.subscriptionType)}</Text></> : <Text dimColor>none</Text>}</Text>
+              {selected ? <Text><Text dimColor>quota   </Text><Text color={utilColor(selected.usage?.five_hour?.utilization ?? null)}>5h {fmtPct(selected.usage?.five_hour?.utilization)}</Text><Text dimColor> · </Text><Text color={utilColor(selected.usage?.seven_day?.utilization ?? null)}>7d {fmtPct(selected.usage?.seven_day?.utilization)}</Text>{selected.usage?.status === 'stale' ? <Text dimColor> · cached</Text> : null}</Text> : null}
+              {claudeBest.target ? <Text><Text dimColor>best    </Text><Text color={claudeBest.confidence === 'high' ? 'green' : 'yellow'}>{claudeBest.target.label}</Text><Text dimColor> · {bestNowDetail(claudeBest)}</Text></Text> : null}
             </Box>
           ) : (
-          <Box marginTop={1} width={W - 2}>
-            <Box width={leftW} flexDirection="column" alignItems="center">
-              <Box flexDirection="column">
-                <Text color={CLAUDE_ORANGE}>{' ▐▛███▜▌'}</Text>
-                <Text color={CLAUDE_ORANGE}>{'▝▜█████▛▘'}</Text>
-                <Text color={CLAUDE_ORANGE}>{'  ▘▘ ▝▝'}</Text>
-              </Box>
-              <Box marginTop={1} flexDirection="column" alignItems="center">
-                <Text>
-                  Welcome back, <Text bold color="white">{active ? active.label : 'there'}</Text>!
-                </Text>
+            <Box marginTop={1} width={W - 2}>
+              <Box width={leftW} flexDirection="column" alignItems="center">
+                <ClaudePulseMark frame={motionFrame} />
                 {active ? (
-                  <Text>
-                    <Text color={planColor(active.subscriptionType)}>
-                      Claude {(active.subscriptionType ?? '').toUpperCase()}
-                    </Text>
-                    <Text dimColor> · {active.email}</Text>
-                  </Text>
-                ) : (
-                  <Text dimColor>No account selected</Text>
-                )}
+                  <Box marginTop={1} flexDirection="column" alignItems="center" width={leftW - 2}>
+                    <Text wrap="truncate-end"><Text color="green">{activeGlyph} </Text><Text bold>{active.label}</Text></Text>
+                    <Text color={planColor(active.subscriptionType)}>CLAUDE {formatPlanLabel(active.subscriptionType)}</Text>
+                  </Box>
+                ) : <Text dimColor>No active account</Text>}
+              </Box>
+              <Box flexDirection="column" flexGrow={1} borderStyle="single" borderColor="gray" borderTop={false} borderRight={false} borderBottom={false} paddingLeft={2}>
+                <Text bold color="white">SELECTED ACCOUNT</Text>
+                {selected ? (
+                  <Box flexDirection="column">
+                    <Text wrap="truncate-end"><Text color={selected.id === store.activeProfileId ? 'green' : 'cyanBright'}>{selected.id === store.activeProfileId ? activeGlyph : '○'} </Text><Text bold>{accountListLabel(selected.label, selected.email)}</Text>{'  '}<Text color={planColor(selected.subscriptionType)}>{formatPlanLabel(selected.subscriptionType)}</Text></Text>
+                    <Text dimColor>{accountSecondaryIdentity(selected.label, selected.email) ? `${accountSecondaryIdentity(selected.label, selected.email)} · ` : ''}{selected.id === store.activeProfileId ? 'active' : 'ready to switch'}{selected.planObservedAt ? ` · plan checked ${relMs(selected.planObservedAt)} via ${selected.planSource === 'claude-auth-status' ? 'official CLI' : 'saved OAuth'}` : ''}</Text>
+                    {hasCliAuth(selected) && selected.usage && (selected.usage.status === 'ok' || selected.usage.status === 'stale') ? (
+                      <>
+                        <HeroQuotaLine label="5h" usedPercent={selected.usage.five_hour?.utilization} reset={quotaResetLabel(selected.usage.five_hour?.utilization, selected.usage.five_hour?.resets_at)} />
+                        <HeroQuotaLine label="7d" usedPercent={selected.usage.seven_day?.utilization} reset={quotaResetLabel(selected.usage.seven_day?.utilization, selected.usage.seven_day?.resets_at)} />
+                        {selected.usage.status === 'stale' ? <Text dimColor>cached · live refresh unavailable</Text> : null}
+                      </>
+                    ) : selected.needsReauth ? <Text color="red">⚠ Login renewal required — press a to re-add</Text> : !hasCliAuth(selected) ? <Text dimColor>Desktop-only · quota unavailable</Text> : <Text dimColor>Press u to load quota</Text>}
+                    {asTime(selected.claudeAiOauth?.refreshTokenExpiresAt) ? <Text dimColor>login renewal {relMs(asTime(selected.claudeAiOauth?.refreshTokenExpiresAt))}</Text> : null}
+                  </Box>
+                ) : <Text dimColor>No account selected</Text>}
+                {claudeBest.target ? <Text><Text dimColor>best now  </Text><Text color={claudeBest.confidence === 'high' ? 'green' : 'yellow'}>{claudeBest.target.label}</Text><Text dimColor> · {bestNowDetail(claudeBest)}</Text></Text> : null}
               </Box>
             </Box>
-            <Box
-              flexDirection="column"
-              flexGrow={1}
-              borderStyle="single"
-              borderColor="gray"
-              borderTop={false}
-              borderRight={false}
-              borderBottom={false}
-              paddingLeft={2}
-            >
-              <Text bold color="white">
-                Your accounts <Text dimColor>· {profiles.length} saved</Text>
-              </Text>
-              {selected ? (
-                <Box marginTop={1} flexDirection="column">
-                  <Text>
-                    <Text dimColor>{selected.id === store.activeProfileId ? 'active ' : 'viewing '}</Text>
-                    <Text color={selected.id === store.activeProfileId ? 'green' : 'cyanBright'}>●</Text>{' '}
-                    <Text bold color="white">{selected.label}</Text>{' '}
-                    <Text color={planColor(selected.subscriptionType)}>{(selected.subscriptionType ?? '').toUpperCase()}</Text>
-                  </Text>
-                  {selected.planObservedAt ? (
-                    <Text dimColor>{'   '}plan confirmed {relMs(selected.planObservedAt)} via {selected.planSource === 'claude-auth-status' ? 'official CLI' : 'saved OAuth'}</Text>
-                  ) : null}
-                  {(() => {
-                    const expiry = asTime(selected.claudeAiOauth?.refreshTokenExpiresAt);
-                    if (!expiry) return null;
-                    const urgent = expiry - Date.now() <= 5 * 24 * 60 * 60 * 1000;
-                    return <Text color={urgent ? 'yellow' : undefined} dimColor={!urgent}>{'   '}login renewal {relMs(expiry)}{urgent ? ' — re-add before expiry' : ''}</Text>;
-                  })()}
-                  {!hasCliAuth(selected) ? (
-                    selected.needsReauth ? (
-                      <Text color="red">{'   ⚠ login expired — press "a" to re-add this account'}</Text>
-                    ) : (
-                      <Text dimColor>{'   Desktop-only account — usage not available'}</Text>
-                    )
-                  ) : selected.usage && (selected.usage.status === 'ok' || selected.usage.status === 'stale') ? (
-                    <>
-                      <Text>
-                        {'   5h  '}
-                        <Text color={utilColor(selected.usage.five_hour?.utilization ?? null)}>
-                          {fmtPct(selected.usage.five_hour?.utilization).padEnd(5)}
-                        </Text>
-                        <Text dimColor>{quotaResetLabel(selected.usage.five_hour?.utilization, selected.usage.five_hour?.resets_at)}</Text>
-                      </Text>
-                      <Text>
-                        {'   7d  '}
-                        <Text color={utilColor(selected.usage.seven_day?.utilization ?? null)}>
-                          {fmtPct(selected.usage.seven_day?.utilization).padEnd(5)}
-                        </Text>
-                        <Text dimColor>{quotaResetLabel(selected.usage.seven_day?.utilization, selected.usage.seven_day?.resets_at)}</Text>
-                      </Text>
-                      {selected.needsReauth ? (
-                        <Text color="red">{'   ⚠ login expired — press "a" to re-add (numbers are last-known)'}</Text>
-                      ) : selected.usage.status === 'stale' ? (
-                        <Text dimColor>{selected.needsReauth ? '   (cached — login renewal required)' : '   (cached — live refresh unavailable)'}</Text>
-                      ) : null}
-                      {/* PROMO: Fable 50% through 2026-07-19 — auto-hidden at FABLE_PROMO_END. */}
-                      {(() => {
-                        if (Date.now() >= FABLE_PROMO_END) return null;
-                        const fable = selected.usage.models?.find((m) => /fable/i.test(m.name));
-                        if (!fable) return null;
-                        return (
-                          <Text>
-                            {'   Fable '}
-                            <Text color={utilColor(fable.utilization)}>{fmtPct(fable.utilization).padEnd(5)}</Text>
-                            <Text dimColor>promo (through Jul 19)</Text>
-                          </Text>
-                        );
-                      })()}
-                    </>
-                  ) : selected.needsReauth ? (
-                    <Text color="red">{'   ⚠ login expired — press "a" to re-add this account'}</Text>
-                  ) : selected.usage?.status === 'rate_limited' ? (
-                    <Text dimColor>{'   rate-limited — usage will refresh shortly'}</Text>
-                  ) : (
-                    <Text dimColor>{'   loading usage… (press u to force refresh)'}</Text>
-                  )}
-                </Box>
-              ) : null}
-              {claudeBest.target ? (
-                <Text>
-                  <Text dimColor>best now: </Text>
-                  <Text color={claudeBest.confidence === 'high' ? 'green' : 'yellow'}>{claudeBest.target.label}</Text>
-                  <Text dimColor> · {bestNowDetail(claudeBest)}</Text>
-                </Text>
-              ) : claudeBest.reason === 'all-exhausted' && claudeBest.nextAvailableAt ? (
-                <Text dimColor>best now: none · next reset in {resetIn(new Date(claudeBest.nextAvailableAt).toISOString())}</Text>
-              ) : claudeBest.reason === 'reserve-protected' ? (
-                <Text dimColor>best now: reserve protected · keeping the final 5% headroom</Text>
-              ) : null}
-            </Box>
-          </Box>
           )}
         </Box>
       ) : (
         <Box width={W} borderStyle="round" borderColor={CODEX_BLUE} paddingX={1} flexDirection="column">
-          <Text bold><Text color={CODEX_BLUE}>Codex</Text> <Text color="white">Account Switch</Text>{' '}<Text dimColor>v{APP_VERSION}</Text></Text>
+          <Box justifyContent="space-between">
+            <Text bold><Text color={CODEX_BLUE}>Codex</Text> Account Switch <Text dimColor>v{APP_VERSION}</Text></Text>
+            <Text dimColor>{codexProfiles.length} accounts · AGPL</Text>
+          </Box>
+          {newVersion ? <Text color="yellow">Update available: v{newVersion}</Text> : null}
           {compactHero ? (
             <Box marginTop={1} flexDirection="column">
-              <Text wrap="truncate-end"><Text dimColor>active: </Text>{codexActive ? <><Text color="green">● </Text><Text bold>{codexActive.label}</Text><Text dimColor> · {codexActive.email}</Text></> : <Text dimColor>none</Text>}</Text>
-              {codexSelected ? (
-                <>
-                  <Text wrap="truncate-end"><Text dimColor>{codexSelected.id === codexStore.activeProfileId ? 'selected/active: ' : 'selected: '}</Text><Text bold>{codexSelected.label}</Text>{' '}<Text color={planColor(codexSelected.planType)}>{(codexSelected.planType ?? '?').toUpperCase()}</Text></Text>
-                  <Text dimColor wrap="truncate-end">{codexSelected.email}</Text>
-                  <Text><Text dimColor>quota </Text><Text color={utilColor(codexSelectedQuota?.primary?.usedPercent ?? null)}>5h {fmtPct(codexSelectedQuota?.primary?.usedPercent)}</Text><Text dimColor> · </Text><Text color={utilColor(codexSelectedQuota?.secondary?.usedPercent ?? null)}>7d {fmtPct(codexSelectedQuota?.secondary?.usedPercent)}</Text>{codexSelected.usage?.status === 'stale' ? <Text dimColor> · cached</Text> : null}</Text>
-                  {codexSelected.needsReauth ? <Text color="red">login renewal required</Text> : null}
-                </>
-              ) : null}
-              <Text dimColor>{codexProfiles.length} saved{codexBest.target ? ` · best now: ${codexBest.target.label}` : ''}</Text>
+              <Text wrap="truncate-end"><Text dimColor>active  </Text>{codexActive ? <><Text color="green">{activeGlyph} </Text><Text bold>{accountListLabel(codexActive.label, codexActive.email)}</Text>{' '}<Text color={planColor(codexActive.planType)}>{formatPlanLabel(codexActive.planType)}</Text></> : <Text dimColor>none</Text>}</Text>
+              {codexSelected ? <Text><Text dimColor>quota   </Text>{codexQuotaColumns.length ? codexQuotaColumns.map((column, index) => {
+                const window = codexSelectedQuota?.[column.key] ?? null;
+                const label = window ? formatQuotaWindowLabel(window.windowDurationMins).toLowerCase() : column.compactLabel.toLowerCase();
+                return <Text key={column.key}>{index ? <Text dimColor> · </Text> : null}<Text color={utilColor(window?.usedPercent ?? null)}>{label} {fmtPct(window?.usedPercent)}</Text></Text>;
+              }) : <Text dimColor>no rolling window returned</Text>}{codexSelected.usage?.status === 'stale' ? <Text dimColor> · cached</Text> : null}</Text> : null}
+              {codexBest.target ? <Text><Text dimColor>best    </Text><Text color={codexBest.confidence === 'high' ? 'green' : 'yellow'}>{codexBest.target.label}</Text><Text dimColor> · {bestNowDetail(codexBest, codexBestLabels)}</Text></Text> : null}
             </Box>
           ) : (
-          <Box marginTop={1} width={W - 2}>
-            <Box width={leftW} flexDirection="column" alignItems="center">
-              <CodexTerminalMark />
-              <Box marginTop={1} flexDirection="column" alignItems="center">
-                <Text>Welcome back, <Text bold>{codexActive?.label ?? 'there'}</Text>!</Text>
-                {codexActive ? <Text><Text color={planColor(codexActive.planType)}>Codex {(codexActive.planType ?? '').toUpperCase()}</Text><Text dimColor> · {codexActive.email}</Text></Text> : <Text dimColor>No Codex account selected</Text>}
+            <Box marginTop={1} width={W - 2}>
+              <Box width={leftW} flexDirection="column" alignItems="center">
+                <CodexBotMark frame={motionFrame} />
+                {codexActive ? (
+                  <Box marginTop={1} flexDirection="column" alignItems="center" width={leftW - 2}>
+                    <Text wrap="truncate-end"><Text color="green">{activeGlyph} </Text><Text bold>{codexActive.label}</Text></Text>
+                    <Text color={planColor(codexActive.planType)}>CODEX {formatPlanLabel(codexActive.planType)}</Text>
+                  </Box>
+                ) : <Text dimColor>No active account</Text>}
+              </Box>
+              <Box flexDirection="column" flexGrow={1} borderStyle="single" borderColor="gray" borderTop={false} borderRight={false} borderBottom={false} paddingLeft={2}>
+                <Text bold color="white">SELECTED ACCOUNT</Text>
+                {codexSelected ? (
+                  <Box flexDirection="column">
+                    <Text wrap="truncate-end"><Text color={codexSelected.id === codexStore.activeProfileId ? 'green' : 'cyanBright'}>{codexSelected.id === codexStore.activeProfileId ? activeGlyph : '○'} </Text><Text bold>{accountListLabel(codexSelected.label, codexSelected.email)}</Text>{'  '}<Text color={planColor(codexSelected.planType)}>{formatPlanLabel(codexSelected.planType)}</Text></Text>
+                    <Text dimColor>{accountSecondaryIdentity(codexSelected.label, codexSelected.email) ? `${accountSecondaryIdentity(codexSelected.label, codexSelected.email)} · ` : ''}{codexSelected.id === codexStore.activeProfileId ? 'active' : 'ready to switch'}{codexSelected.planObservedAt ? ` · plan checked ${relMs(codexSelected.planObservedAt)} via ${codexSelected.planSource === 'codex-rate-limits' ? 'quota entitlement' : codexSelected.planSource === 'codex-account' ? 'account service' : 'saved OAuth'}` : ''}</Text>
+                    {codexQuotaColumns.some((column) => codexSelectedQuota?.[column.key]) ? (
+                      <>
+                        {codexQuotaColumns.map((column) => {
+                          const window = codexSelectedQuota?.[column.key] ?? null;
+                          return window ? <HeroQuotaLine key={column.key} label={formatQuotaWindowLabel(window.windowDurationMins).toLowerCase()} usedPercent={window.usedPercent} reset={quotaResetLabel(window.usedPercent, window.resetsAt ? new Date(window.resetsAt * 1000).toISOString() : null)} /> : null;
+                        })}
+                        {codexSelected.usage?.status === 'stale' ? <Text dimColor>cached · live refresh unavailable</Text> : null}
+                      </>
+                    ) : codexSelected.needsReauth ? <Text color="red">⚠ Login renewal required — press a to re-add</Text> : codexSelected.usage?.status === 'ok' ? <Text dimColor>Provider currently returned no rolling quota window</Text> : <Text dimColor>Press u to load quota</Text>}
+                  </Box>
+                ) : <Text dimColor>No account selected</Text>}
+                {codexBest.target ? <Text><Text dimColor>best now  </Text><Text color={codexBest.confidence === 'high' ? 'green' : 'yellow'}>{codexBest.target.label}</Text><Text dimColor> · {bestNowDetail(codexBest, codexBestLabels)}</Text></Text> : null}
               </Box>
             </Box>
-            <Box flexDirection="column" flexGrow={1} borderStyle="single" borderColor="gray" borderTop={false} borderRight={false} borderBottom={false} paddingLeft={2}>
-              <Text bold>Your Codex accounts <Text dimColor>· {codexProfiles.length} saved</Text></Text>
-              {codexSelected ? (
-                <Box marginTop={1} flexDirection="column">
-                  <Text><Text dimColor>{codexSelected.id === codexStore.activeProfileId ? 'active ' : 'viewing '}</Text><Text color={codexSelected.id === codexStore.activeProfileId ? 'green' : 'cyanBright'}>●</Text>{' '}<Text bold>{codexSelected.label}</Text>{' '}<Text color={planColor(codexSelected.planType)}>{(codexSelected.planType ?? '').toUpperCase()}</Text></Text>
-                  {codexSelected.usage?.fetchedAt ? <Text dimColor>{'   '}plan/quota checked {relMs(codexSelected.usage.fetchedAt)} via official Codex app-server</Text> : null}
-                  {codexSelectedQuota?.primary || codexSelectedQuota?.secondary ? (
-                    <>
-                      <Text>{'   5h  '}<Text color={utilColor(codexSelectedQuota.primary?.usedPercent ?? null)}>{fmtPct(codexSelectedQuota.primary?.usedPercent).padEnd(5)}</Text><Text dimColor>{quotaResetLabel(codexSelectedQuota.primary?.usedPercent, codexSelectedQuota.primary?.resetsAt ? new Date(codexSelectedQuota.primary.resetsAt * 1000).toISOString() : null)}</Text></Text>
-                      <Text>{'   7d  '}<Text color={utilColor(codexSelectedQuota.secondary?.usedPercent ?? null)}>{fmtPct(codexSelectedQuota.secondary?.usedPercent).padEnd(5)}</Text><Text dimColor>{quotaResetLabel(codexSelectedQuota.secondary?.usedPercent, codexSelectedQuota.secondary?.resetsAt ? new Date(codexSelectedQuota.secondary.resetsAt * 1000).toISOString() : null)}</Text></Text>
-                      {codexSelected.usage?.status === 'stale' ? <Text dimColor>{'   cached — live refresh unavailable'}</Text> : null}
-                    </>
-                  ) : codexSelected.needsReauth ? <Text color="red">{'   ⚠ login expired — press "a" to add the account again'}</Text> : <Text dimColor>{'   press u to load Codex usage'}</Text>}
-                </Box>
-              ) : null}
-              {codexBest.target ? <Text><Text dimColor>best now: </Text><Text color={codexBest.confidence === 'high' ? 'green' : 'yellow'}>{codexBest.target.label}</Text><Text dimColor> · {bestNowDetail(codexBest)}</Text></Text> : codexBest.reason === 'all-exhausted' && codexBest.nextAvailableAt ? <Text dimColor>best now: none · next reset in {resetIn(new Date(codexBest.nextAvailableAt).toISOString())}</Text> : codexBest.reason === 'reserve-protected' ? <Text dimColor>best now: reserve protected · keeping the final 5% headroom</Text> : null}
-            </Box>
-          </Box>
           )}
         </Box>
       )) : (
@@ -2588,40 +2623,51 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
               <Text dimColor>
                 {compactTable
                   ? ultraCompactTable
-                    ? `${'    '}${pad('ACCOUNT', compactLabelW)}${pad('PLAN', 7)}`
-                    : `${'    '}${pad('ACCOUNT', compactLabelW)}${pad('PLAN', 7)}${pad('5H', 7)}${pad('7D', 7)}`
-                  : `${'    '}${pad('ACCOUNT', 18)}${pad('LINKED', 8)}${pad('EMAIL', emailW)}${pad('PLAN', 6)}${pad('5-HOUR', 12)}${pad('7-DAY', 12)}LAST ACTIVE`}
+                    ? `${codexHeaderPrefix}${pad('ACCOUNT', codexTableLayout.accountWidth)}│ ${pad('PLAN', codexTableLayout.planWidth)}`
+                    : `${codexHeaderPrefix}${pad('ACCOUNT', codexTableLayout.accountWidth)}│ ${pad('PLAN', codexTableLayout.planWidth)}${codexQuotaColumns.map((column) => `│ ${pad(column.compactLabel, codexTableLayout.usageWidth)}`).join('')}`
+                  : `${codexHeaderPrefix}${pad('ACCOUNT', codexTableLayout.accountWidth)}│ ${pad('PLAN', codexTableLayout.planWidth)}${codexQuotaColumns.map((column) => `│ ${pad(column.longLabel, codexTableLayout.usageWidth)}`).join('')}│ ${pad('STATE', codexTableLayout.stateWidth)}`}
               </Text>
+              <Divider width={W} color="#27272A" />
               {codexProfiles.slice(codexViewport.start, codexViewport.end).map((profile, offset) => {
                 const i = codexViewport.start + offset;
                 const isActive = profile.id === codexStore.activeProfileId;
                 const isCursor = i === codexCursor;
                 const quota = effectiveCodexQuota(profile);
                 return (
-                  <Box key={profile.id}>
-                    <Text color={CODEX_BLUE} bold>{isCursor ? '❯ ' : '  '}</Text>
-                    <Text color={profile.needsReauth ? 'red' : isActive ? 'green' : 'gray'}>{profile.needsReauth ? '⚠' : isActive ? '●' : '○'}{' '}</Text>
+                  <Text key={profile.id} backgroundColor={isCursor ? '#1A1A1D' : i % 2 ? '#101010' : undefined}>
+                    <Text color={CODEX_BLUE} bold>{isCursor ? cursorGlyph : '  '}</Text>
+                    {codexTableLayout.showIndex ? <Text dimColor>{formatAccountOrdinal(i, codexTableLayout.indexWidth)}{' '}</Text> : null}
+                    <Text color={profile.needsReauth ? 'red' : isActive ? 'green' : 'gray'}>{profile.needsReauth ? '⚠' : isActive ? activeGlyph : '○'}{' '}</Text>
                     {compactTable ? (
                       <>
-                        <Text bold={isCursor} color={profile.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(profile.label, compactLabelW)}</Text>
-                        <Text color={planColor(profile.planType)}>{pad((profile.planType ?? '?').toUpperCase(), 7)}</Text>
-                        {!ultraCompactTable ? <>
-                          <Text color={utilColor(quota.primary?.usedPercent ?? null)}>{pad(fmtPct(quota.primary?.usedPercent), 7)}</Text>
-                          <Text color={utilColor(quota.secondary?.usedPercent ?? null)}>{pad(fmtPct(quota.secondary?.usedPercent), 7)}</Text>
-                        </> : null}
+                        <Text bold={isCursor} color={profile.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(profile.label, profile.email), codexTableLayout.accountWidth)}</Text>
+                        <ColumnRule />
+                        <Text color={planColor(profile.planType)}>{pad(formatPlanLabel(profile.planType), codexTableLayout.planWidth)}</Text>
+                        {!ultraCompactTable ? codexQuotaColumns.map((column) => {
+                          const window = quota[column.key];
+                          const value = column.mixedDuration && window
+                            ? `${formatQuotaWindowLabel(window.windowDurationMins).toLowerCase()} ${fmtPct(window.usedPercent)}`
+                            : fmtPct(window?.usedPercent);
+                          return <Text key={column.key}><ColumnRule /><Text color={utilColor(window?.usedPercent ?? null)}>{pad(value, codexTableLayout.usageWidth)}</Text></Text>;
+                        }) : null}
                       </>
                     ) : (
                       <>
-                        <Text bold={isCursor} color={profile.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(profile.label, 18)}</Text>
-                        <Text dimColor>{pad('APP+CLI', 8)}</Text>
-                        <Text dimColor>{pad(profile.email, emailW)}</Text>
-                        <Text color={planColor(profile.planType)}>{pad((profile.planType ?? '?').toUpperCase(), 6)}</Text>
-                        <UsageCell win={quota.primary ? { utilization: quota.primary.usedPercent } : null} />
-                        <UsageCell win={quota.secondary ? { utilization: quota.secondary.usedPercent } : null} />
-                        {isActive ? <Text color="green">{pad('in use', 11)}</Text> : <Text dimColor>{pad(relTime(profile.lastUsedAt), 11)}</Text>}
+                        <Text bold={isCursor} color={profile.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(profile.label, profile.email), codexTableLayout.accountWidth)}</Text>
+                        <ColumnRule />
+                        <Text color={planColor(profile.planType)}>{pad(formatPlanLabel(profile.planType), codexTableLayout.planWidth)}</Text>
+                        {codexQuotaColumns.map((column) => {
+                          const window = quota[column.key];
+                          return <Text key={column.key}><ColumnRule /><UsageCell
+                            win={window ? { utilization: window.usedPercent } : null}
+                            windowLabel={column.mixedDuration && window ? formatQuotaWindowLabel(window.windowDurationMins) : null}
+                          /></Text>;
+                        })}
+                        <ColumnRule />
+                        {profile.needsReauth ? <Text color="red">{pad('REAUTH', codexTableLayout.stateWidth)}</Text> : isActive ? <Text color="green">{pad('ACTIVE', codexTableLayout.stateWidth)}</Text> : <Text dimColor>{pad(relTime(profile.lastUsedAt), codexTableLayout.stateWidth)}</Text>}
                       </>
                     )}
-                  </Box>
+                  </Text>
                 );
               })}
               {codexProfiles.length > listCapacity ? (
@@ -2666,44 +2712,51 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
               <Text dimColor>
                 {compactTable
                   ? ultraCompactTable
-                    ? `${'    '}${pad('ACCOUNT', compactLabelW)}${pad('PLAN', 7)}`
-                    : `${'    '}${pad('ACCOUNT', compactLabelW)}${pad('PLAN', 7)}${pad('5H', 7)}${pad('7D', 7)}`
-                  : `${'    '}${pad('ACCOUNT', 18)}${pad('LINKED', 8)}${pad('EMAIL', emailW)}${pad('PLAN', 6)}${pad('5-HOUR', 12)}${pad('7-DAY', 12)}LAST ACTIVE`}
+                    ? `${claudeHeaderPrefix}${pad('ACCOUNT', claudeTableLayout.accountWidth)}│ ${pad('PLAN', claudeTableLayout.planWidth)}`
+                    : `${claudeHeaderPrefix}${pad('ACCOUNT', claudeTableLayout.accountWidth)}│ ${pad('PLAN', claudeTableLayout.planWidth)}│ ${pad('5H', claudeTableLayout.usageWidth)}│ ${pad('7D', claudeTableLayout.usageWidth)}`
+                  : `${claudeHeaderPrefix}${pad('ACCOUNT', claudeTableLayout.accountWidth)}│ ${pad('PLAN', claudeTableLayout.planWidth)}│ ${pad('5-HOUR', claudeTableLayout.usageWidth)}│ ${pad('7-DAY', claudeTableLayout.usageWidth)}│ ${pad('STATE', claudeTableLayout.stateWidth)}`}
               </Text>
+              <Divider width={W} color="#27272A" />
               {profiles.slice(claudeViewport.start, claudeViewport.end).map((p, offset) => {
                 const i = claudeViewport.start + offset;
                 const isActive = p.id === store.activeProfileId;
                 const isCursor = i === cursor;
                 const linked = [hasCliAuth(p) ? 'CLI' : null, p.desktopSnapshotDir ? 'DSK' : null].filter(Boolean).join('+');
                 return (
-                  <Box key={p.id}>
+                  <Text key={p.id} backgroundColor={isCursor ? '#1A1A1D' : i % 2 ? '#101010' : undefined}>
                     <Text color="cyanBright" bold>
-                      {isCursor ? '❯ ' : '  '}
+                      {isCursor ? cursorGlyph : '  '}
                     </Text>
+                    {claudeTableLayout.showIndex ? <Text dimColor>{formatAccountOrdinal(i, claudeTableLayout.indexWidth)}{' '}</Text> : null}
                     <Text color={p.needsReauth ? 'red' : isActive ? 'green' : 'gray'}>
-                      {p.needsReauth ? '⚠' : isActive ? '●' : '○'}{' '}
+                      {p.needsReauth ? '⚠' : isActive ? activeGlyph : '○'}{' '}
                     </Text>
                     {compactTable ? (
                       <>
-                        <Text bold={isCursor} color={p.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(p.label, compactLabelW)}</Text>
-                        <Text color={planColor(p.subscriptionType)}>{pad((p.subscriptionType ?? '?').toUpperCase(), 7)}</Text>
+                        <Text bold={isCursor} color={p.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(p.label, p.email), claudeTableLayout.accountWidth)}</Text>
+                        <ColumnRule />
+                        <Text color={planColor(p.subscriptionType)}>{pad(formatPlanLabel(p.subscriptionType), claudeTableLayout.planWidth)}</Text>
                         {!ultraCompactTable ? <>
-                          <Text color={utilColor(p.usage?.five_hour?.utilization ?? null)}>{pad(fmtPct(p.usage?.five_hour?.utilization), 7)}</Text>
-                          <Text color={utilColor(p.usage?.seven_day?.utilization ?? null)}>{pad(fmtPct(p.usage?.seven_day?.utilization), 7)}</Text>
+                          <ColumnRule />
+                          <Text color={utilColor(p.usage?.five_hour?.utilization ?? null)}>{pad(fmtPct(p.usage?.five_hour?.utilization), claudeTableLayout.usageWidth)}</Text>
+                          <ColumnRule />
+                          <Text color={utilColor(p.usage?.seven_day?.utilization ?? null)}>{pad(fmtPct(p.usage?.seven_day?.utilization), claudeTableLayout.usageWidth)}</Text>
                         </> : null}
                       </>
                     ) : (
                       <>
-                        <Text bold={isCursor} color={p.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(p.label, 18)}</Text>
-                        <Text dimColor>{pad(linked, 8)}</Text>
-                        <Text dimColor>{pad(p.email, emailW)}</Text>
-                        <Text color={planColor(p.subscriptionType)}>{pad((p.subscriptionType ?? '?').toUpperCase(), 6)}</Text>
+                        <Text bold={isCursor} color={p.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(p.label, p.email), claudeTableLayout.accountWidth)}</Text>
+                        <ColumnRule />
+                        <Text color={planColor(p.subscriptionType)}>{pad(formatPlanLabel(p.subscriptionType), claudeTableLayout.planWidth)}</Text>
+                        <ColumnRule />
                         <UsageCell win={p.usage?.five_hour} />
+                        <ColumnRule />
                         <UsageCell win={p.usage?.seven_day} />
-                        {isActive ? <Text color="green">{pad('in use', 11)}</Text> : <Text dimColor>{pad(relTime(p.lastUsedAt), 11)}</Text>}
+                        <ColumnRule />
+                        {p.needsReauth ? <Text color="red">{pad('REAUTH', claudeTableLayout.stateWidth)}</Text> : isActive ? <Text color="green">{pad('ACTIVE', claudeTableLayout.stateWidth)}</Text> : <Text dimColor>{pad(linked || relTime(p.lastUsedAt), claudeTableLayout.stateWidth)}</Text>}
                       </>
                     )}
-                  </Box>
+                  </Text>
                 );
               })}
               {profiles.length > listCapacity ? (
@@ -2769,29 +2822,13 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           </Box>
         ) : status ? <Text color="yellow">{status}</Text> : null}
         {mode === 'list' ? (
-          <>
-            <Text dimColor>
-              <Text color="cyan">↑/↓</Text> move · <Text color="cyan">⏎</Text> switch · <Text color="cyan">b</Text>{' '}
-              best-now · <Text color="cyan">l</Text> headroom · <Text color="cyan">u</Text> refresh · <Text color="cyan">PgUp/PgDn</Text> page
-              {' · '}<Text color="cyan">g/G</Text> first/last · <Text color="cyan">/</Text> search · <Text color="cyan">?</Text> help
-            </Text>
-            {provider === 'claude' ? (
-              <Text dimColor>
-                <Text color="cyan">a</Text> add · <Text color="cyan">A</Text> add Desktop · <Text color="cyan">i/I</Text> import/import-all ·{' '}
-                <Text color="cyan">e</Text> export · <Text color="cyan">E</Text> export-all · <Text color="cyan">r</Text> rename ·{' '}
-                <Text color="cyan">d</Text> archive · <Text color="cyan">z</Text> restore · <Text color="cyan">S</Text> setup · <Text color="cyan">q</Text> quit
-              </Text>
-            ) : (
-              <Text dimColor>
-                <Text color={CODEX_BLUE}>a</Text> add · <Text color={CODEX_BLUE}>i/I</Text> import/import-all · <Text color={CODEX_BLUE}>e</Text> export ·{' '}
-                <Text color={CODEX_BLUE}>E</Text> export-all · <Text color={CODEX_BLUE}>r</Text> rename · <Text color={CODEX_BLUE}>d</Text> archive ·{' '}
-                <Text color={CODEX_BLUE}>z</Text> restore ·{' '}
-                <Text color={CODEX_BLUE}>S</Text> setup · <Text color={CODEX_BLUE}>q</Text> quit
-              </Text>
-            )}
-          </>
+          <Text dimColor>
+            <Text color={providerColor}>↑/↓</Text> select · <Text color={providerColor}>⏎</Text> switch ·{' '}
+            <Text color={providerColor}>b</Text> best · <Text color={providerColor}>u</Text> refresh ·{' '}
+            <Text color={providerColor}>a</Text> add · <Text color={providerColor}>/</Text> find ·{' '}
+            <Text color={providerColor}>?</Text> all commands · <Text color={providerColor}>q</Text> quit
+          </Text>
         ) : null}
-        <Text dimColor>log: {logFile()}</Text>
       </Box>
     </Box>
   );
@@ -2818,7 +2855,11 @@ Usage:
   switch.cmd keep-alive install  Schedule keep-alive only (no shortcuts)
   switch.cmd --help          This help
 
-Data & logs live in ~/.claude-switch/`);
+Data & logs live in ~/.claude-switch/
+
+Copyright (C) 2026 LightZirconite
+License: AGPL-3.0-or-later (see LICENSE; no warranty)
+Source: https://git.justw.tf/LightZirconite/claude-account-switch`);
 }
 
 function asTime(value: unknown): number | null {
@@ -2961,8 +3002,12 @@ async function printCodexDoctor(): Promise<void> {
     console.log(`Effective credential store: ${live.credentialStore ?? 'auto/default'}`);
     if (liveAuth) {
       const email = live.account?.email ?? savedLiveProfile?.email ?? '(unknown)';
-      const plan = live.account?.planType ?? savedLiveProfile?.planType ?? 'unknown plan';
-      console.log(`Live account: ${email} (${plan})`);
+      const plan = resolveCodexPlan(live, savedLiveProfile?.planType);
+      const planLabel = formatPlanLabel(plan.planType);
+      const providerDetail = plan.planType && planLabel.toLowerCase() !== plan.planType.toLowerCase()
+        ? `; provider=${plan.planType}`
+        : '';
+      console.log(`Live account: ${email} (${planLabel}; source=${plan.source ?? savedLiveProfile?.planSource ?? 'saved'}${providerDetail})`);
     } else {
       console.log('Live account: not logged in with ChatGPT');
     }
@@ -2976,12 +3021,20 @@ async function printCodexDoctor(): Promise<void> {
   console.log('Saved profiles:');
   for (const profile of store.profiles) {
     const bucket = effectiveCodexQuota(profile);
-    const primary = bucket.primary ? `${bucket.primary.usedPercent}%` : bucket.primaryComplete ? 'n/a' : '?';
-    const secondary = bucket.secondary ? `${bucket.secondary.usedPercent}%` : bucket.secondaryComplete ? 'n/a' : '?';
+    const windows = (['primary', 'secondary'] as const).flatMap((key) => {
+      const window = bucket[key];
+      if (window) return [`${formatQuotaWindowLabel(window.windowDurationMins).toLowerCase()}=${window.usedPercent}%`];
+      const complete = key === 'primary' ? bucket.primaryComplete : bucket.secondaryComplete;
+      return complete ? [] : [`${key}=?`];
+    });
     const flags = [profile.id === store.activeProfileId ? 'active' : null, profile.needsReauth ? 'needs re-add' : null]
       .filter(Boolean).join(', ') || 'saved';
-    console.log(`  - ${profile.label} <${profile.email}> [${flags}] plan=${profile.planType ?? 'unknown'}`);
-    console.log(`    usage: ${profile.usage?.status ?? 'never'}; 5h=${primary}; 7d=${secondary}`);
+    const planLabel = formatPlanLabel(profile.planType);
+    const providerDetail = profile.planType && planLabel.toLowerCase() !== profile.planType.toLowerCase()
+      ? ` [provider=${profile.planType}]`
+      : '';
+    console.log(`  - ${profile.label} <${profile.email}> [${flags}] plan=${planLabel}${providerDetail}`);
+    console.log(`    usage: ${profile.usage?.status ?? 'never'}; ${windows.join('; ') || 'no rolling window'}`);
   }
 }
 

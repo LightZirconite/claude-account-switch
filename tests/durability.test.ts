@@ -1243,6 +1243,29 @@ test('file-backed Codex reconciliation accepts the official null-email account p
   assert.equal(readCodexAuth(codexProfileHome(reconciled.profile!.id))?.tokens.refresh_token, auth.tokens.refresh_token);
 });
 
+test('live Codex reconciliation persists the quota-backed Pro plan over stale account metadata', async () => {
+  resetRoot();
+  const auth = codexAuth('codex-upgraded-plan', 'upgraded@example.test');
+  writeJson(codexAuthPath(), auth);
+
+  const reconciled = await reconcileLiveCodex(false, {
+    inspect: async () => ({
+      credentialStore: 'file',
+      account: { type: 'chatgpt', email: 'upgraded@example.test', planType: 'plus' },
+      requiresOpenaiAuth: false,
+      rateLimits: {
+        rateLimits: { limitId: 'codex', planType: 'prolite' },
+        rateLimitsByLimitId: {},
+      },
+    }),
+  });
+
+  assert.equal(reconciled.profile?.planType, 'prolite');
+  assert.equal(reconciled.profile?.planSource, 'codex-rate-limits');
+  assert.ok((reconciled.profile?.planObservedAt ?? 0) > 0);
+  assert.equal(loadCodexStore().profiles[0]?.planType, 'prolite');
+});
+
 test('raw Claude imports accept comments and trailing commas without exposing token fragments', () => {
   resetRoot();
   const creds = path.join(root, 'raw', '.credentials.json');
