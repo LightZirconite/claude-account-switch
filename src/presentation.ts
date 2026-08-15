@@ -117,7 +117,7 @@ export function commandHelpPages(provider: ProviderId): CommandHelpPage[] {
         {
           title: 'CONTEXTUAL CONTROLS',
           entries: [
-            { id: 'setup', key: 'S', description: 'Open shortcuts and scheduled-maintenance setup' },
+            { id: 'setup', key: 'S / M', description: 'Open setup / show the encrypted Windows → Linux migration' },
             { id: 'setup-actions', key: 'i / x inside setup', description: 'Install / uninstall the shown integrations' },
             { id: 'confirm', key: 'y / n', description: 'Accept / reject a switch or archive confirmation' },
             { id: 'submit-back', key: 'Enter / Esc', description: 'Submit or save / cancel or go back safely' },
@@ -139,7 +139,7 @@ export function commandHelpPages(provider: ProviderId): CommandHelpPage[] {
             { id: 'cli-import', key: 'import [--provider P] <path>', description: 'Import every valid account represented by one source' },
             { id: 'cli-import-all', key: 'import-all [--provider P] <path>', description: 'Explicit bulk-import alias for a bundle or folder' },
             { id: 'cli-export-all', key: 'export-all [claude|codex]', description: 'Create a new timestamped provider bundle' },
-            { id: 'cli-doctor', key: 'doctor [all|claude|codex]', description: 'Diagnose stores and accounts without printing secrets' },
+            { id: 'cli-doctor', key: 'doctor [all|claude|codex|linux]', description: 'Diagnose stores and accounts without printing secrets' },
           ],
         },
       ],
@@ -154,8 +154,8 @@ export function commandHelpPages(provider: ProviderId): CommandHelpPage[] {
             { id: 'cli-dry-run', key: '--dry-run', description: 'Preview exactly which live keys a switch would change' },
             { id: 'cli-restore', key: 'restore <provider> [backup]', description: 'Restore one provider live-auth backup transactionally' },
             { id: 'cli-install', key: 'install / uninstall', description: 'Add / remove shortcuts and scheduled maintenance' },
-            { id: 'cli-keep-alive', key: 'keep-alive', description: 'Refresh due tokens and report required logins now' },
-            { id: 'cli-keep-alive-job', key: 'keep-alive install|uninstall', description: 'Add / remove only the scheduled keep-alive job' },
+            { id: 'cli-keep-alive', key: 'keep-alive [install|uninstall]', description: 'Run now or add / remove only its scheduled job' },
+            { id: 'cli-migration', key: 'migration … / linux-desktop …', description: 'Move all state and configure CachyOS Desktop apps safely' },
             { id: 'cli-help', key: '--help / -h', description: 'Print the non-interactive command reference' },
           ],
         },

@@ -5,7 +5,23 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { getLiveAccount } from '../src/claudeStore';
-import { credentialsPath } from '../src/paths';
+import { credentialsPath, xdgConfigHome, xdgDataHome } from '../src/paths';
+
+test('freedesktop base directory overrides are honored without changing HOME', () => {
+  const previousConfig = process.env.XDG_CONFIG_HOME;
+  const previousData = process.env.XDG_DATA_HOME;
+  try {
+    process.env.XDG_CONFIG_HOME = '/tmp/custom config';
+    process.env.XDG_DATA_HOME = '/tmp/custom data';
+    assert.equal(xdgConfigHome(), '/tmp/custom config');
+    assert.equal(xdgDataHome(), '/tmp/custom data');
+  } finally {
+    if (previousConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousConfig;
+    if (previousData === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = previousData;
+  }
+});
 
 test('Claude live auth uses the official dotted store when a stale undotted artifact also exists', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'switch-claude-path-test-'));

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
-import { atomicCopyFile, atomicWriteFile, ensurePrivateDir } from '../src/atomicFile';
+import { atomicCopyFile, atomicCopyFileRange, atomicWriteFile, ensurePrivateDir } from '../src/atomicFile';
 import { logger, redactText, redactValue } from '../src/logger';
 
 function tempRoot(t: TestContext): string {
@@ -84,6 +84,19 @@ test('atomicCopyFile copies bytes and leaves an existing target untouched when s
 
   assert.throws(() => atomicCopyFile(path.join(root, 'missing.bin'), target));
   assert.deepEqual(fs.readFileSync(target), content);
+});
+
+test('atomicCopyFileRange streams only the requested bytes and rejects an oversized range', (t) => {
+  const root = tempRoot(t);
+  const source = path.join(root, 'source.bin');
+  const target = path.join(root, 'target.bin');
+  const content = Buffer.alloc(3 * 1024 * 1024 + 17);
+  for (let index = 0; index < content.length; index++) content[index] = index % 251;
+  fs.writeFileSync(source, content);
+
+  atomicCopyFileRange(source, 1024 * 1024 - 3, 2 * 1024 * 1024 + 9, target);
+  assert.deepEqual(fs.readFileSync(target), content.subarray(1024 * 1024 - 3, 3 * 1024 * 1024 + 6));
+  assert.throws(() => atomicCopyFileRange(source, content.length - 1, 2, target), /exceeds/i);
 });
 
 test('redactValue recursively removes secret fields, embedded tokens, and URL query values', () => {

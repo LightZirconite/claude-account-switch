@@ -29,7 +29,7 @@ locks. A Codex operation never writes Claude files, and a Claude operation never
 
 ## Setup
 
-Requires Node.js `>=20.3.0` and the official Claude/Codex CLIs for the providers you use.
+Requires Node.js `>=22.0.0` and the official Claude/Codex CLIs for the providers you use.
 
 Windows:
 
@@ -59,6 +59,10 @@ switch.cmd uninstall
 On macOS and Linux, use `node dist/cli.js install` and
 `node dist/cli.js uninstall` instead. The installer reports shortcut and scheduler results
 independently, so a platform integration failure is visible without hiding successful steps.
+Linux follows the XDG base-directory and user-directory conventions. Scheduled maintenance uses
+a validated, persistent user `systemd` timer with missed-run recovery; cron is used only when no
+user systemd manager is available. Generated units and Desktop Entries launch Node directly,
+without `sh -c` or interpolated credential paths.
 
 ## Keys
 
@@ -83,6 +87,7 @@ The account actions apply only to the visible provider.
 | b | refresh quotas, then choose the reset-aware **Best Now** account |
 | u | refresh quotas for the visible provider (duplicate requests are coalesced) |
 | S | setup shortcuts and scheduled maintenance |
+| M | show the complete encrypted Windows → Linux migration workflow |
 | q | quit |
 
 Moving the cursor previews that account's cached or freshly-read quota without switching
@@ -242,8 +247,102 @@ Current provider references:
 
 - [Claude Code authentication](https://code.claude.com/docs/en/authentication)
 - [Claude session security controls](https://support.claude.com/en/articles/13163631-configuring-session-security-settings)
-- [Codex authentication](https://developers.openai.com/codex/auth)
+- [Codex authentication](https://learn.chatgpt.com/docs/auth)
 - [Codex App Server](https://developers.openai.com/codex/app-server)
+
+## CachyOS and Linux Desktop apps
+
+Claude Code and Codex CLI run natively on Linux, but the current vendor Desktop packages do not
+list Arch/CachyOS as a supported target. Claude Desktop provides Debian/Ubuntu packages, while the
+ChatGPT/Codex Linux preview lists specific Ubuntu, Debian and Fedora releases. This project therefore
+uses an **Ubuntu 24.04 Distrobox** for both indispensable graphical apps on CachyOS instead of
+pretending an unofficial Arch repack is vendor-supported.
+
+Nothing privileged is run automatically. Display the exact setup, then execute only the commands
+you approve:
+
+```sh
+node dist/cli.js linux-desktop guide
+```
+
+The commands shown by the guide install Podman/Distrobox and the XDG/Wayland clipboard tools on the host, create the
+Ubuntu box, points to the two current official `.deb` download pages, exports `claude-desktop` and
+`chatgpt` to the host menu, and finally registers structured no-shell launch descriptors:
+
+```sh
+node dist/cli.js linux-desktop configure claude-codex-desktop
+node dist/cli.js linux-desktop doctor
+node dist/cli.js doctor all
+```
+
+Distrobox shares the user's home and forwards Wayland/X11/audio integration. Each Linux Desktop app
+still needs one initial Linux sign-in per provider account. Windows Electron cookies, DPAPI material
+and Chromium databases are archived as recovery evidence, but are never injected into the Linux
+profile: doing so would be unreliable and could corrupt or expose a session.
+
+## Complete Windows → Linux migration
+
+Provider `e`/`E` exports remain useful for moving individual accounts. The `migration` workflow is
+the full-machine path: one versioned archive contains the switcher's account metadata, independent
+credential envelopes, backups, tombstones and Desktop captures, plus portable Claude/Codex settings,
+projects, sessions, histories, plugins, skills and memories. Windows-only Desktop state is included
+under a recovery-only scope. Locks, sockets, transient jobs, temporary files, rebuildable Desktop
+caches and symbolic links are not copied; every exclusion and its reason appears in the encrypted
+manifest.
+
+Windows-only provider executables and scripts (`.exe`, `.dll`, `.cmd`, `.bat`, `.ps1`) are moved to
+the recovery-only scope instead of being installed into the Linux live homes. Known Claude/Codex
+configuration files containing Windows drive or UNC paths remain available, but the manifest flags
+them for review and import writes a `portability-review.json` under migration recovery backups.
+
+On Windows, inventory first and read every warning:
+
+```powershell
+switch.cmd migration prepare
+```
+
+Close Claude Code/Desktop and Codex CLI/Desktop normally, then create the archive. The passphrase is
+read without echo and is never accepted in a command-line argument or environment variable:
+
+```powershell
+switch.cmd migration export
+# Non-interactive alternative: --passphrase-file C:\private\migration-passphrase
+```
+
+On CachyOS, clone/build this project, copy the `.ccswitch-migration` file, and validate it before any
+write:
+
+```sh
+node dist/cli.js migration inspect /path/to/archive.ccswitch-migration
+node dist/cli.js migration verify /path/to/archive.ccswitch-migration
+node dist/cli.js migration import /path/to/archive.ccswitch-migration
+```
+
+The archive uses `scrypt` key derivation, AES-256-GCM authenticated encryption, streaming Brotli
+compression and a SHA-256 for every file. Import decrypts and validates the complete archive into a
+private temporary payload before touching live data, then streams bounded file ranges into atomic
+target writes without loading large histories into memory. Different existing files are refused by default.
+After inspecting the archive, `--replace-existing` explicitly authorizes transactional replacement;
+every replaced target is backed up, writes are atomic, all installed hashes are rechecked and a failed
+operation rolls back.
+
+For a passphrase file on Linux, run `chmod 600` first. Store that file outside `~/.claude-switch`,
+`~/.claude` and `~/.codex`; export rejects a passphrase file under any source root. Keep the archive and passphrase separately:
+the archive contains credentials and private conversation/project history even though its contents are
+encrypted.
+
+Large histories and recovery-only Desktop stores can take several minutes to hash and encrypt. The
+CLI reports that the inventory is running; keep enough free space for the encrypted archive and one
+private decrypted payload on the target. Temporary payloads use the switcher's private
+`migration-work/` directory on the home-data filesystem instead of assuming `/tmp` has enough space.
+Decompressed payloads are rejected above the explicit 64 GiB safety ceiling.
+
+Migration preserves every saved account, including rows already marked `needs re-add`. It cannot make
+a provider-revoked or expired OAuth grant valid again. Codex file-backed `auth.json` sessions and valid
+Claude `.credentials.json` sessions are portable, but either provider may require official re-login;
+the switcher retains the account and reports that requirement instead of deleting it. This is the
+honest boundary behind “lose no account”: **all recoverable data is retained, but server-side login
+validity cannot be manufactured offline.**
 
 ## Import and export
 
@@ -302,6 +401,11 @@ switch.cmd import-all --provider claude <bundle-or-folder>
 switch.cmd import-all --provider codex <bundle-or-folder>
 switch.cmd export-all claude
 switch.cmd export-all codex
+switch.cmd migration prepare
+switch.cmd migration export [--output <file>] [--passphrase-file <0600-file>]
+switch.cmd migration inspect|verify <archive> [--passphrase-file <0600-file>]
+switch.cmd migration import <archive> [--replace-existing] [--passphrase-file <0600-file>]
+switch.cmd linux-desktop guide|configure|doctor
 switch.cmd doctor all
 switch.cmd keep-alive
 switch.cmd --dry-run
@@ -336,6 +440,9 @@ Claude and Codex homes when it is installed. This switcher store is independent 
 - `import/claude/` and `import/codex/`: provider-specific active inboxes containing secrets
 - `import/processed/<provider>/`: consumed inbox evidence plus secret-free import receipts
 - `exports/`: timestamped portable files containing secrets; older exports are never overwritten
+- `exports/*.ccswitch-migration`: encrypted full-machine archives; passphrases are never stored here
+- `backups/migration-import-*`: rollback copies for files explicitly replaced during a full import
+- `backups/migration-recovery/`: Windows-only Desktop evidence never restored into Linux live state
 
 Credential envelopes are plain JSON protected by user-directory permissions, not
 application-level encryption. Never commit or share them. Legacy profile stores are migrated

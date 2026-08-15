@@ -107,8 +107,81 @@ export function atomicWriteFile(
   }
 }
 
-/** Read the complete source into memory, then atomically replace the target. */
+/** Stream one bounded source range into a flushed sibling, then atomically replace the target. */
+export function atomicCopyFileRange(
+  source: string,
+  sourceOffset: number,
+  length: number,
+  target: string,
+  mode = DEFAULT_FILE_MODE,
+): void {
+  if (!Number.isSafeInteger(sourceOffset) || sourceOffset < 0
+    || !Number.isSafeInteger(length) || length < 0
+    || !Number.isSafeInteger(sourceOffset + length)) {
+    throw new Error('Atomic copy range must use non-negative safe integers.');
+  }
+  const sourceStat = fs.statSync(source);
+  if (!sourceStat.isFile() || sourceOffset + length > sourceStat.size) {
+    throw new Error(`Atomic copy range exceeds its regular source file: ${source}`);
+  }
+  ensureParentDir(path.dirname(target));
+  const temp = uniqueTempPath(target);
+  let sourceFd: number | null = null;
+  let targetFd: number | null = null;
+  let renamed = false;
+  try {
+    sourceFd = fs.openSync(source, 'r');
+    targetFd = fs.openSync(temp, 'wx', mode);
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let copied = 0;
+    while (copied < length) {
+      const wanted = Math.min(buffer.length, length - copied);
+      const read = fs.readSync(sourceFd, buffer, 0, wanted, sourceOffset + copied);
+      if (!read) throw new Error(`Atomic copy source ended early: ${source}`);
+      let written = 0;
+      while (written < read) {
+        const count = fs.writeSync(targetFd, buffer, written, read - written);
+        if (!count) throw new Error(`Atomic copy target stopped accepting data: ${target}`);
+        written += count;
+      }
+      copied += read;
+    }
+    setPrivateFileMode(targetFd, mode);
+    fs.fsyncSync(targetFd);
+    fs.closeSync(targetFd);
+    targetFd = null;
+    fs.closeSync(sourceFd);
+    sourceFd = null;
+    fs.renameSync(temp, target);
+    renamed = true;
+    if (process.platform !== 'win32') {
+      let dirFd: number | null = null;
+      try {
+        dirFd = fs.openSync(path.dirname(target), 'r');
+        fs.fsyncSync(dirFd);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EISDIR') throw error;
+      } finally {
+        if (dirFd !== null) fs.closeSync(dirFd);
+      }
+    }
+  } finally {
+    if (targetFd !== null) {
+      try { fs.closeSync(targetFd); } catch { /* preserve the original failure */ }
+    }
+    if (sourceFd !== null) {
+      try { fs.closeSync(sourceFd); } catch { /* preserve the original failure */ }
+    }
+    if (!renamed) {
+      try { fs.rmSync(temp, { force: true }); } catch { /* preserve the original failure */ }
+    }
+  }
+}
+
+/** Stream a complete source file with bounded memory, then atomically replace the target. */
 export function atomicCopyFile(source: string, target: string, mode = DEFAULT_FILE_MODE): void {
-  const content = fs.readFileSync(source);
-  atomicWriteFile(target, content, mode);
+  const stat = fs.statSync(source);
+  if (!stat.isFile()) throw new Error(`Atomic copy source is not a regular file: ${source}`);
+  atomicCopyFileRange(source, 0, stat.size, target, mode);
 }

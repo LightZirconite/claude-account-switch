@@ -1,0 +1,38 @@
+name: cross-platform-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm audit --audit-level=high
+
+  arch-linux:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install Arch validation runtime
+        run: pacman -Syu --noconfirm nodejs npm git systemd desktop-file-utils
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npx tsx scripts/validate-linux.ts

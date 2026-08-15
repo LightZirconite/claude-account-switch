@@ -267,7 +267,7 @@ test('command help stays short, paged, and complete for both providers', () => {
     'export-selected', 'export-all', 'export-open', 'export-unique', 'export-secrets', 'export-provider-limit',
     'setup', 'setup-actions', 'confirm', 'submit-back', 'edit', 'quit',
     'cli-launch', 'cli-login', 'cli-import', 'cli-import-all', 'cli-export-all', 'cli-doctor',
-    'cli-dry-run', 'cli-restore', 'cli-install', 'cli-keep-alive', 'cli-keep-alive-job', 'cli-help',
+    'cli-dry-run', 'cli-restore', 'cli-install', 'cli-keep-alive', 'cli-migration', 'cli-help',
     'safety-switch', 'safety-provider', 'safety-archive', 'safety-import', 'safety-export', 'safety-storage',
   ];
 

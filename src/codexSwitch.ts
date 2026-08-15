@@ -29,6 +29,7 @@ import {
   pruneManagedBackupDirs,
   releaseBackupRetentionProtection,
 } from './retention';
+import { resolveLinuxDesktopLaunch } from './linuxDesktop';
 
 export interface CodexProcessInfo {
   pid: number;
@@ -134,8 +135,10 @@ export function classifyCodexProcesses(rows: RawProcess[], currentPid = process.
   const relevant = rows.filter((row) => {
     const name = path.basename(row.Name ?? row.ExecutablePath ?? '');
     const executable = row.ExecutablePath ?? '';
-    return /^(?:codex|ChatGPT)(?:\.exe)?$/i.test(name)
-      || /[\\/]WindowsApps[\\/]OpenAI\.Codex_/i.test(executable);
+    const commandLine = row.CommandLine ?? '';
+    return /^(?:codex|ChatGPT|openai-codex)(?:\.exe)?$/i.test(name)
+      || /[\\/]WindowsApps[\\/]OpenAI\.Codex_/i.test(executable)
+      || /[\\/]@openai[\\/]codex[\\/]bin[\\/]codex\.js(?:"|\s|$)/i.test(commandLine);
   });
   const byPid = new Map(rows.map((row) => [Number(row.ProcessId), row]));
   const ancestorPids = new Set<number>();
@@ -148,7 +151,7 @@ export function classifyCodexProcesses(rows: RawProcess[], currentPid = process.
     const name = row.Name ?? '';
     const executable = row.ExecutablePath ?? '';
     const commandLine = row.CommandLine ?? '';
-    return /chatgpt/i.test(name)
+    return /^(?:chatgpt)(?:\.exe)?$/i.test(path.basename(name))
       || /[\\/]WindowsApps[\\/]OpenAI\.Codex_/i.test(executable)
       || /\.app[\\/]Contents[\\/]MacOS[\\/]/i.test(commandLine);
   }).map((row) => Number(row.ProcessId)));
@@ -284,10 +287,10 @@ function forceTerminateCodexProcessTrees(processes: CodexProcessInfo[]): void {
     }
     return;
   }
-  if (process.platform === 'darwin') {
+  if (process.platform === 'darwin' || process.platform === 'linux') {
     for (const pid of roots) {
       try {
-        process.kill(pid, 'SIGTERM');
+        process.kill(pid, process.platform === 'linux' ? 'SIGKILL' : 'SIGTERM');
       } catch {
         /* process already exited or cannot be terminated */
       }
@@ -341,10 +344,10 @@ function forceTerminateOriginalCodexAppProcesses(processes: CodexProcessInfo[]):
     }
     return;
   }
-  if (process.platform === 'darwin') {
+  if (process.platform === 'darwin' || process.platform === 'linux') {
     for (const candidate of processes) {
       try {
-        process.kill(candidate.pid, 'SIGTERM');
+        process.kill(candidate.pid, process.platform === 'linux' ? 'SIGKILL' : 'SIGTERM');
       } catch {
         /* process already exited or cannot be terminated */
       }
@@ -386,7 +389,19 @@ export async function requestGracefulAppClose(
   // Revalidate immediately before asking the app to close. A helper or a new app
   // that appeared after the caller's inventory aborts this switch without writes.
   assertOnlyOriginalCodexAppsRemain(initialApps, inventory());
-  requestClose();
+  if (process.platform === 'linux' && !options.requestClose) {
+    // Linux graphical clients do not expose a portable close-window API. SIGTERM is
+    // the normal close request and targets only the exact revalidated original PIDs.
+    for (const candidate of initialApps.values()) {
+      try {
+        process.kill(candidate.pid, 'SIGTERM');
+      } catch {
+        /* process already exited or is not owned by this user */
+      }
+    }
+  } else {
+    requestClose();
+  }
   await waitForExit(initialPids, GRACEFUL_DESKTOP_CLOSE_MS);
 
   // Even if every original PID exited, a helper may have appeared during the wait.
@@ -410,6 +425,10 @@ function relaunchCodexApp(): void {
       spawn('explorer.exe', ['shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App'], { detached: true, stdio: 'ignore' }).unref();
     } else if (process.platform === 'darwin') {
       spawn('open', ['-a', 'Codex'], { detached: true, stdio: 'ignore' }).unref();
+    } else if (process.platform === 'linux') {
+      const launch = resolveLinuxDesktopLaunch('codex');
+      if (!launch) throw new Error('No Linux ChatGPT/Codex Desktop launcher is configured.');
+      spawn(launch.exe, launch.args, { detached: true, stdio: 'ignore' }).unref();
     }
   } catch (e) {
     logger.warn('codex relaunch failed', { error: String(e) });

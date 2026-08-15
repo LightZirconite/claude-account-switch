@@ -5,17 +5,26 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { claudeConfigDir, codexAuthPath, codexHome, dataDir, ensureDataDirs } from './paths';
+import {
+  claudeConfigDir,
+  codexAuthPath,
+  codexHome,
+  dataDir,
+  ensureDataDirs,
+  xdgConfigHome,
+  xdgDataHome,
+} from './paths';
 import { findCodexExe } from './codexAppServer';
 import { configureCodexFileCredentialStore } from './codexConfig';
 import { loadCodexStore } from './codexProfiles';
 import { logger } from './logger';
+import { atomicWriteFile } from './atomicFile';
 
 export const APP_NAME = 'Claude + Codex Account Switch';
 const LEGACY_APP_NAME = 'Claude Account Switch';
 const TASK_ID = 'ClaudeAccountSwitch-KeepAlive'; // Windows task / launchd label / cron marker
 const KEEPALIVE_INTERVAL_HOURS = 6;
-export const CURRENT_SCHEDULER_SPEC_VERSION = 1;
+export const CURRENT_SCHEDULER_SPEC_VERSION = 2;
 
 export interface StepResult {
   name: string;
@@ -236,6 +245,12 @@ export function desktopExecArgument(value: string): string {
     .replace(/`/g, '\\`')
     .replace(/\$/g, '\\$')
     .replace(/%/g, '%%')}"`;
+}
+
+/** Quote one systemd ExecStart argument without involving a shell. */
+export function systemdExecArgument(value: string): string {
+  if (!value || /\0|[\r\n]/u.test(value)) throw new Error('systemd arguments must be non-empty single-line values without NUL bytes.');
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`;
 }
 
 function desktopEntryValue(value: string): string {
@@ -592,6 +607,117 @@ function macShortcutsUninstall(): StepResult {
 
 // ---------- Linux ----------
 
+const SYSTEMD_ID = 'claude-codex-account-switch-keepalive';
+
+export interface LinuxSystemdUnits {
+  service: string;
+  timer: string;
+}
+
+export function buildLinuxSystemdUnits(action: LaunchAction): LinuxSystemdUnits {
+  const execStart = [action.exe, ...action.args].map(systemdExecArgument).join(' ');
+  return {
+    service: `[Unit]
+Description=${APP_NAME} provider-isolated keep-alive
+Documentation=https://git.justw.tf/LightZirconite/claude-account-switch
+
+[Service]
+Type=oneshot
+WorkingDirectory=${systemdExecArgument(action.cwd)}
+ExecStart=${execStart}
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=30min
+`,
+    timer: `[Unit]
+Description=Run ${APP_NAME} keep-alive every six hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00
+Persistent=true
+RandomizedDelaySec=5min
+AccuracySec=1min
+Unit=${SYSTEMD_ID}.service
+
+[Install]
+WantedBy=timers.target
+`,
+  };
+}
+
+function linuxSystemdPaths(): { service: string; timer: string } {
+  const dir = path.join(xdgConfigHome(), 'systemd', 'user');
+  return {
+    service: path.join(dir, `${SYSTEMD_ID}.service`),
+    timer: path.join(dir, `${SYSTEMD_ID}.timer`),
+  };
+}
+
+function readOptionalFile(file: string): Buffer | null {
+  try {
+    return fs.readFileSync(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function restoreOptionalFile(file: string, content: Buffer | null): void {
+  if (content === null) fs.rmSync(file, { force: true });
+  else atomicWriteFile(file, content, 0o600);
+}
+
+function linuxUserSystemdAvailable(): boolean {
+  return run('systemctl', ['--user', 'show-environment']).ok;
+}
+
+function linuxSystemdSchedulerInstall(action: LaunchAction): StepResult {
+  const files = linuxSystemdPaths();
+  const units = buildLinuxSystemdUnits(action);
+  const previous = {
+    service: readOptionalFile(files.service),
+    timer: readOptionalFile(files.timer),
+    enabled: run('systemctl', ['--user', 'is-enabled', `${SYSTEMD_ID}.timer`]).ok,
+  };
+  const rollback = (detail: string): StepResult => {
+    run('systemctl', ['--user', 'disable', '--now', `${SYSTEMD_ID}.timer`]);
+    try {
+      restoreOptionalFile(files.service, previous.service);
+      restoreOptionalFile(files.timer, previous.timer);
+      run('systemctl', ['--user', 'daemon-reload']);
+      if (previous.enabled) run('systemctl', ['--user', 'enable', '--now', `${SYSTEMD_ID}.timer`]);
+      return { name: 'Auto keep-alive (systemd user timer)', ok: false, detail: `${detail}; rollback: previous units restored` };
+    } catch (error) {
+      return {
+        name: 'Auto keep-alive (systemd user timer)',
+        ok: false,
+        detail: `${detail}; rollback failed: ${String((error as Error).message ?? error)}`,
+      };
+    }
+  };
+
+  atomicWriteFile(files.service, units.service, 0o600);
+  atomicWriteFile(files.timer, units.timer, 0o600);
+  const analyzer = run('systemd-analyze', ['--user', 'verify', files.service, files.timer]);
+  if (!analyzer.ok && !/ENOENT|not recognized|not found/i.test(analyzer.err)) {
+    return rollback(analyzer.err || 'systemd-analyze rejected the generated units');
+  }
+  const reload = run('systemctl', ['--user', 'daemon-reload']);
+  if (!reload.ok) return rollback(reload.err || 'systemctl --user daemon-reload failed');
+  const enable = run('systemctl', ['--user', 'enable', '--now', `${SYSTEMD_ID}.timer`]);
+  if (!enable.ok) return rollback(enable.err || 'systemctl could not enable the timer');
+  const enabled = run('systemctl', ['--user', 'is-enabled', `${SYSTEMD_ID}.timer`]);
+  const active = run('systemctl', ['--user', 'is-active', `${SYSTEMD_ID}.timer`]);
+  if (!enabled.ok || !active.ok) return rollback('systemd did not report the timer as enabled and active');
+  const probe = schedulerProbe(action);
+  if (!probe.ok) return rollback(probe.detail ?? 'registered systemd action probe failed');
+  return {
+    name: 'Auto keep-alive (systemd user timer)',
+    ok: true,
+    detail: `${verifiedSchedulerDetail(action)}; persistent missed-run recovery`,
+  };
+}
+
 const CRON_MARKER = `# ${TASK_ID}`;
 function linuxCurrentCrontab(): string {
   const r = run('crontab', ['-l']);
@@ -632,40 +758,88 @@ function linuxSchedulerUninstall(): StepResult {
   run('crontab', ['-'], lines.length ? lines.join('\n') + '\n' : '\n');
   return { name: 'Auto keep-alive (cron)', ok: true, detail: 'removed' };
 }
-function linuxDesktopFiles(appName = APP_NAME): string[] {
-  return [
-    path.join(os.homedir(), '.local', 'share', 'applications', `${TASK_ID}.desktop`),
-    path.join(os.homedir(), 'Desktop', `${appName}.desktop`),
-  ];
+
+function linuxSystemdSchedulerUninstall(): StepResult {
+  const files = linuxSystemdPaths();
+  const disabled = run('systemctl', ['--user', 'disable', '--now', `${SYSTEMD_ID}.timer`]);
+  fs.rmSync(files.service, { force: true });
+  fs.rmSync(files.timer, { force: true });
+  const reloaded = run('systemctl', ['--user', 'daemon-reload']);
+  // Also remove an older cron fallback when migrating to or uninstalling systemd.
+  linuxSchedulerUninstall();
+  const ok = (disabled.ok || /not loaded|not found|does not exist/i.test(disabled.err)) && reloaded.ok;
+  return {
+    name: 'Auto keep-alive (systemd user timer)',
+    ok,
+    detail: ok ? 'removed' : disabled.err || reloaded.err || 'could not fully remove systemd units',
+  };
 }
-function linuxShortcutsInstall(): StepResult {
-  const { exe, args, cwd } = launcherCommand();
-  const execLine = [exe, ...args].map(desktopExecArgument).join(' ');
-  const content = `[Desktop Entry]
+
+function linuxDesktopDirectory(): string | null {
+  const result = run('xdg-user-dir', ['DESKTOP']);
+  if (result.ok && path.isAbsolute(result.out) && !/[\r\n]/u.test(result.out)) return result.out;
+  const conventional = path.join(os.homedir(), 'Desktop');
+  return fs.existsSync(conventional) ? conventional : null;
+}
+
+function linuxDesktopFiles(appName = APP_NAME): string[] {
+  const files = [path.join(xdgDataHome(), 'applications', `${TASK_ID}.desktop`)];
+  const desktop = linuxDesktopDirectory();
+  if (desktop) files.push(path.join(desktop, `${appName}.desktop`));
+  return files;
+}
+
+export function buildLinuxDesktopEntry(action: LaunchAction): string {
+  const execLine = [action.exe, ...action.args].map(desktopExecArgument).join(' ');
+  return `[Desktop Entry]
+Version=1.0
 Type=Application
 Name=${APP_NAME}
 Comment=Switch between Claude Code and Codex accounts
+TryExec=${desktopEntryValue(action.exe)}
 Exec=${execLine}
-Path=${desktopEntryValue(cwd)}
+Path=${desktopEntryValue(action.cwd)}
 Terminal=true
+StartupNotify=true
 Categories=Utility;Development;
 `;
-  let ok = false;
-  fs.rmSync(path.join(os.homedir(), 'Desktop', `${LEGACY_APP_NAME}.desktop`), { force: true });
-  for (const f of linuxDesktopFiles()) {
+}
+function linuxShortcutsInstall(): StepResult {
+  const action = launcherCommand();
+  const content = buildLinuxDesktopEntry(action);
+  const files = linuxDesktopFiles();
+  const applicationFile = files[0];
+  let desktopCreated = false;
+  const legacyDesktop = linuxDesktopDirectory();
+  if (legacyDesktop) fs.rmSync(path.join(legacyDesktop, `${LEGACY_APP_NAME}.desktop`), { force: true });
+  for (const [index, file] of files.entries()) {
     try {
-      fs.mkdirSync(path.dirname(f), { recursive: true });
-      fs.writeFileSync(f, content, { mode: 0o755 });
-      fs.chmodSync(f, 0o755);
-      ok = true;
-    } catch {
-      /* try the next location */
+      atomicWriteFile(file, content, 0o755);
+      fs.chmodSync(file, 0o755);
+      const validation = run('desktop-file-validate', [file]);
+      if (!validation.ok && !/ENOENT|not recognized|not found/i.test(validation.err)) {
+        fs.rmSync(file, { force: true });
+        if (index === 0) return { name: 'App menu + Desktop shortcut (.desktop)', ok: false, detail: validation.err };
+        continue;
+      }
+      if (index > 0) desktopCreated = true;
+    } catch (error) {
+      if (index === 0) {
+        return { name: 'App menu + Desktop shortcut (.desktop)', ok: false, detail: String((error as Error).message ?? error) };
+      }
     }
   }
-  return { name: 'App menu + Desktop shortcut (.desktop)', ok, detail: ok ? 'created' : 'could not write .desktop files' };
+  run('update-desktop-database', [path.dirname(applicationFile)]);
+  return {
+    name: 'App menu + Desktop shortcut (.desktop)',
+    ok: fs.existsSync(applicationFile),
+    detail: desktopCreated ? 'app menu and XDG Desktop shortcut created' : 'app menu entry created (no XDG Desktop directory advertised)',
+  };
 }
 function linuxShortcutsUninstall(): StepResult {
-  for (const f of [...linuxDesktopFiles(), path.join(os.homedir(), 'Desktop', `${LEGACY_APP_NAME}.desktop`)]) {
+  const legacyDesktop = linuxDesktopDirectory();
+  const legacyFiles = legacyDesktop ? [path.join(legacyDesktop, `${LEGACY_APP_NAME}.desktop`)] : [];
+  for (const f of [...linuxDesktopFiles(), ...legacyFiles]) {
     try {
       if (fs.existsSync(f)) fs.unlinkSync(f);
     } catch {
@@ -682,9 +856,9 @@ function schedulerInstall(): StepResult {
     const action = schedulerAction();
     if (process.platform === 'win32') return winSchedulerInstall(action);
     if (process.platform === 'darwin') return macSchedulerInstall(action);
-    return linuxSchedulerInstall(action);
+    return linuxUserSystemdAvailable() ? linuxSystemdSchedulerInstall(action) : linuxSchedulerInstall(action);
   } catch (error) {
-    const platformName = process.platform === 'win32' ? 'Task Scheduler' : process.platform === 'darwin' ? 'launchd' : 'cron';
+    const platformName = process.platform === 'win32' ? 'Task Scheduler' : process.platform === 'darwin' ? 'launchd' : 'systemd/cron';
     return {
       name: `Auto keep-alive (${platformName})`,
       ok: false,
@@ -695,7 +869,10 @@ function schedulerInstall(): StepResult {
 function schedulerUninstall(): StepResult {
   if (process.platform === 'win32') return winSchedulerUninstall();
   if (process.platform === 'darwin') return macSchedulerUninstall();
-  return linuxSchedulerUninstall();
+  const files = linuxSystemdPaths();
+  return (fs.existsSync(files.service) || fs.existsSync(files.timer) || linuxUserSystemdAvailable())
+    ? linuxSystemdSchedulerUninstall()
+    : linuxSchedulerUninstall();
 }
 function shortcutsInstall(): StepResult {
   if (process.platform === 'win32') return winShortcutsInstall();

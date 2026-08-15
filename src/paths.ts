@@ -4,6 +4,17 @@ import path from 'node:path';
 import fs from 'node:fs';
 import type { ProviderId } from './types';
 
+/** Freedesktop base directories. Environment overrides are intentionally honored verbatim. */
+export function xdgConfigHome(): string {
+  const configured = process.env.XDG_CONFIG_HOME?.trim();
+  return configured || path.join(os.homedir(), '.config');
+}
+
+export function xdgDataHome(): string {
+  const configured = process.env.XDG_DATA_HOME?.trim();
+  return configured || path.join(os.homedir(), '.local', 'share');
+}
+
 /** Directory Claude Code uses for its config (~/.claude by default). */
 export function claudeConfigDir(): string {
   const override = process.env.CLAUDE_CONFIG_DIR;
@@ -114,7 +125,7 @@ export function desktopUserDataDir(): string | null {
       ? path.join(os.homedir(), 'Library', 'Application Support')
       : process.platform === 'win32'
         ? (process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming'))
-        : path.join(os.homedir(), '.config');
+        : xdgConfigHome();
   const candidates = ['Claude', 'Claude-3p']
     .map((name) => path.join(base, name))
     .filter((dir) => fs.existsSync(dir));

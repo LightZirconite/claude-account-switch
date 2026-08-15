@@ -58,6 +58,28 @@
   the switcher machine.
 - Detect the Codex Desktop application separately from the Codex CLI. Request a graceful
   close, allow a reasonable shutdown period, and abort without writes if it remains active.
+- On Linux, honor XDG base directories and the XDG Desktop directory. Prefer a persistent
+  user `systemd` timer; use cron only when the user systemd manager is genuinely unavailable.
+- CachyOS Desktop support uses the vendors' Ubuntu 24.04 packages in Distrobox. Never claim
+  that an Arch package is vendor-supported, silently run privileged setup, or inject Windows
+  Chromium cookies into a Linux Desktop profile.
+- Linux Desktop launchers are structured executable/argument descriptors. Do not route app
+  close, relaunch, scheduled maintenance or `.desktop` entries through `sh -c`.
+
+## Full-machine migration
+
+- A full migration archive is encrypted and authenticated before it leaves the source machine.
+  Never accept its passphrase in process arguments, environment variables, logs or manifests.
+- Include switcher stores/backups/tombstones plus portable Claude/Codex settings, sessions,
+  history, plugins, skills and memories. Record every excluded lock, socket, temp entry or
+  symbolic link with a reason; never silently omit an oversized or unreadable regular file.
+- Windows Desktop state is recovery-only evidence. Import it under switcher backups and require
+  one initial Linux Desktop sign-in instead of pretending DPAPI/cookie state is portable.
+- Decrypt and validate the complete manifest, authenticated ciphertext and every file SHA-256
+  before live writes. Reject traversal/symlink targets and differing files by default; an
+  explicit replacement must create rollback backups and verify every installed file.
+- Migration preserves invalid or revoked accounts with a re-authentication warning. It never
+  deletes a saved profile merely because the provider no longer accepts its session.
 
 ## Code quality, performance and change discipline
 
@@ -88,4 +110,5 @@ npm run typecheck
 npm run build
 node dist/cli.js doctor all
 npm audit
+npx tsx scripts/validate-linux.ts  # Linux CI/host with systemd + desktop-file-utils
 ```

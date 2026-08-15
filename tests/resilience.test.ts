@@ -1161,6 +1161,19 @@ test('Codex process classification protects app-server and ambiguous children be
   assert.equal(classified.find((process) => process.pid === 103)?.kind, 'app');
 });
 
+test('Codex process classification recognizes Linux ChatGPT Desktop and openai-codex helpers', () => {
+  const classified = classifyCodexProcesses([
+    { ProcessId: 200, ParentProcessId: 1, Name: 'chatgpt', CommandLine: '/usr/bin/chatgpt', ExecutablePath: '/usr/bin/chatgpt' },
+    { ProcessId: 201, ParentProcessId: 200, Name: 'openai-codex', CommandLine: 'openai-codex app-server', ExecutablePath: '/usr/lib/chatgpt/openai-codex' },
+    { ProcessId: 202, ParentProcessId: 1, Name: 'codex', CommandLine: 'codex exec task', ExecutablePath: '/home/test/.local/bin/codex' },
+    { ProcessId: 203, ParentProcessId: 1, Name: 'node', CommandLine: 'node /home/test/node_modules/@openai/codex/bin/codex.js exec', ExecutablePath: '/usr/bin/node' },
+  ], 999);
+  assert.equal(classified.find((process) => process.pid === 200)?.kind, 'app');
+  assert.equal(classified.find((process) => process.pid === 201)?.kind, 'helper');
+  assert.equal(classified.find((process) => process.pid === 202)?.kind, 'cli');
+  assert.equal(classified.find((process) => process.pid === 203)?.kind, 'cli');
+});
+
 test('Codex Desktop close aborts without force or auth mutation when a helper appears during the wait', async () => {
   resetRoot();
   const auth = codexAuth('live-account', 'live@example.test');

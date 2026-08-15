@@ -5,6 +5,21 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import clipboard from 'clipboardy';
+import {
+  exportMigration,
+  importMigration,
+  inspectMigration,
+  prepareMigration,
+  promptMigrationPassphrase,
+  readMigrationPassphraseFile,
+  verifyMigration,
+  type MigrationManifest,
+} from './migration';
+import {
+  configureLinuxDesktopDistrobox,
+  inspectLinuxDesktop,
+  linuxDesktopGuide,
+} from './linuxDesktop';
 
 import {
   claudeConfigDir,
@@ -641,7 +656,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     setMode('setup');
   }, []);
 
-  // installAll/uninstallAll shell out (schtasks/PowerShell/launchctl/cron) and block
+  // installAll/uninstallAll shell out (Task Scheduler/launchctl/systemd/cron) and block
   // briefly; paint the busy line first, then run on the next tick.
   const runInstall = useCallback(() => {
     setBusy(`Setting up ${APP_NAME}…`);
@@ -871,8 +886,9 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     if (!codexSelected) return;
     try {
       const file = await exportCodexProfile(codexSelected, { processInventory: findCodexProcesses });
-      clipboard.write(file).catch(() => {});
-      showMessage('Codex account exported', [file, '', 'Path copied. This file contains login secrets. Keep it private.'], 'success', exportDir());
+      let copied = true;
+      try { await clipboard.write(file); } catch { copied = false; }
+      showMessage('Codex account exported', [file, '', `${copied ? 'Path copied.' : 'Clipboard unavailable; copy the path above.'} This file contains login secrets. Keep it private.`], 'success', exportDir());
     } catch (e) {
       showMessage('Codex export failed', [redactText(e)], 'error');
     }
@@ -881,8 +897,9 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const exportAllCodex = useCallback(async () => {
     try {
       const file = await exportAllCodexProfiles(codexStore, { processInventory: findCodexProcesses });
-      clipboard.write(file).catch(() => {});
-      showMessage('All Codex accounts exported', [file, '', 'Path copied. This file contains login secrets. Keep it private.'], 'success', exportDir());
+      let copied = true;
+      try { await clipboard.write(file); } catch { copied = false; }
+      showMessage('All Codex accounts exported', [file, '', `${copied ? 'Path copied.' : 'Clipboard unavailable; copy the path above.'} This file contains login secrets. Keep it private.`], 'success', exportDir());
     } catch (e) {
       showMessage('Codex export failed', [redactText(e)], 'error');
     }
@@ -1951,11 +1968,12 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     if (!selected) return;
     try {
       const file = await exportProfile(selected);
-      clipboard.write(file).catch(() => {});
+      let copied = true;
+      try { await clipboard.write(file); } catch { copied = false; }
       showMessage(
         'Exported',
         [
-          'Portable file written (path copied to clipboard):',
+          copied ? 'Portable file written (path copied to clipboard):' : 'Portable file written (clipboard unavailable; copy this path):',
           '',
           file,
           '',
@@ -1977,11 +1995,12 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     }
     try {
       const result = await exportAllProfiles(store);
-      clipboard.write(result.file).catch(() => {});
+      let copied = true;
+      try { await clipboard.write(result.file); } catch { copied = false; }
       showMessage(
         'Claude Code portable export created',
         [
-          `${result.exportedCount} Claude Code account credential(s) written (path copied):`,
+          `${result.exportedCount} Claude Code account credential(s) written (${copied ? 'path copied' : 'clipboard unavailable; copy the path below'}):`,
           '',
           result.file,
           '',
@@ -2038,6 +2057,17 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       if (input === '?') {
         setHelpPage(0);
         setMode('help');
+        return;
+      }
+      if (input === 'M') {
+        showMessage('Windows → Linux migration', [
+          'The complete migration is encrypted and deliberately runs from the CLI so its passphrase stays hidden.',
+          '1. node dist/cli.js migration prepare',
+          '2. Close Claude and Codex normally.',
+          '3. node dist/cli.js migration export',
+          'On Linux: migration inspect, then migration import (use --replace-existing only after inspection).',
+          'Press ? for the complete command reference.',
+        ], 'info');
         return;
       }
       if (input === '/') {
@@ -3089,7 +3119,15 @@ Usage:
                              Validate and import every account represented by the source
   switch.cmd export-all [claude|codex]
                              Write a new timestamped provider-tagged bundle
-  switch.cmd doctor [all|claude|codex]  Diagnose accounts without printing secrets
+  switch.cmd migration prepare          Inventory everything before moving to Linux
+  switch.cmd migration export [--output file] [--passphrase-file 0600-file]
+                             Encrypt switcher + Claude/Codex portable state in one archive
+  switch.cmd migration inspect|verify <archive> [--passphrase-file 0600-file]
+  switch.cmd migration import <archive> [--replace-existing] [--passphrase-file 0600-file]
+                             Validate fully, back up conflicts, import atomically, verify
+  switch.cmd linux-desktop guide|doctor|configure [distrobox-name]
+                             CachyOS Ubuntu-24.04 Desktop integration
+  switch.cmd doctor [all|claude|codex|linux]  Diagnose without printing secrets
   switch.cmd --dry-run       Show exactly which keys a switch would change (no writes)
   switch.cmd restore <claude|codex> [backup-path]
                              Restore one provider's live auth transactionally
@@ -3107,9 +3145,58 @@ Interactive transfer:
 
 Data & logs live in ~/.claude-switch/
 
+Migration passphrases are never accepted on the command line or in environment variables.
+
 Copyright (C) 2026 LightZirconite
 License: AGPL-3.0-or-later (see LICENSE; no warranty)
 Source: https://git.justw.tf/LightZirconite/claude-account-switch`);
+}
+
+function humanBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+  let amount = value;
+  let unit = -1;
+  do {
+    amount /= 1024;
+    unit++;
+  } while (amount >= 1024 && unit < units.length - 1);
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${units[unit]}`;
+}
+
+function printMigrationManifest(manifest: MigrationManifest): void {
+  const claude = manifest.accounts.filter((account) => account.provider === 'claude');
+  const codex = manifest.accounts.filter((account) => account.provider === 'codex');
+  const reauth = manifest.accounts.filter((account) => account.status === 'reauth-required');
+  console.log(`Archive id: ${manifest.archiveId}`);
+  console.log(`Created: ${manifest.createdAt}`);
+  console.log(`Source: ${manifest.source.platform}/${manifest.source.arch}; Node ${manifest.source.node}; switcher ${manifest.source.switcher}`);
+  console.log(`Files: ${manifest.entries.length}; plaintext payload: ${humanBytes(manifest.totalBytes)}`);
+  console.log(`Accounts: Claude ${claude.length}; Codex ${codex.length}; re-authentication required ${reauth.length}`);
+  console.log(`Recovery-only files: ${manifest.entries.filter((entry) => entry.scope === 'recovery').length}`);
+  console.log(`Explicit exclusions: ${manifest.exclusions.length}`);
+  console.log(`Linux path reviews: ${manifest.portabilityWarnings.length}`);
+  for (const account of reauth) console.log(`  ! ${account.provider}: ${account.label} <${account.email}> — ${account.reason ?? 'official re-authentication required'}`);
+  for (const warning of manifest.portabilityWarnings.slice(0, 20)) console.log(`  ! ${warning.scope}/${warning.path} — ${warning.reason}`);
+  if (manifest.portabilityWarnings.length > 20) console.log(`  ! … ${manifest.portabilityWarnings.length - 20} more portability warning(s) are retained in the encrypted manifest.`);
+}
+
+function optionValue(args: string[], name: string): string | undefined {
+  const indexes = args.flatMap((value, index) => value === name ? [index] : []);
+  if (indexes.length > 1) throw new Error(`${name} may be specified only once.`);
+  const index = indexes[0] ?? -1;
+  if (index < 0) return undefined;
+  const value = args[index + 1]?.trim();
+  if (!value || value.startsWith('--')) throw new Error(`${name} requires a value.`);
+  return value;
+}
+
+async function migrationPassphrase(args: string[], confirm: boolean, forExport = false): Promise<string> {
+  if (args.some((arg) => arg === '--passphrase' || arg.startsWith('--passphrase='))) {
+    throw new Error('--passphrase is intentionally unsupported because process arguments are observable. Use the hidden prompt or --passphrase-file.');
+  }
+  const file = optionValue(args, '--passphrase-file');
+  return file ? readMigrationPassphraseFile(file, { forExport }) : promptMigrationPassphrase(confirm);
 }
 
 function asTime(value: unknown): number | null {
@@ -3373,6 +3460,10 @@ function printReport(title: string, report: InstallReport): void {
 }
 
 async function main(): Promise<void> {
+  const nodeMajor = Number(process.versions.node.split('.')[0]);
+  if (!Number.isInteger(nodeMajor) || nodeMajor < 22) {
+    throw new Error(`Node.js 22 or newer is required; current runtime is ${process.version}.`);
+  }
   const rawArgs = process.argv.slice(2);
   const args: string[] = [];
   const pathFlags: Record<string, 'CLAUDE_SWITCH_HOME' | 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME' | 'CODEX_BIN'> = {
@@ -3420,11 +3511,92 @@ async function main(): Promise<void> {
 
   if (args[0] === 'doctor') {
     const scope = args[1] ?? 'all';
+    if (!['all', 'claude', 'codex', 'linux'].includes(scope)) {
+      throw new Error(`Unsupported doctor scope "${scope}". Use all, claude, codex, or linux.`);
+    }
     console.log('Claude + Codex Account Switch doctor\n');
     if (scope === 'all' || scope === 'claude') await printClaudeDoctor();
     if (scope === 'all') console.log('');
     if (scope === 'all' || scope === 'codex') await printCodexDoctor();
+    if ((scope === 'all' && process.platform === 'linux') || scope === 'linux') {
+      if (scope === 'all') console.log('');
+      console.log('Linux Desktop integration');
+      const diagnostic = inspectLinuxDesktop();
+      for (const line of diagnostic.lines) console.log(`  ${line}`);
+      console.log(`  Overall: ${diagnostic.ok ? 'ready' : 'attention required'}`);
+    }
     return;
+  }
+
+  if (args[0] === 'linux-desktop') {
+    const action = args[1] ?? 'doctor';
+    if (action === 'guide') {
+      console.log(linuxDesktopGuide(args[2]));
+      return;
+    }
+    if (action === 'configure') {
+      if (process.platform !== 'linux') throw new Error('Run linux-desktop configure on the target Linux machine.');
+      const file = configureLinuxDesktopDistrobox(args[2]);
+      console.log(`Linux Desktop launch descriptors saved to: ${file}`);
+      console.log('No package, container, sudo command, or browser login was started automatically.');
+      return;
+    }
+    if (action === 'doctor') {
+      const diagnostic = inspectLinuxDesktop();
+      for (const line of diagnostic.lines) console.log(`${diagnostic.ok ? '✓' : '•'} ${line}`);
+      if (!diagnostic.ok) process.exitCode = 1;
+      return;
+    }
+    throw new Error(`Unsupported linux-desktop action "${action}". Use guide, configure, or doctor.`);
+  }
+
+  if (args[0] === 'migration') {
+    const action = args[1] ?? 'prepare';
+    if (action === 'prepare') {
+      console.log('Inventorying and hashing portable state plus recovery evidence; large histories can take several minutes…');
+      const plan = prepareMigration();
+      printMigrationManifest(plan.manifest);
+      for (const warning of plan.warnings) console.log(`WARNING: ${warning}`);
+      console.log('No archive was written and no account was changed.');
+      return;
+    }
+    if (action === 'export') {
+      const passphrase = await migrationPassphrase(args, true, true);
+      console.log('Inventorying, hashing, compressing, and encrypting the migration archive…');
+      const result = await exportMigration(passphrase, optionValue(args, '--output'));
+      console.log(`Encrypted migration archive created: ${result.output}`);
+      printMigrationManifest(result.manifest);
+      for (const warning of result.warnings) console.log(`WARNING: ${warning}`);
+      console.log('Keep the archive and passphrase separately. The archive contains credentials and private history.');
+      return;
+    }
+    if (action === 'inspect' || action === 'verify' || action === 'import') {
+      const archive = args[2]?.trim();
+      if (!archive || archive.startsWith('--')) throw new Error(`migration ${action} requires an archive path.`);
+      const passphrase = await migrationPassphrase(args, false);
+      if (action === 'inspect') {
+        const manifest = await inspectMigration(archive, passphrase);
+        console.log('Migration archive decrypted and every file hash verified.');
+        printMigrationManifest(manifest);
+        return;
+      }
+      if (action === 'verify') {
+        const manifest = await verifyMigration(archive, passphrase);
+        console.log(`Migration archive verified: ${manifest.entries.length} file(s), ${humanBytes(manifest.totalBytes)}, authentication tag and all SHA-256 hashes valid.`);
+        return;
+      }
+      const result = await importMigration(archive, passphrase, { replaceExisting: args.includes('--replace-existing') });
+      console.log(`Migration imported and verified: ${result.written} file(s) written; ${result.identical} already identical.`);
+      if (result.backupDir) console.log(`Replaced target files were backed up to: ${result.backupDir}`);
+      if (result.recoveryDir) console.log(`Windows-only Desktop recovery evidence was archived at: ${result.recoveryDir}`);
+      if (result.desktopLinksDetached) console.log(`${result.desktopLinksDetached} Windows Desktop link(s) were detached from live Linux profiles; recovery evidence was preserved.`);
+      if (result.portabilityReviewFile) console.log(`Windows path review written to: ${result.portabilityReviewFile}`);
+      const reauth = result.manifest.accounts.filter((account) => account.status === 'reauth-required');
+      if (reauth.length) console.log(`${reauth.length} saved account(s) still require official re-authentication; none were deleted.`);
+      if (process.platform === 'linux') console.log('Desktop apps require one initial Linux sign-in per provider account; Windows cookies were not injected.');
+      return;
+    }
+    throw new Error(`Unsupported migration action "${action}". Use prepare, export, inspect, verify, or import.`);
   }
 
   if (args[0] === 'restore') {

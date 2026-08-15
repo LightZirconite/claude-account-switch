@@ -7,6 +7,8 @@ import test from 'node:test';
 
 import {
   buildLauncherAction,
+  buildLinuxDesktopEntry,
+  buildLinuxSystemdUnits,
   buildRuntimePathArgs,
   buildSchedulerAction,
   buildWindowsSchedulerRegistrationScript,
@@ -15,6 +17,7 @@ import {
   posixShellQuote,
   quoteWindowsArgument,
   schedulerSetupNeedsAttention,
+  systemdExecArgument,
   windowsArgumentLine,
   type RuntimeLocations,
 } from '../src/installer';
@@ -191,6 +194,56 @@ test('POSIX and desktop launchers quote metacharacters instead of evaluating the
   const desktop = desktopExecArgument('a b$HOME`cmd`%f\\tail');
   assert.equal(desktop, '"a b\\$HOME\\`cmd\\`%%f\\\\tail"');
   assert.throws(() => desktopExecArgument('line\nbreak'), /line breaks/i);
+});
+
+test('Linux systemd user units are no-shell, persistent, and preserve literal percent signs', () => {
+  const action = {
+    exe: '/opt/Node Runtime/bin/node',
+    args: [
+      '/opt/Switch 100%/dist/cli.js',
+      'keep-alive',
+      '--scheduler-runtime',
+      '--switch-home', '/home/test/.local/state/switch 100%',
+      '--claude-config', '/home/test/.config/claude',
+      '--codex-home', '/home/test/.config/codex',
+      '--codex-bin', '/home/test/.local/bin/codex',
+    ],
+    cwd: '/opt/Switch 100%',
+  };
+  const units = buildLinuxSystemdUnits(action);
+
+  assert.match(units.service, /^\[Service\]$/m);
+  assert.match(units.service, /Type=oneshot/);
+  assert.match(units.service, /NoNewPrivileges=true/);
+  assert.match(units.service, /PrivateTmp=true/);
+  assert.match(units.service, /ExecStart="\/opt\/Node Runtime\/bin\/node"/);
+  assert.match(units.service, /100%%/);
+  assert.doesNotMatch(units.service, /\/bin\/(?:ba)?sh|sh -c/);
+  assert.match(units.timer, /OnCalendar=\*-\*-\* 00,06,12,18:00:00/);
+  assert.match(units.timer, /Persistent=true/);
+  assert.match(units.timer, /WantedBy=timers.target/);
+  assert.equal(systemdExecArgument('a"b\\c%'), '"a\\"b\\\\c%%"');
+  assert.throws(() => systemdExecArgument('bad\nunit'), /single-line/i);
+});
+
+test('Linux desktop entry uses TryExec and direct argv without shell interpolation', () => {
+  const action = {
+    exe: '/home/test/Node Runtime/bin/node',
+    args: [
+      '/home/test/Switch 100%/dist/cli.js',
+      '--switch-home', '/home/test/.switch data',
+      '--claude-config', '/home/test/.claude',
+      '--codex-home', '/home/test/.codex',
+    ],
+    cwd: '/home/test/Switch 100%',
+  };
+  const desktop = buildLinuxDesktopEntry(action);
+  assert.match(desktop, /^Version=1\.0$/m);
+  assert.match(desktop, /^TryExec=\/home\/test\/Node Runtime\/bin\/node$/m);
+  assert.match(desktop, /^Terminal=true$/m);
+  assert.match(desktop, /^StartupNotify=true$/m);
+  assert.match(desktop, /Exec="\/home\/test\/Node Runtime\/bin\/node"/);
+  assert.doesNotMatch(desktop, /sh -c|cmd\.exe|powershell/i);
 });
 
 test('headless scheduler skips an absent Codex provider without requiring CODEX_BIN', () => {

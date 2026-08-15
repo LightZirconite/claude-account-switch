@@ -9,7 +9,7 @@ const options = {
   bundle: true,
   platform: 'node',
   format: 'esm',
-  target: 'node20',
+  target: 'node22',
   // Keep npm deps (ink, react, clipboardy, jsonc-parser) external; only bundle our own source.
   // Avoids bundling ink's yoga WASM and keeps the build simple/robust.
   packages: 'external',
