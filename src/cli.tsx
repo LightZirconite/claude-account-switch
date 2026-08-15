@@ -81,6 +81,7 @@ import {
   installAll,
   uninstallAll,
   installState,
+  schedulerSetupNeedsAttention,
   shouldOfferSetup,
   markSetupOffered,
   schedulerOnlyInstall,
@@ -1105,7 +1106,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider, codexCursor]);
 
-  // First run: offer the one-click setup (shortcuts + auto keep-alive) exactly once.
+  // Offer setup on first run and again when an installed scheduler needs migration.
   useEffect(() => {
     if (shouldOfferSetup()) {
       markSetupOffered();
@@ -2000,6 +2001,8 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
 
   // ---------- input handling ----------
   useInput((input, key) => {
+    const isEnter = !!key.return || input === '\r' || input === '\n';
+
     if (mode === 'list') {
       if (key.leftArrow) {
         setProvider(switchProviderTab({ provider, cursors: { claude: cursor, codex: codexCursor } }, 'left').provider);
@@ -2009,6 +2012,12 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       if (key.rightArrow) {
         setProvider(switchProviderTab({ provider, cursors: { claude: cursor, codex: codexCursor } }, 'right').provider);
         setStatus('Codex accounts');
+        return;
+      }
+      if (key.tab) {
+        const next = provider === 'claude' ? 'codex' : 'claude';
+        setProvider(switchProviderTab({ provider, cursors: { claude: cursor, codex: codexCursor } }, next === 'claude' ? 'left' : 'right').provider);
+        setStatus(`${next === 'claude' ? 'Claude' : 'Codex'} accounts`);
         return;
       }
       if (busy && key.escape && bulkRefreshAbortRef.current) {
@@ -2049,7 +2058,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           setCodexCursor((c) => moveCursor(codexProfiles.length, c, 'first', listCapacity));
         } else if (input === 'G') {
           setCodexCursor((c) => moveCursor(codexProfiles.length, c, 'last', listCapacity));
-        } else if (key.return && codexSelected) beginCodexSwitch(codexSelected);
+        } else if (isEnter && codexSelected) beginCodexSwitch(codexSelected);
         else if (input === 'a') void startCodexAdd();
         else if (input === 'i') openImportMenu();
         else if (input === 'I') {
@@ -2084,7 +2093,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       else if (key.pageDown) setCursor((c) => moveCursor(profiles.length, c, 'pageNext', listCapacity));
       else if (input === 'g') setCursor((c) => moveCursor(profiles.length, c, 'first', listCapacity));
       else if (input === 'G') setCursor((c) => moveCursor(profiles.length, c, 'last', listCapacity));
-      else if (key.return) {
+      else if (isEnter) {
         if (selected) beginSwitch(selected);
       } else if (input === 'a') void startAdd(selected?.needsReauth ? selected.email : undefined);
       else if (input === 'A') startCaptureDesktop();
@@ -2145,7 +2154,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         setHelpPage((page) => (page - 1 + pageCount) % pageCount);
       } else if (key.rightArrow || key.downArrow || key.pageDown || input === 'j') {
         setHelpPage((page) => (page + 1) % pageCount);
-      } else if (key.return || key.escape || input === '?' || input === 'q') {
+      } else if (isEnter || key.escape || input === '?' || input === 'q') {
         setMode('list');
       }
       return;
@@ -2155,7 +2164,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       if (key.escape) {
         setBuffer('');
         setMode('list');
-      } else if (key.return) {
+      } else if (isEnter) {
         const query = buffer.trim().toLowerCase();
         if (query) setLastSearch(buffer.trim());
         const collection = provider === 'claude' ? profiles : codexProfiles;
@@ -2189,7 +2198,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       if (busy) return;
       if (input === 'i') runInstall();
       else if (input === 'x') runUninstall();
-      else if (input === 'q' || key.escape || key.return) {
+      else if (input === 'q' || key.escape || isEnter || key.leftArrow || key.rightArrow || key.upArrow || key.downArrow || key.tab) {
         setSetupReport(null);
         setMode('list');
       }
@@ -2201,7 +2210,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         codexAddAbortRef.current?.abort();
         setBuffer('');
         setBusy('Cancelling Codex login…');
-      } else if (key.return) {
+      } else if (isEnter) {
         void submitCodexCallbackUrl();
       } else if (!codexCallbackBusy && (key.backspace || key.delete)) {
         setBuffer((value) => value.slice(0, -1));
@@ -2212,7 +2221,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     }
 
     if (mode === 'codexConfirmSwitch') {
-      if ((input === 'y' || key.return) && pendingCodexSwitch) void doCodexSwitch(pendingCodexSwitch);
+      if ((input === 'y' || isEnter) && pendingCodexSwitch) void doCodexSwitch(pendingCodexSwitch);
       else if (input === 'n' || key.escape) {
         setPendingCodexSwitch(null);
         setMode('list');
@@ -2239,7 +2248,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     }
 
     if (mode === 'codexRename') {
-      if (key.return) {
+      if (isEnter) {
         if (codexSelected && buffer.trim()) setCodexStore(renameCodexProfile(codexSelected.id, buffer.trim()));
         setMode('list');
       } else if (key.escape) setMode('list');
@@ -2249,7 +2258,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     }
 
     if (mode === 'confirmSwitch') {
-      if (input === 'y' || key.return) {
+      if (input === 'y' || isEnter) {
         if (pendingSwitch) void doSwitch(pendingSwitch.profile);
       } else if (input === 'n' || key.escape) {
         setPendingSwitch(null);
@@ -2280,7 +2289,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     }
 
     if (mode === 'rename') {
-      if (key.return) {
+      if (isEnter) {
         if (selected && buffer.trim()) {
           const next = mutateStore((fresh) => {
             const profile = fresh.profiles.find((candidate) => candidate.id === selected.id);
@@ -2308,7 +2317,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       const total = importItems.length;
       if (key.upArrow) setImportCursor((c) => (c > 0 ? c - 1 : Math.max(0, total - 1)));
       else if (key.downArrow) setImportCursor((c) => (c < total - 1 ? c + 1 : 0));
-      else if (key.return) {
+      else if (isEnter) {
         if (importItems[importCursor]) void doImportItem(importItems[importCursor]);
       } else if (input === 'o') {
         openFolder(providerImportDir(provider));
@@ -2324,7 +2333,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     }
 
     if (mode === 'importPath') {
-      if (key.return) {
+      if (isEnter) {
         void doImportPath(buffer);
       } else if (key.escape) {
         setMode('importMenu');
@@ -2351,7 +2360,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         setBuffer('');
         setMode('list');
         setStatus('Claude authorization cancelled. No account was changed.');
-      } else if (key.return) {
+      } else if (isEnter) {
         void submitAddCode();
       } else if (key.backspace || key.delete) {
         setBuffer((value) => value.slice(0, -1));
@@ -2365,7 +2374,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       if (key.escape) {
         setMode('list');
         setStatus('Desktop capture cancelled.');
-      } else if (key.return) {
+      } else if (isEnter) {
         setBuffer('');
         setMode('capturingDesktopLabel');
       }
@@ -2376,7 +2385,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       if (key.escape) {
         setMode('list');
         setStatus('Desktop capture cancelled.');
-      } else if (key.return) {
+      } else if (isEnter) {
         desktopLabelRef.current = buffer.trim();
         setBuffer('');
         setMode('capturingDesktopEmail');
@@ -2393,7 +2402,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       if (key.escape) {
         setMode('list');
         setStatus('Desktop capture cancelled.');
-      } else if (key.return) {
+      } else if (isEnter) {
         void finalizeDesktopCapture(buffer.trim());
       } else if (key.backspace || key.delete) {
         setBuffer((b) => b.slice(0, -1));
@@ -2406,7 +2415,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     if (mode === 'message') {
       if (input === 'o' && message?.openFolder) {
         openFolder(message.openFolder);
-      } else if (key.return || key.escape || input === 'q') {
+      } else if (isEnter || key.escape || input === 'q') {
         setMessage(null);
         setMode('list');
       }
@@ -2665,10 +2674,19 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           <Box marginTop={1} flexDirection="column">
             {(() => {
               const st = installState();
+              const schedulerNeedsUpdate = schedulerSetupNeedsAttention(st);
               return (
-                <Text dimColor>
-                  Current: shortcuts {st.shortcuts ? '✓' : '—'} · auto keep-alive {st.scheduler ? '✓' : '—'}
-                </Text>
+                <>
+                  <Text dimColor>
+                    Current: shortcuts {st.shortcuts ? '✓' : '—'} · auto keep-alive{' '}
+                    {schedulerNeedsUpdate
+                      ? <Text color="yellow">update required</Text>
+                      : st.scheduler ? '✓' : '—'}
+                  </Text>
+                  {schedulerNeedsUpdate ? (
+                    <Text color="yellow">Press i to install the missed-run and retry reliability update.</Text>
+                  ) : null}
+                </>
               );
             })()}
           </Box>

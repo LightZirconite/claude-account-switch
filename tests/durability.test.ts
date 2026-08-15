@@ -21,6 +21,7 @@ import {
   applyProfile,
   backupLive,
   claudeLiveAuthJournalPath,
+  getLiveAccount,
   inspectClaudeLiveAuthRecovery,
   recoverClaudeLiveAuthTransaction,
   restoreFromBackup,
@@ -1281,6 +1282,43 @@ test('Codex live reconciliation opts into safe restart lock recovery', async () 
   });
 
   assert.equal(reconciled.profile?.accountId, auth.tokens.account_id);
+  assert.equal(fs.existsSync(lockDir), false);
+});
+
+test('stale lock with an alive PID (PID reuse) is reclaimed when heartbeat age exceeds staleMs', async () => {
+  resetRoot();
+  const lockName = 'pid-reuse-stale-recovery';
+  const lockDir = path.join(dataDir(), 'locks', `${lockName}.lock`);
+  writeJson(path.join(lockDir, 'owner.json'), {
+    pid: process.pid, // current process is definitely alive!
+    ownerId: 'previous-generation-reused-pid',
+    at: Date.now() - 120_000,
+    name: lockName,
+  });
+  const old = new Date(Date.now() - 120_000);
+  fs.utimesSync(lockDir, old, old);
+  let entered = false;
+
+  await withFileLock(lockName, async () => {
+    entered = true;
+  }, { staleMs: 10, timeoutMs: 1_000, recoverAbandoned: true });
+
+  assert.equal(entered, true);
+  assert.equal(fs.existsSync(lockDir), false);
+});
+
+test('Claude getLiveAccount and mutateStore safely reclaim abandoned restart locks', () => {
+  resetRoot();
+  const lockDir = path.join(dataDir(), 'locks', 'claude-live-auth.lock');
+  writeJson(path.join(lockDir, 'owner.json'), {
+    pid: 2_147_483_647,
+    ownerId: 'dead-claude-worker',
+    at: Date.now(),
+    name: 'claude-live-auth',
+  });
+
+  const live = getLiveAccount();
+  assert.equal(live.claudeAiOauth, null);
   assert.equal(fs.existsSync(lockDir), false);
 });
 

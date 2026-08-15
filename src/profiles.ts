@@ -1105,7 +1105,7 @@ export function saveStore(store: ProfilesStore): void {
     } catch {
       /* sidecar is best-effort */
     }
-  });
+  }, { recoverAbandoned: true });
 }
 
 /**
@@ -1142,7 +1142,7 @@ export function mutateStore(mutator: (store: ProfilesStore) => void): ProfilesSt
     atomicWriteFile(lastGoodPath(), content);
     clearArchiveMarkersForCommittedProfiles(store);
     return store;
-  });
+  }, { recoverAbandoned: true });
 }
 
 /**
@@ -1155,7 +1155,7 @@ export function mutateStoreWithLiveAccount(
   return withFileLockSync('claude-live-auth', () => {
     const live = readLiveAccountUnlocked();
     return mutateStore((store) => mutator(store, live));
-  });
+  }, { recoverAbandoned: true });
 }
 
 /**

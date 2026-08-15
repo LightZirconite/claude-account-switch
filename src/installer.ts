@@ -15,6 +15,7 @@ export const APP_NAME = 'Claude + Codex Account Switch';
 const LEGACY_APP_NAME = 'Claude Account Switch';
 const TASK_ID = 'ClaudeAccountSwitch-KeepAlive'; // Windows task / launchd label / cron marker
 const KEEPALIVE_INTERVAL_HOURS = 6;
+export const CURRENT_SCHEDULER_SPEC_VERSION = 1;
 
 export interface StepResult {
   name: string;
@@ -166,8 +167,9 @@ function stateFile(): string {
   return path.join(dataDir(), '.install-state.json');
 }
 
-interface InstallState {
+export interface InstallState {
   scheduler?: boolean;
+  schedulerSpecVersion?: number;
   shortcuts?: boolean;
   at?: string;
 }
@@ -188,12 +190,17 @@ function writeState(patch: InstallState): void {
   }
 }
 
-/** Whether the first-run setup prompt should be offered (nothing installed, never asked). */
+/** Whether an installed scheduler predates the reliability contract in this build. */
+export function schedulerSetupNeedsAttention(state: InstallState): boolean {
+  return state.scheduler === true && state.schedulerSpecVersion !== CURRENT_SCHEDULER_SPEC_VERSION;
+}
+
+/** Whether first-run setup or a required scheduler migration should be offered. */
 export function shouldOfferSetup(): boolean {
   const s = installState();
-  return !s.scheduler && !s.shortcuts && !s.at;
+  return (!s.scheduler && !s.shortcuts && !s.at) || schedulerSetupNeedsAttention(s);
 }
-/** Record that we offered setup, so we don't nag again even if the user declines. */
+/** Record a first-run offer. A stale installed scheduler keeps prompting until repaired. */
 export function markSetupOffered(): void {
   if (!installState().at) writeState({});
 }
@@ -279,7 +286,7 @@ export function buildWindowsSchedulerRegistrationScript(action: LaunchAction): s
     `$ErrorActionPreference = 'Stop'`,
     `$action = New-ScheduledTaskAction -Execute ${psQuote(action.exe)} -Argument ${psQuote(windowsArgumentLine(action.args))} -WorkingDirectory ${psQuote(action.cwd)}`,
     `$triggers = @(${triggerHours.map((hour) => `New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.AddHours(${hour}))`).join('; ')})`,
-    `$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew`,
+    `$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RunOnlyIfNetworkAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5)`,
     `Register-ScheduledTask -TaskName ${psQuote(TASK_ID)} -Action $action -Trigger $triggers -Settings $settings -Description ${psQuote(`${APP_NAME} provider-isolated keep-alive`)} -Force | Out-Null`,
   ].join('\n');
 }
@@ -289,6 +296,14 @@ interface WindowsRegisteredAction {
   Arguments?: string;
   WorkingDirectory?: string;
   TriggerCount?: number;
+  StartWhenAvailable?: boolean;
+  ExecutionTimeLimit?: string;
+  MultipleInstances?: string;
+  DisallowStartIfOnBatteries?: boolean;
+  StopIfGoingOnBatteries?: boolean;
+  RunOnlyIfNetworkAvailable?: boolean;
+  RestartCount?: number;
+  RestartInterval?: string;
 }
 
 interface WindowsTaskSnapshot {
@@ -336,7 +351,7 @@ function inspectWindowsRegisteredAction(): { ok: boolean; action?: WindowsRegist
     `$task = Get-ScheduledTask -TaskName ${psQuote(TASK_ID)}`,
     `$actions = @($task.Actions)`,
     `if ($actions.Count -ne 1) { throw "Expected exactly one registered action; found $($actions.Count)." }`,
-    `[pscustomobject]@{ Execute = $actions[0].Execute; Arguments = $actions[0].Arguments; WorkingDirectory = $actions[0].WorkingDirectory; TriggerCount = @($task.Triggers).Count } | ConvertTo-Json -Compress`,
+    `[pscustomobject]@{ Execute = $actions[0].Execute; Arguments = $actions[0].Arguments; WorkingDirectory = $actions[0].WorkingDirectory; TriggerCount = @($task.Triggers).Count; StartWhenAvailable = $task.Settings.StartWhenAvailable; ExecutionTimeLimit = [string]$task.Settings.ExecutionTimeLimit; MultipleInstances = [string]$task.Settings.MultipleInstances; DisallowStartIfOnBatteries = $task.Settings.DisallowStartIfOnBatteries; StopIfGoingOnBatteries = $task.Settings.StopIfGoingOnBatteries; RunOnlyIfNetworkAvailable = $task.Settings.RunOnlyIfNetworkAvailable; RestartCount = $task.Settings.RestartCount; RestartInterval = [string]$task.Settings.RestartInterval } | ConvertTo-Json -Compress`,
   ].join('\n');
   const result = run('powershell', ['-NoProfile', '-NonInteractive', '-Command', script]);
   if (!result.ok) return { ok: false, detail: result.err || 'could not inspect the registered task action' };
@@ -365,7 +380,15 @@ function winSchedulerInstall(action: LaunchAction): StepResult {
     && sameWindowsPath(inspected.action?.Execute, action.exe)
     && inspected.action?.Arguments === windowsArgumentLine(action.args)
     && sameWindowsPath(inspected.action?.WorkingDirectory, action.cwd)
-    && inspected.action?.TriggerCount === 24 / KEEPALIVE_INTERVAL_HOURS;
+    && inspected.action?.TriggerCount === 24 / KEEPALIVE_INTERVAL_HOURS
+    && inspected.action?.StartWhenAvailable === true
+    && inspected.action?.ExecutionTimeLimit === 'PT30M'
+    && inspected.action?.MultipleInstances === 'IgnoreNew'
+    && inspected.action?.DisallowStartIfOnBatteries === false
+    && inspected.action?.StopIfGoingOnBatteries === false
+    && inspected.action?.RunOnlyIfNetworkAvailable === true
+    && inspected.action?.RestartCount === 3
+    && inspected.action?.RestartInterval === 'PT5M';
   const actualAction = actionMatches ? {
     exe: inspected.action!.Execute!,
     args: action.args,
@@ -378,7 +401,7 @@ function winSchedulerInstall(action: LaunchAction): StepResult {
     : !inspected.ok
       ? inspected.detail
       : !actionMatches
-        ? 'Task Scheduler changed the registered executable, arguments, working directory, or trigger count; installation was not accepted.'
+        ? 'Task Scheduler changed the registered action, triggers, or reliability settings; installation was not accepted.'
         : probe.detail;
   const rollback = ok ? null : restoreWindowsTask(previous.snapshot);
   return {
@@ -708,7 +731,11 @@ function codexCredentialStoreInstall(): StepResult {
 /** Install everything: recurring keep-alive + shortcuts. Returns a per-step report. */
 export function installAll(): InstallReport {
   const steps = [codexCredentialStoreInstall(), schedulerInstall(), shortcutsInstall()];
-  writeState({ scheduler: steps[1].ok, shortcuts: steps[2].ok });
+  writeState({
+    scheduler: steps[1].ok,
+    schedulerSpecVersion: steps[1].ok ? CURRENT_SCHEDULER_SPEC_VERSION : 0,
+    shortcuts: steps[2].ok,
+  });
   logger.info('installer: installAll', { steps: steps.map((s) => `${s.name}:${s.ok}`) });
   return { steps };
 }
@@ -716,7 +743,7 @@ export function installAll(): InstallReport {
 /** Remove everything we installed. */
 export function uninstallAll(): InstallReport {
   const steps = [schedulerUninstall(), shortcutsUninstall()];
-  writeState({ scheduler: false, shortcuts: false });
+  writeState({ scheduler: false, schedulerSpecVersion: 0, shortcuts: false });
   logger.info('installer: uninstallAll');
   return { steps };
 }
@@ -724,11 +751,14 @@ export function uninstallAll(): InstallReport {
 /** Install only the recurring keep-alive job (no shortcuts). */
 export function schedulerOnlyInstall(): StepResult {
   const s = schedulerInstall();
-  writeState({ scheduler: s.ok });
+  writeState({
+    scheduler: s.ok,
+    schedulerSpecVersion: s.ok ? CURRENT_SCHEDULER_SPEC_VERSION : 0,
+  });
   return s;
 }
 export function schedulerOnlyUninstall(): StepResult {
   const s = schedulerUninstall();
-  writeState({ scheduler: false });
+  writeState({ scheduler: false, schedulerSpecVersion: 0 });
   return s;
 }

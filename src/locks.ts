@@ -90,9 +90,10 @@ function tryAcquire(name: string, staleMs: number): HeldLock | null {
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
     try {
-      const age = Date.now() - fs.statSync(p).mtimeMs;
+      const stat = fs.statSync(p);
+      const age = Date.now() - stat.mtimeMs;
       const owner = readOwner(p);
-      if (age > staleMs && (!owner || !processAlive(owner.pid))) {
+      if (age > staleMs || !owner || !processAlive(owner.pid)) {
         // Never unlink a stale-looking lock here. Another waiter may already have
         // removed/reacquired it after this process observed the old owner, and an
         // unfenced rmSync would then delete the fresh owner's lock directory.
@@ -107,7 +108,7 @@ function tryAcquire(name: string, staleMs: number): HeldLock | null {
 }
 
 /**
- * Reclaim one lock whose recorded owner is provably dead.
+ * Reclaim one lock whose recorded owner is provably dead or whose heartbeat is stale.
  *
  * This is deliberately unavailable to ordinary waiters. A secondary, independently
  * owned takeover lock serializes the only removers, and the primary ownerId is reread
@@ -130,37 +131,42 @@ function reclaimAbandonedLock(name: string, staleMs: number): boolean {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
       throw error;
     }
+    const age = Date.now() - stat.mtimeMs;
     const owner = readOwner(selected);
     const ownerIsValid = validOwner(owner, name);
     if (ownerIsValid) {
-      if (processAlive(owner.pid)) return false;
-    } else if (Date.now() - stat.mtimeMs <= staleMs) {
+      // If owner process is still alive AND the lock has a fresh heartbeat, do not reclaim.
+      if (processAlive(owner.pid) && age <= staleMs) return false;
+    } else if (age <= staleMs) {
       // Missing/corrupt ownership metadata cannot prove an immediate crash. Require
       // the normal stale interval and preserve it for manual inspection until then.
       return false;
     }
 
     const rechecked = readOwner(selected);
+    let recheckedStat: fs.Stats;
+    try {
+      recheckedStat = fs.statSync(selected);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      throw error;
+    }
+    const recheckedAge = Date.now() - recheckedStat.mtimeMs;
     if (ownerIsValid) {
       if (!validOwner(rechecked, name)
         || rechecked.ownerId !== owner.ownerId
-        || rechecked.pid !== owner.pid
-        || processAlive(rechecked.pid)) return false;
+        || rechecked.pid !== owner.pid) return false;
+      if (processAlive(rechecked.pid) && recheckedAge <= staleMs) return false;
     } else {
-      let currentStat: fs.Stats;
-      try {
-        currentStat = fs.statSync(selected);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
-        throw error;
-      }
       if (validOwner(rechecked, name)
-        || currentStat.mtimeMs !== stat.mtimeMs
-        || currentStat.ctimeMs !== stat.ctimeMs) return false;
+        || recheckedStat.mtimeMs !== stat.mtimeMs
+        || recheckedStat.ctimeMs !== stat.ctimeMs) return false;
     }
 
     fs.rmSync(selected, { recursive: true, force: false });
     return true;
+  } catch {
+    return false;
   } finally {
     release(takeover);
   }
@@ -181,12 +187,18 @@ function tryAcquireWithRecovery(
   }
   if (held || !recoverAbandoned) return held;
 
-  const owner = readOwner(lockPath(name));
-  // A valid dead owner is conclusive even before the generic stale interval. This
-  // makes recovery immediate after a crash or reboot while corrupt owner metadata
-  // remains subject to the stale interval and the generation fence above.
-  if (validOwner(owner, name) && !processAlive(owner.pid)) {
-    reclaimAbandonedLock(name, staleMs);
+  const selected = lockPath(name);
+  try {
+    const stat = fs.statSync(selected);
+    const age = Date.now() - stat.mtimeMs;
+    const owner = readOwner(selected);
+    // A valid dead owner is conclusive immediately. A lock whose heartbeat has expired
+    // (e.g. from PID recycling or power loss) is reclaimed once staleMs has elapsed.
+    if ((validOwner(owner, name) && !processAlive(owner.pid)) || age > staleMs) {
+      reclaimAbandonedLock(name, staleMs);
+    }
+  } catch {
+    /* lock may have been released concurrently */
   }
   return null;
 }

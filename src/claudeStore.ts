@@ -165,7 +165,7 @@ export function readLiveAccountUnlocked(): LiveAccount {
 
 /** Return one coherent live-auth snapshot; never expose the two-file transaction midpoint. */
 export function getLiveAccount(): LiveAccount {
-  return withFileLockSync('claude-live-auth', () => readLiveAccountUnlocked());
+  return withFileLockSync('claude-live-auth', () => readLiveAccountUnlocked(), { recoverAbandoned: true });
 }
 
 // ---------- Backups ----------
@@ -813,7 +813,7 @@ export function restoreFromBackup(
           cause: error,
         });
       }
-    });
+    }, { recoverAbandoned: true });
   } finally {
     try {
       releaseSelectedBackup();
@@ -894,7 +894,7 @@ export function updateLiveCredentials(claudeAiOauth: ClaudeAiOauth, organization
     else delete obj.organizationUuid;
     writeCredentialsText(JSON.stringify(obj, null, 2) + '\n');
     logger.info('synced rotated token to live credentials');
-  });
+  }, { recoverAbandoned: true });
 }
 
 /** Both files must still parse as JSON after a write. */
@@ -1136,5 +1136,5 @@ export function applyProfile(
       logger.error('apply failed, rolled back', e, { profile: p.email });
       return { ok: false, backupDir, rollback: 'succeeded', error: redactText(e) };
     }
-  });
+  }, { recoverAbandoned: true });
 }

@@ -10,9 +10,11 @@ import {
   buildRuntimePathArgs,
   buildSchedulerAction,
   buildWindowsSchedulerRegistrationScript,
+  CURRENT_SCHEDULER_SPEC_VERSION,
   desktopExecArgument,
   posixShellQuote,
   quoteWindowsArgument,
+  schedulerSetupNeedsAttention,
   windowsArgumentLine,
   type RuntimeLocations,
 } from '../src/installer';
@@ -160,8 +162,28 @@ test('Windows registration uses structured ScheduledTasks fields instead of scht
   assert.match(script, /-WorkingDirectory/);
   assert.match(script, /Register-ScheduledTask/);
   assert.equal((script.match(/New-ScheduledTaskTrigger -Daily/g) ?? []).length, 4);
+  assert.match(script, /-StartWhenAvailable/);
+  assert.match(script, /-AllowStartIfOnBatteries/);
+  assert.match(script, /-DontStopIfGoingOnBatteries/);
+  assert.match(script, /-RunOnlyIfNetworkAvailable/);
+  assert.match(script, /-RestartCount 3/);
+  assert.match(script, /-RestartInterval \(New-TimeSpan -Minutes 5\)/);
+  assert.match(script, /-ExecutionTimeLimit \(New-TimeSpan -Minutes 30\)/);
   assert.doesNotMatch(script, /\bschtasks\b|\/TR\b/i);
   assert.ok(script.includes(windowsArgumentLine(action.args).replace(/'/g, "''")));
+});
+
+test('legacy installed schedulers require a one-time reliability migration', () => {
+  assert.equal(schedulerSetupNeedsAttention({ scheduler: true }), true);
+  assert.equal(schedulerSetupNeedsAttention({ scheduler: true, schedulerSpecVersion: 0 }), true);
+  assert.equal(
+    schedulerSetupNeedsAttention({
+      scheduler: true,
+      schedulerSpecVersion: CURRENT_SCHEDULER_SPEC_VERSION,
+    }),
+    false,
+  );
+  assert.equal(schedulerSetupNeedsAttention({ scheduler: false }), false);
 });
 
 test('POSIX and desktop launchers quote metacharacters instead of evaluating them', () => {
