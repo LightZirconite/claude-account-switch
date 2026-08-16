@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import clipboard from 'clipboardy';
 import {
+  discoverMigrationArchiveInput,
   exportMigration,
   importMigration,
   inspectMigration,
@@ -497,6 +498,8 @@ type Mode =
   | 'importMenu'
   | 'importPath'
   | 'importing'
+  | 'migrationPassphrase'
+  | 'migrationImporting'
   | 'adding'
   | 'capturingDesktopConfirm'
   | 'capturingDesktopLabel'
@@ -549,6 +552,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const [mode, setMode] = useState<Mode>('list');
   const [status, setStatus] = useState<string>('');
   const [buffer, setBuffer] = useState<string>('');
+  const [migrationSource, setMigrationSource] = useState<string | null>(null);
   const [lastSearch, setLastSearch] = useState<string>('');
   const [pendingSwitch, setPendingSwitch] = useState<{ profile: Profile; pids: ProcInfo[] } | null>(null);
   const [pendingCodexSwitch, setPendingCodexSwitch] = useState<CodexProfile | null>(null);
@@ -1892,14 +1896,51 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     [claudeVersion, reloadCodexStore, showMessage],
   );
 
+  const doMigrationImport = useCallback(async (passphrase: string) => {
+    const source = migrationSource;
+    setBuffer('');
+    if (!source) {
+      showMessage('Migration import failed', ['The selected migration source is no longer available.'], 'error');
+      return;
+    }
+    setMode('migrationImporting');
+    try {
+      const result = await importMigration(source, passphrase, { replaceExisting: true });
+      const claude = reloadClaudeStore();
+      const codex = reloadCodexStore();
+      const reauth = result.manifest.accounts.filter((account) => account.status === 'reauth-required').length;
+      showMessage('Full migration imported and verified', [
+        `${result.written} file(s) restored; ${result.identical} were already identical.`,
+        `${claude.profiles.length} Claude account(s) and ${codex.profiles.length} Codex account(s) are now in the local stores.`,
+        ...(result.backupDir ? [`Replaced files were backed up first: ${result.backupDir}`] : []),
+        ...(result.recoveryDir ? [`Windows Desktop recovery evidence: ${result.recoveryDir}`] : []),
+        ...(result.portabilityReviewFile ? [`Linux path review: ${result.portabilityReviewFile}`] : []),
+        ...(reauth ? [`${reauth} saved account(s) still require an official sign-in; none were deleted.`] : []),
+        'The external migration folder was left untouched.',
+      ], 'success');
+    } catch (error) {
+      showMessage('Migration import failed', [redactText(error)], 'error');
+    } finally {
+      setMigrationSource(null);
+    }
+  }, [migrationSource, reloadClaudeStore, reloadCodexStore, showMessage]);
+
   const doImportPath = useCallback(async (rawTarget: string) => {
     const target = normalizeImportPath(rawTarget);
     if (!target) {
       openImportMenu();
       return;
     }
-    setMode('importing');
     try {
+      const migrationArchive = discoverMigrationArchiveInput(target);
+      if (migrationArchive) {
+        setMigrationSource(migrationArchive);
+        setBuffer('');
+        setStatus('');
+        setMode('migrationPassphrase');
+        return;
+      }
+      setMode('importing');
       if (provider === 'claude') {
         const discovered = importFromPath(target);
         const metadata = await recoverClaudeImportMetadata(discovered, claudeVersion);
@@ -2061,11 +2102,12 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       }
       if (input === 'M') {
         showMessage('Windows → Linux migration', [
-          'The complete migration is encrypted and deliberately runs from the CLI so its passphrase stays hidden.',
+          'The complete migration is encrypted and authenticated.',
           '1. node dist/cli.js migration prepare',
           '2. Close Claude and Codex normally.',
           '3. node dist/cli.js migration export',
-          'On Linux: migration inspect, then migration import (use --replace-existing only after inspection).',
+          'On Linux: press I, paste/drag the Coder folder, then enter its passphrase.',
+          'The app verifies every hash before writing and backs up replaced files.',
           'Press ? for the complete command reference.',
         ], 'info');
         return;
@@ -2374,6 +2416,30 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       }
       return;
     }
+
+    if (mode === 'migrationPassphrase') {
+      if (key.escape) {
+        setBuffer('');
+        setMigrationSource(null);
+        setStatus('Full migration import cancelled. Nothing was changed.');
+        setMode('list');
+      } else if (isEnter) {
+        if (buffer.length < 12) {
+          setStatus('The migration passphrase must contain at least 12 characters.');
+        } else {
+          const passphrase = buffer;
+          setBuffer('');
+          void doMigrationImport(passphrase);
+        }
+      } else if (key.backspace || key.delete) {
+        setBuffer((value) => value.slice(0, -1));
+      } else if (input && !key.ctrl && !key.meta) {
+        setBuffer((value) => (value + input).replace(/[\0\r\n]/g, ''));
+      }
+      return;
+    }
+
+    if (mode === 'migrationImporting') return;
 
     if (mode === 'adding') {
       if (claudeAddSubmissionRef.current || addBusy) {
@@ -2874,8 +2940,26 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           <Text wrap="wrap">Path: <Text color="green">{buffer}</Text><Text>▎</Text></Text>
           <Box marginTop={1} flexDirection="column">
             <Text dimColor>Type, paste, or drag one file/folder into this terminal.</Text>
-            <Text dimColor>Enter imports every valid account · external source stays untouched · Esc returns</Text>
+            <Text dimColor>A Coder migration folder is detected automatically · external source stays untouched</Text>
+            <Text dimColor>Enter imports every valid account · Esc returns</Text>
           </Box>
+        </Box>
+      ) : mode === 'migrationPassphrase' ? (
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
+          <Text bold color="cyan">FULL MIGRATION · DECRYPTION KEY</Text>
+          <Text wrap="truncate-end">Source: <Text color="green">{migrationSource ?? '(missing)'}</Text></Text>
+          <Text>Passphrase: <Text color="green">{'•'.repeat(Math.min(buffer.length, 64))}</Text><Text>▎</Text> <Text dimColor>({buffer.length} characters)</Text></Text>
+          <Box marginTop={1} flexDirection="column">
+            <Text dimColor>The passphrase is never displayed or logged.</Text>
+            <Text dimColor>Enter verifies the authenticated archive and every SHA-256 before restoring.</Text>
+            <Text dimColor>Enter authorizes differing files to be replaced after rollback backups · Esc cancels</Text>
+            {status ? <Text color="yellow">{status}</Text> : null}
+          </Box>
+        </Box>
+      ) : mode === 'migrationImporting' ? (
+        <Box width={W} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
+          <Spinner label="Verifying and restoring the complete migration…" color="cyan" />
+          <Text dimColor>Large histories can take several minutes. Existing differences are backed up before replacement.</Text>
         </Box>
       ) : mode === 'search' ? (
         <Box width={W} flexDirection="column" borderStyle="round" borderColor={providerColor} paddingX={1}>
@@ -3122,8 +3206,8 @@ Usage:
   switch.cmd migration prepare          Inventory everything before moving to Linux
   switch.cmd migration export [--output file] [--passphrase-file 0600-file]
                              Encrypt switcher + Claude/Codex portable state in one archive
-  switch.cmd migration inspect|verify <archive> [--passphrase-file 0600-file]
-  switch.cmd migration import <archive> [--replace-existing] [--passphrase-file 0600-file]
+  switch.cmd migration inspect|verify <archive-or-folder> [--passphrase-file 0600-file]
+  switch.cmd migration import <archive-or-folder> [--replace-existing] [--passphrase-file 0600-file]
                              Validate fully, back up conflicts, import atomically, verify
   switch.cmd linux-desktop guide|doctor|configure [distrobox-name]
                              CachyOS Ubuntu-24.04 Desktop integration
@@ -3572,7 +3656,7 @@ async function main(): Promise<void> {
     }
     if (action === 'inspect' || action === 'verify' || action === 'import') {
       const archive = args[2]?.trim();
-      if (!archive || archive.startsWith('--')) throw new Error(`migration ${action} requires an archive path.`);
+      if (!archive || archive.startsWith('--')) throw new Error(`migration ${action} requires an archive file or portable folder path.`);
       const passphrase = await migrationPassphrase(args, false);
       if (action === 'inspect') {
         const manifest = await inspectMigration(archive, passphrase);

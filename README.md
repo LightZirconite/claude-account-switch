@@ -59,6 +59,10 @@ switch.cmd uninstall
 On macOS and Linux, use `node dist/cli.js install` and
 `node dist/cli.js uninstall` instead. The installer reports shortcut and scheduler results
 independently, so a platform integration failure is visible without hiding successful steps.
+Interactive shortcuts target the source-controlled `launcher.cjs` bootstrap rather than the
+disposable `dist/cli.js` build output. If dependencies or the compiled CLI are missing, the
+bootstrap restores them with structured, shell-free child processes; an interactive failure stays
+visible instead of making the terminal window disappear immediately.
 Linux follows the XDG base-directory and user-directory conventions. Scheduled maintenance uses
 a validated, persistent user `systemd` timer with missed-run recovery; cron is used only when no
 user systemd manager is available. Generated units and Desktop Entries launch Node directly,
@@ -78,7 +82,7 @@ The account actions apply only to the visible provider.
 | Enter | switch to the selected account |
 | a | copy a remote authorization URL, then paste the returned code/callback |
 | A (Claude) | capture an optional machine-bound Claude Desktop session |
-| i / I | open the provider inbox / paste or drag a file or folder path |
+| i / I | open the provider inbox / paste or drag credentials or a full migration folder |
 | e / E | export selected / all portable credentials for the visible provider |
 | r | rename the selected account |
 | d | archive the selected non-active account without destroying credentials |
@@ -309,14 +313,19 @@ switch.cmd migration export
 # Non-interactive alternative: --passphrase-file C:\private\migration-passphrase
 ```
 
-On CachyOS, clone/build this project, copy the `.ccswitch-migration` file, and validate it before any
-write:
+On CachyOS, clone/build this project and copy either the `.ccswitch-migration` file or its portable
+folder. The CLI accepts both forms and requires exactly one archive directly inside a folder:
 
 ```sh
-node dist/cli.js migration inspect /path/to/archive.ccswitch-migration
-node dist/cli.js migration verify /path/to/archive.ccswitch-migration
-node dist/cli.js migration import /path/to/archive.ccswitch-migration
+node dist/cli.js migration inspect /path/to/Coder
+node dist/cli.js migration verify /path/to/Coder
+node dist/cli.js migration import /path/to/Coder
 ```
+
+The interactive path is shorter: press `I`, paste or drag the `Coder` folder, and enter the
+passphrase in the masked prompt. The TUI detects the archive, authenticates and hashes the complete
+payload before live writes, creates rollback backups for differing existing files, and leaves the
+external folder untouched.
 
 The archive uses `scrypt` key derivation, AES-256-GCM authenticated encryption, streaming Brotli
 compression and a SHA-256 for every file. Import decrypts and validates the complete archive into a
@@ -403,8 +412,8 @@ switch.cmd export-all claude
 switch.cmd export-all codex
 switch.cmd migration prepare
 switch.cmd migration export [--output <file>] [--passphrase-file <0600-file>]
-switch.cmd migration inspect|verify <archive> [--passphrase-file <0600-file>]
-switch.cmd migration import <archive> [--replace-existing] [--passphrase-file <0600-file>]
+switch.cmd migration inspect|verify <archive-or-folder> [--passphrase-file <0600-file>]
+switch.cmd migration import <archive-or-folder> [--replace-existing] [--passphrase-file <0600-file>]
 switch.cmd linux-desktop guide|configure|doctor
 switch.cmd doctor all
 switch.cmd keep-alive

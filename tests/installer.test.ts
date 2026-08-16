@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import test from 'node:test';
 
 import {
@@ -16,12 +17,27 @@ import {
   desktopExecArgument,
   posixShellQuote,
   quoteWindowsArgument,
+  launcherBootstrapEntry,
   schedulerSetupNeedsAttention,
   systemdExecArgument,
   windowsArgumentLine,
   type RuntimeLocations,
 } from '../src/installer';
 import { projectCodexFileCredentialStore } from '../src/codexConfig';
+
+const require = createRequire(import.meta.url);
+const launcherBootstrap = require('../launcher.cjs') as {
+  launcherState(root?: string, node?: string): {
+    root: string;
+    node: string;
+    dependencies: string;
+    entry: string;
+  };
+  requiredRepairs(state: { dependencies: string; entry: string }): {
+    installDependencies: boolean;
+    build: boolean;
+  };
+};
 
 const locations: RuntimeLocations = {
   switchHome: path.join('C:', 'Users', 'Test User', 'switch home'),
@@ -103,6 +119,39 @@ test('Windows shortcuts bypass cmd.exe and preserve custom runtime paths with me
   assert.deepEqual(action.args.slice(1), buildRuntimePathArgs(safeLocations));
   assert.equal(action.exe.toLowerCase().endsWith('.cmd'), false);
   assert.equal(action.cwd, path.resolve(path.join('C:', 'app')));
+});
+
+test('persisted launchers use a source-controlled bootstrap that detects missing build output', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'account-switch-launcher-'));
+  try {
+    const bootstrap = launcherBootstrapEntry(root);
+    assert.equal(bootstrap, path.join(path.resolve(root), 'launcher.cjs'));
+
+    const state = launcherBootstrap.launcherState(root, process.execPath);
+    assert.deepEqual(launcherBootstrap.requiredRepairs(state), {
+      installDependencies: true,
+      build: true,
+    });
+
+    fs.mkdirSync(state.dependencies, { recursive: true });
+    fs.mkdirSync(path.dirname(state.entry), { recursive: true });
+    fs.writeFileSync(state.entry, '// compiled CLI fixture\n', 'utf8');
+    assert.deepEqual(launcherBootstrap.requiredRepairs(state), {
+      installDependencies: false,
+      build: false,
+    });
+
+    const action = buildLauncherAction({
+      node: process.execPath,
+      entry: path.resolve('launcher.cjs'),
+      root: path.resolve('.'),
+      locations,
+    });
+    assert.equal(action.args[0], path.resolve('launcher.cjs'));
+    assert.equal(fs.existsSync(action.args[0]), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('direct launchers and scheduler actions share the same durable runtime projection', () => {

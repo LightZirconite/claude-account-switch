@@ -58,6 +58,10 @@ function entryScript(): string {
 function projectRoot(): string {
   return path.resolve(path.dirname(entryScript()), '..');
 }
+/** Stable source-controlled entry point used by interactive launchers. */
+export function launcherBootstrapEntry(root: string): string {
+  return path.join(path.resolve(root), 'launcher.cjs');
+}
 function nodeExe(): string {
   return process.execPath;
 }
@@ -147,8 +151,8 @@ export function buildLauncherAction(input: {
 }): LaunchAction {
   const runtimeArgs = buildRuntimePathArgs(input.locations);
   const root = path.resolve(input.root);
-  // Persisted launchers execute Node directly. Routing custom paths through switch.cmd
-  // would make cmd.exe reinterpret &, |, <, >, ^, %, and ! in otherwise valid paths.
+  // Persisted launchers execute Node directly. The source-controlled bootstrap can
+  // restore dependencies and dist without routing user paths through a shell.
   return { exe: path.resolve(input.node), args: [path.resolve(input.entry), ...runtimeArgs], cwd: root };
 }
 
@@ -166,7 +170,7 @@ function launcherCommand(): LaunchAction {
   const root = projectRoot();
   return buildLauncherAction({
     node: nodeExe(),
-    entry: entryScript(),
+    entry: launcherBootstrapEntry(root),
     root,
     locations: currentLocations(false),
   });

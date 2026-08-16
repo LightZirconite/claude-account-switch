@@ -5,10 +5,12 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+  discoverMigrationArchiveInput,
   exportMigration,
   importMigration,
   inspectMigration,
   readMigrationPassphraseFile,
+  resolveMigrationArchiveInput,
   verifyMigration,
 } from '../src/migration';
 
@@ -33,7 +35,8 @@ test('encrypted migration round-trips portable state, verifies hashes, and backs
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-migration-test-'));
   const source = path.join(root, 'source');
   const target = path.join(root, 'target');
-  const archive = path.join(root, 'portable.ccswitch-migration');
+  const portableFolder = path.join(root, 'Coder');
+  const archive = path.join(portableFolder, 'portable.ccswitch-migration');
   const previous = {
     switchHome: process.env.CLAUDE_SWITCH_HOME,
     claudeConfig: process.env.CLAUDE_CONFIG_DIR,
@@ -90,20 +93,22 @@ test('encrypted migration round-trips portable state, verifies hashes, and backs
     assert.equal(ciphertext.includes(Buffer.from('claude-secret-value')), false);
     assert.equal(ciphertext.includes(Buffer.from('codex-secret-value')), false);
 
-    const inspected = await inspectMigration(archive, passphrase);
+    assert.equal(resolveMigrationArchiveInput(portableFolder), path.resolve(archive));
+    assert.equal(discoverMigrationArchiveInput(portableFolder), path.resolve(archive));
+    const inspected = await inspectMigration(portableFolder, passphrase);
     assert.equal(inspected.archiveId, exported.manifest.archiveId);
-    assert.equal((await verifyMigration(archive, passphrase)).entries.length, inspected.entries.length);
+    assert.equal((await verifyMigration(portableFolder, passphrase)).entries.length, inspected.entries.length);
     await assert.rejects(inspectMigration(archive, 'wrong passphrase value'), /wrong passphrase|modified archive/i);
 
     setHomes(target);
     fs.writeFileSync(path.join(process.env.CLAUDE_CONFIG_DIR!, '.credentials.json'), '{"refreshToken":"target-conflict"}\n');
     await assert.rejects(
-      importMigration(archive, passphrase, quiet),
+      importMigration(portableFolder, passphrase, quiet),
       /--replace-existing/i,
     );
     assert.match(fs.readFileSync(path.join(process.env.CLAUDE_CONFIG_DIR!, '.credentials.json'), 'utf8'), /target-conflict/);
 
-    const imported = await importMigration(archive, passphrase, { ...quiet, replaceExisting: true });
+    const imported = await importMigration(portableFolder, passphrase, { ...quiet, replaceExisting: true });
     assert.ok(imported.written >= 5);
     assert.ok(imported.backupDir);
     assert.match(fs.readFileSync(path.join(process.env.CLAUDE_CONFIG_DIR!, '.credentials.json'), 'utf8'), /claude-secret-value/);

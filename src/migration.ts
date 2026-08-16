@@ -34,6 +34,7 @@ const MAX_PUBLIC_HEADER_BYTES = 64 * 1024;
 const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024 * 1024;
 const IO_CHUNK_BYTES = 1024 * 1024;
+const MIGRATION_EXTENSION = '.ccswitch-migration';
 
 export type MigrationScope = 'switch' | 'claude' | 'claude-meta' | 'codex' | 'recovery';
 
@@ -443,6 +444,46 @@ function validatePassphrase(passphrase: string): void {
   if (/\0|[\r\n]/u.test(passphrase)) throw new Error('Migration passphrase must be one line without NUL bytes.');
 }
 
+/**
+ * Resolve either an archive file or a portable folder containing exactly one
+ * migration archive. Directory lookup is deliberately shallow so an unrelated
+ * tree cannot silently select stale nested credentials.
+ */
+export function resolveMigrationArchiveInput(input: string): string {
+  const selected = path.resolve(input);
+  const stat = fs.lstatSync(selected);
+  if (stat.isSymbolicLink()) throw new Error('Migration input cannot be a symbolic link.');
+  if (stat.isFile()) return selected;
+  if (!stat.isDirectory()) throw new Error('Migration input must be a regular archive file or directory.');
+
+  const candidates = fs.readdirSync(selected, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(MIGRATION_EXTENSION))
+    .map((entry) => path.join(selected, entry.name))
+    .sort((left, right) => left.localeCompare(right));
+  if (!candidates.length) {
+    throw new Error(`No ${MIGRATION_EXTENSION} archive was found directly inside: ${selected}`);
+  }
+  if (candidates.length > 1) {
+    throw new Error(`Multiple ${MIGRATION_EXTENSION} archives were found inside ${selected}; select the intended archive file explicitly.`);
+  }
+  return candidates[0];
+}
+
+/** Return a migration archive only when a pasted generic import path represents one. */
+export function discoverMigrationArchiveInput(input: string): string | null {
+  const selected = path.resolve(input);
+  const stat = fs.lstatSync(selected);
+  if (stat.isSymbolicLink()) throw new Error('Import input cannot be a symbolic link.');
+  if (stat.isFile()) {
+    return selected.toLowerCase().endsWith(MIGRATION_EXTENSION) ? selected : null;
+  }
+  if (!stat.isDirectory()) return null;
+  const candidates = fs.readdirSync(selected, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(MIGRATION_EXTENSION));
+  if (!candidates.length) return null;
+  return resolveMigrationArchiveInput(selected);
+}
+
 function deriveKey(passphrase: string, header: PublicHeader): Buffer {
   return crypto.scryptSync(passphrase, Buffer.from(header.kdf.salt, 'base64'), 32, {
     N: header.kdf.N,
@@ -705,7 +746,7 @@ function readManifest(payloadFile: string): { manifest: MigrationManifest; dataO
 
 async function decryptMigration(file: string, passphrase: string): Promise<DecryptedPayload> {
   validatePassphrase(passphrase);
-  const archive = path.resolve(file);
+  const archive = resolveMigrationArchiveInput(file);
   const parsed = parsePublicHeader(archive);
   const key = deriveKey(passphrase, parsed.header);
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(parsed.header.cipher.iv, 'base64'));
