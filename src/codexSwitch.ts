@@ -136,7 +136,7 @@ export function classifyCodexProcesses(rows: RawProcess[], currentPid = process.
     const name = path.basename(row.Name ?? row.ExecutablePath ?? '');
     const executable = row.ExecutablePath ?? '';
     const commandLine = row.CommandLine ?? '';
-    return /^(?:codex|ChatGPT|openai-codex)(?:\.exe)?$/i.test(name)
+    return /^(?:codex|ChatGPT|openai-codex|codex-code-mode-host)(?:\.exe)?$/i.test(name)
       || /[\\/]WindowsApps[\\/]OpenAI\.Codex_/i.test(executable)
       || /[\\/]@openai[\\/]codex[\\/]bin[\\/]codex\.js(?:"|\s|$)/i.test(commandLine);
   });
@@ -175,6 +175,7 @@ export function classifyCodexProcesses(rows: RawProcess[], currentPid = process.
       kind: ancestorPids.has(Number(row.ProcessId))
         ? 'ancestor'
         : /(?:^|\s)app-server(?:\s|$)/i.test(row.CommandLine ?? '')
+          || /^codex-code-mode-host(?:\.exe)?$/i.test(path.basename(row.Name ?? row.ExecutablePath ?? ''))
           || (/^codex(?:\.exe)?$/i.test(path.basename(row.Name ?? row.ExecutablePath ?? ''))
             && !(row.CommandLine ?? '').trim())
           ? 'helper'

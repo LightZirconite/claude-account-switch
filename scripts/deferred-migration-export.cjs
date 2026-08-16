@@ -130,6 +130,14 @@ function isProviderBusyDiagnostic(diagnostic) {
   return /Close (?:Claude|Codex) (?:Code\/Desktop|CLI\/Desktop)(?: normally)? before migration export/iu.test(diagnostic);
 }
 
+function retryableExportFailure(diagnostic) {
+  if (isProviderBusyDiagnostic(diagnostic)) return 'provider-busy';
+  if (/Migration source(?:s)? changed while (?:it|the archive) was being encrypted/iu.test(diagnostic)) {
+    return 'source-changed';
+  }
+  return null;
+}
+
 function sha256(file) {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha256');
@@ -168,8 +176,8 @@ async function main() {
 
     while (!fs.existsSync(job.archive) && Date.now() < deadline) {
       fs.utimesSync(lock, new Date(), new Date());
-      atomicStatus(job, 'waiting-for-claude-and-codex-to-close', {
-        note: 'Close Claude Code/Desktop and Codex CLI/Desktop normally. The guarded export starts automatically afterward.',
+      atomicStatus(job, 'exporting', {
+        note: 'The guarded encrypted export is running. Keep Claude and Codex closed until state becomes complete.',
       });
       const exported = runCli(job, [
         'migration', 'export',
@@ -178,12 +186,25 @@ async function main() {
       ]);
       if (exported.status === 0 && fs.existsSync(job.archive)) break;
       const diagnostic = `${exported.stdout ?? ''}\n${exported.stderr ?? ''}`;
-      if (isProviderBusyDiagnostic(diagnostic)) {
+      const retryReason = retryableExportFailure(diagnostic);
+      if (retryReason === 'provider-busy') {
+        atomicStatus(job, 'waiting-for-claude-and-codex-to-close', {
+          note: 'Close Claude Code/Desktop and Codex CLI/Desktop normally. The guarded export starts automatically afterward.',
+        });
+        await sleep(RETRY_MS);
+        continue;
+      }
+      if (retryReason === 'source-changed') {
+        atomicStatus(job, 'retrying-after-source-change', {
+          note: 'A migration source changed before publication. Nothing partial was published; the guarded export will retry automatically.',
+        });
         await sleep(RETRY_MS);
         continue;
       }
       atomicStatus(job, 'failed', {
-        note: 'The guarded export failed for a reason other than an open provider process. Run migration prepare again before retrying.',
+        failureCode: 'unexpected-export-error',
+        diagnosticLog: path.join(job.switchHome, 'logs', 'switch.log'),
+        note: 'The guarded export failed unexpectedly. The redacted switcher log contains the diagnostic; no partial archive was published.',
       });
       cleanupRegistration(job);
       return;
@@ -228,4 +249,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { isProviderBusyDiagnostic };
+module.exports = { isProviderBusyDiagnostic, retryableExportFailure };

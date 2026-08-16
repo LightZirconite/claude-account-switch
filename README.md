@@ -140,6 +140,8 @@ detected Codex CLI sessions, asks the desktop app to close gracefully, then term
 the revalidated Codex processes allowed by the safety policy if needed. It swaps `auth.json` atomically, validates the
 result through App Server, and rolls back on failure. The confirmation warns that unsaved
 Codex work can be lost; Claude processes are never force-killed.
+Codex code-mode and App Server hosts are protected helpers: migration and credential writes wait
+for them to exit and never treat them as ordinary CLI processes that may be force-terminated.
 
 ## Remote authorization
 
@@ -298,6 +300,9 @@ Windows-only provider executables and scripts (`.exe`, `.dll`, `.cmd`, `.bat`, `
 the recovery-only scope instead of being installed into the Linux live homes. Known Claude/Codex
 configuration files containing Windows drive or UNC paths remain available, but the manifest flags
 them for review and import writes a `portability-review.json` under migration recovery backups.
+Codex `.sandbox/*.log` files are active runtime diagnostics rather than portable account data; they
+are excluded explicitly with their reason in the encrypted manifest, while durable sandbox markers
+and configuration remain included.
 
 On Windows, inventory first and read every warning:
 

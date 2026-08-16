@@ -79,6 +79,9 @@ test('encrypted migration round-trips portable state, verifies hashes, and backs
     fs.writeFileSync(path.join(process.env.CODEX_HOME!, 'config.toml'), '[mcp.test]\ncommand = "C:\\tools\\server.exe"\n');
     fs.writeFileSync(path.join(process.env.CODEX_HOME!, 'hooks', 'run.ps1'), 'Write-Output "Windows only"\n');
     fs.writeFileSync(path.join(process.env.CODEX_HOME!, 'sessions', 'history.jsonl'), '{"message":"portable Codex history"}\n');
+    fs.mkdirSync(path.join(process.env.CODEX_HOME!, '.sandbox'), { recursive: true });
+    fs.writeFileSync(path.join(process.env.CODEX_HOME!, '.sandbox', 'sandbox.log'), 'transient runtime log\n');
+    fs.writeFileSync(path.join(process.env.CODEX_HOME!, '.sandbox', 'setup_marker.json'), '{}\n');
     fs.mkdirSync(path.join(process.env.CLAUDE_SWITCH_HOME!, 'locks', 'ignored.lock'), { recursive: true });
     fs.writeFileSync(path.join(process.env.CLAUDE_SWITCH_HOME!, 'locks', 'ignored.lock', 'owner.json'), '{}');
 
@@ -92,6 +95,11 @@ test('encrypted migration round-trips portable state, verifies hashes, and backs
     assert.ok(exported.manifest.portabilityWarnings.some((entry) => entry.scope === 'codex' && entry.path === 'config.toml'));
     assert.ok(exported.manifest.exclusions.some((entry) => entry.scope === 'switch' && entry.path === 'locks'));
     assert.ok(exported.manifest.exclusions.some((entry) => entry.scope === 'switch' && entry.path === 'exports/previous.ccswitch-migration'));
+    assert.ok(exported.manifest.exclusions.some((entry) => entry.scope === 'codex'
+      && entry.path === '.sandbox/sandbox.log'
+      && entry.reason === 'ephemeral Codex sandbox runtime log'));
+    assert.equal(exported.manifest.entries.some((entry) => entry.scope === 'codex' && entry.path === '.sandbox/sandbox.log'), false);
+    assert.ok(exported.manifest.entries.some((entry) => entry.scope === 'codex' && entry.path === '.sandbox/setup_marker.json'));
     const ciphertext = fs.readFileSync(archive);
     assert.equal(ciphertext.includes(Buffer.from('claude-secret-value')), false);
     assert.equal(ciphertext.includes(Buffer.from('codex-secret-value')), false);

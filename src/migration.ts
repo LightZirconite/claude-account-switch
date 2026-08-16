@@ -163,6 +163,9 @@ function excludedPath(scope: MigrationScope, relative: string, recovery: boolean
   if (scope === 'claude' && first === '.claude.json') {
     return 'Claude root metadata is archived separately through the portable claude-meta mapping';
   }
+  if (scope === 'codex' && first === '.sandbox' && base.endsWith('.log')) {
+    return 'ephemeral Codex sandbox runtime log';
+  }
   if (first === 'tmp' || first === '.tmp' || first === 'run') return 'ephemeral runtime state';
   if (/\.(?:lock|sock|pid|tmp)$/iu.test(base)) return 'ephemeral lock/socket/process state';
   if (recovery && parts.some((part) => /^(?:cache|code cache|gpucache|crashpad)$/iu.test(part))) {

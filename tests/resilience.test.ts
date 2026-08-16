@@ -1154,11 +1154,13 @@ test('Codex process classification protects app-server and ambiguous children be
     { ProcessId: 101, ParentProcessId: 100, Name: 'codex.exe', CommandLine: 'codex app-server', ExecutablePath: 'C:\\WindowsApps\\OpenAI.Codex_1\\codex.exe' },
     { ProcessId: 102, ParentProcessId: 100, Name: 'codex.exe', CommandLine: '', ExecutablePath: 'C:\\WindowsApps\\OpenAI.Codex_1\\codex.exe' },
     { ProcessId: 103, ParentProcessId: 100, Name: 'codex.exe', CommandLine: 'codex exec task', ExecutablePath: 'C:\\WindowsApps\\OpenAI.Codex_1\\codex.exe' },
+    { ProcessId: 104, ParentProcessId: 1, Name: 'codex-code-mode-host.exe', CommandLine: 'codex-code-mode-host.exe', ExecutablePath: 'C:\\WindowsApps\\OpenAI.Codex_1\\codex-code-mode-host.exe' },
   ], 999);
   assert.equal(classified.find((process) => process.pid === 100)?.kind, 'app');
   assert.equal(classified.find((process) => process.pid === 101)?.kind, 'helper');
   assert.equal(classified.find((process) => process.pid === 102)?.kind, 'helper');
   assert.equal(classified.find((process) => process.pid === 103)?.kind, 'app');
+  assert.equal(classified.find((process) => process.pid === 104)?.kind, 'helper');
 });
 
 test('Codex process classification recognizes Linux ChatGPT Desktop and openai-codex helpers', () => {
