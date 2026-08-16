@@ -322,10 +322,11 @@ node dist/cli.js migration verify /path/to/Coder
 node dist/cli.js migration import /path/to/Coder
 ```
 
-The interactive path is shorter: press `I`, paste or drag the `Coder` folder, and enter the
-passphrase in the masked prompt. The TUI detects the archive, authenticates and hashes the complete
-payload before live writes, creates rollback backups for differing existing files, and leaves the
-external folder untouched.
+The interactive path is shorter: press `I` and paste or drag the `Coder` folder. When the folder
+contains `Claude-Codex-Coder-Recovery-Key.txt` beside its single archive, the TUI reads that key
+automatically without displaying or logging it. Otherwise it opens the masked passphrase prompt.
+The TUI authenticates and hashes the complete payload before live writes, creates rollback backups
+for differing existing files, and leaves the external folder untouched.
 
 The archive uses `scrypt` key derivation, AES-256-GCM authenticated encryption, streaming Brotli
 compression and a SHA-256 for every file. Import decrypts and validates the complete archive into a
@@ -335,10 +336,12 @@ After inspecting the archive, `--replace-existing` explicitly authorizes transac
 every replaced target is backed up, writes are atomic, all installed hashes are rechecked and a failed
 operation rolls back.
 
-For a passphrase file on Linux, run `chmod 600` first. Store that file outside `~/.claude-switch`,
-`~/.claude` and `~/.codex`; export rejects a passphrase file under any source root. Keep the archive and passphrase separately:
-the archive contains credentials and private conversation/project history even though its contents are
-encrypted.
+For a normal passphrase file on Linux, run `chmod 600` first. Store that file outside
+`~/.claude-switch`, `~/.claude` and `~/.codex`; export rejects a passphrase file under any source
+root. Keeping the archive and passphrase separately provides the strongest protection. The named
+portable key above deliberately trades that theft protection for a one-folder recovery workflow:
+anyone who obtains the complete folder can decrypt it. The archive remains authenticated and its
+contents are still never stored as plaintext in that folder.
 
 Large histories and recovery-only Desktop stores can take several minutes to hash and encrypt. The
 CLI reports that the inventory is running; keep enough free space for the encrypted archive and one

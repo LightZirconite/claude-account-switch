@@ -6,10 +6,13 @@ import test from 'node:test';
 
 import {
   discoverMigrationArchiveInput,
+  discoverPortableMigrationPassphraseFile,
   exportMigration,
   importMigration,
   inspectMigration,
+  PORTABLE_MIGRATION_KEY_NAME,
   readMigrationPassphraseFile,
+  readPortableMigrationPassphraseFile,
   resolveMigrationArchiveInput,
   verifyMigration,
 } from '../src/migration';
@@ -95,6 +98,15 @@ test('encrypted migration round-trips portable state, verifies hashes, and backs
 
     assert.equal(resolveMigrationArchiveInput(portableFolder), path.resolve(archive));
     assert.equal(discoverMigrationArchiveInput(portableFolder), path.resolve(archive));
+    const portableKey = path.join(portableFolder, PORTABLE_MIGRATION_KEY_NAME);
+    fs.writeFileSync(portableKey, `${passphrase}\n`, { mode: 0o644 });
+    assert.equal(discoverPortableMigrationPassphraseFile(portableFolder), portableKey);
+    assert.equal(discoverPortableMigrationPassphraseFile(archive), portableKey);
+    assert.equal(readPortableMigrationPassphraseFile(portableKey), passphrase);
+    assert.throws(
+      () => readPortableMigrationPassphraseFile(path.join(portableFolder, 'unexpected-key.txt')),
+      /must be named/i,
+    );
     const inspected = await inspectMigration(portableFolder, passphrase);
     assert.equal(inspected.archiveId, exported.manifest.archiveId);
     assert.equal((await verifyMigration(portableFolder, passphrase)).entries.length, inspected.entries.length);

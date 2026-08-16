@@ -78,6 +78,9 @@
 - Decrypt and validate the complete manifest, authenticated ciphertext and every file SHA-256
   before live writes. Reject traversal/symlink targets and differing files by default; an
   explicit replacement must create rollback backups and verify every installed file.
+- One-folder recovery may auto-read only the exact adjacent
+  `Claude-Codex-Coder-Recovery-Key.txt` regular file. Never display or log it, and state clearly
+  that storing the key beside the archive lets anyone holding the folder decrypt the backup.
 - Migration preserves invalid or revoked accounts with a re-authentication warning. It never
   deletes a saved profile merely because the provider no longer accepts its session.
 

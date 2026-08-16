@@ -35,6 +35,8 @@ const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024 * 1024;
 const IO_CHUNK_BYTES = 1024 * 1024;
 const MIGRATION_EXTENSION = '.ccswitch-migration';
+export const PORTABLE_MIGRATION_KEY_NAME = 'Claude-Codex-Coder-Recovery-Key.txt';
+const MAX_PASSPHRASE_FILE_BYTES = 8 * 1024;
 
 export type MigrationScope = 'switch' | 'claude' | 'claude-meta' | 'codex' | 'recovery';
 
@@ -482,6 +484,28 @@ export function discoverMigrationArchiveInput(input: string): string | null {
     .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(MIGRATION_EXTENSION));
   if (!candidates.length) return null;
   return resolveMigrationArchiveInput(selected);
+}
+
+/** Find the deliberately portable recovery key stored beside a migration archive. */
+export function discoverPortableMigrationPassphraseFile(input: string): string | null {
+  const selected = path.resolve(input);
+  const stat = fs.lstatSync(selected);
+  if (stat.isSymbolicLink()) throw new Error('Migration input cannot be a symbolic link.');
+  const directory = stat.isDirectory() ? selected : path.dirname(selected);
+  const candidate = path.join(directory, PORTABLE_MIGRATION_KEY_NAME);
+  try {
+    const keyStat = fs.lstatSync(candidate);
+    if (!keyStat.isFile() || keyStat.isSymbolicLink()) {
+      throw new Error(`Portable migration key must be a regular, non-symbolic-link file: ${candidate}`);
+    }
+    if (keyStat.size > MAX_PASSPHRASE_FILE_BYTES) {
+      throw new Error(`Portable migration key exceeds ${MAX_PASSPHRASE_FILE_BYTES} bytes.`);
+    }
+    return candidate;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 function deriveKey(passphrase: string, header: PublicHeader): Buffer {
@@ -1059,6 +1083,7 @@ export function readMigrationPassphraseFile(file: string, options: { forExport?:
   const selected = path.resolve(file);
   const stat = fs.lstatSync(selected);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Passphrase file must be a regular, non-symbolic-link file.');
+  if (stat.size > MAX_PASSPHRASE_FILE_BYTES) throw new Error(`Passphrase file exceeds ${MAX_PASSPHRASE_FILE_BYTES} bytes.`);
   if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0) {
     throw new Error('Passphrase file permissions are too broad; run chmod 600 on it first.');
   }
@@ -1068,6 +1093,24 @@ export function readMigrationPassphraseFile(file: string, options: { forExport?:
       throw new Error('The migration passphrase file must be stored outside the switcher, Claude, and Codex data roots so it cannot be archived with the data it protects.');
     }
   }
+  const passphrase = fs.readFileSync(selected, 'utf8').replace(/\r?\n$/u, '');
+  validatePassphrase(passphrase);
+  return passphrase;
+}
+
+/**
+ * Read the exact portable-key filename beside an archive. Removable NTFS mounts
+ * may not expose POSIX chmod bits, so this deliberate convenience format cannot
+ * require mode 0600. Anyone holding the folder can decrypt its archive.
+ */
+export function readPortableMigrationPassphraseFile(file: string): string {
+  const selected = path.resolve(file);
+  if (path.basename(selected) !== PORTABLE_MIGRATION_KEY_NAME) {
+    throw new Error(`Portable migration key must be named ${PORTABLE_MIGRATION_KEY_NAME}.`);
+  }
+  const stat = fs.lstatSync(selected);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Portable migration key must be a regular, non-symbolic-link file.');
+  if (stat.size > MAX_PASSPHRASE_FILE_BYTES) throw new Error(`Portable migration key exceeds ${MAX_PASSPHRASE_FILE_BYTES} bytes.`);
   const passphrase = fs.readFileSync(selected, 'utf8').replace(/\r?\n$/u, '');
   validatePassphrase(passphrase);
   return passphrase;

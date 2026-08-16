@@ -7,12 +7,14 @@ import path from 'node:path';
 import clipboard from 'clipboardy';
 import {
   discoverMigrationArchiveInput,
+  discoverPortableMigrationPassphraseFile,
   exportMigration,
   importMigration,
   inspectMigration,
   prepareMigration,
   promptMigrationPassphrase,
   readMigrationPassphraseFile,
+  readPortableMigrationPassphraseFile,
   verifyMigration,
   type MigrationManifest,
 } from './migration';
@@ -1896,8 +1898,11 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     [claudeVersion, reloadCodexStore, showMessage],
   );
 
-  const doMigrationImport = useCallback(async (passphrase: string) => {
-    const source = migrationSource;
+  const doMigrationImport = useCallback(async (
+    source: string | null,
+    passphrase: string,
+    portableKeyUsed = false,
+  ) => {
     setBuffer('');
     if (!source) {
       showMessage('Migration import failed', ['The selected migration source is no longer available.'], 'error');
@@ -1916,6 +1921,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         ...(result.recoveryDir ? [`Windows Desktop recovery evidence: ${result.recoveryDir}`] : []),
         ...(result.portabilityReviewFile ? [`Linux path review: ${result.portabilityReviewFile}`] : []),
         ...(reauth ? [`${reauth} saved account(s) still require an official sign-in; none were deleted.`] : []),
+        ...(portableKeyUsed ? ['The recovery key stored beside the archive was detected automatically.'] : []),
         'The external migration folder was left untouched.',
       ], 'success');
     } catch (error) {
@@ -1923,7 +1929,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     } finally {
       setMigrationSource(null);
     }
-  }, [migrationSource, reloadClaudeStore, reloadCodexStore, showMessage]);
+  }, [reloadClaudeStore, reloadCodexStore, showMessage]);
 
   const doImportPath = useCallback(async (rawTarget: string) => {
     const target = normalizeImportPath(rawTarget);
@@ -1937,6 +1943,12 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         setMigrationSource(migrationArchive);
         setBuffer('');
         setStatus('');
+        const portableKey = discoverPortableMigrationPassphraseFile(migrationArchive);
+        if (portableKey) {
+          const passphrase = readPortableMigrationPassphraseFile(portableKey);
+          void doMigrationImport(migrationArchive, passphrase, true);
+          return;
+        }
         setMode('migrationPassphrase');
         return;
       }
@@ -2001,9 +2013,10 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         disposition.receiptPath ? path.dirname(disposition.receiptPath) : undefined,
       );
     } catch (error) {
+      setMigrationSource(null);
       showMessage('Import failed', [redactText(error)], 'error');
     }
-  }, [claudeVersion, openImportMenu, provider, reloadCodexStore, showMessage]);
+  }, [claudeVersion, doMigrationImport, openImportMenu, provider, reloadCodexStore, showMessage]);
 
   const exportSelected = useCallback(async () => {
     if (!selected) return;
@@ -2106,7 +2119,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           '1. node dist/cli.js migration prepare',
           '2. Close Claude and Codex normally.',
           '3. node dist/cli.js migration export',
-          'On Linux: press I, paste/drag the Coder folder, then enter its passphrase.',
+          'On Linux: press I and paste/drag Coder; its adjacent recovery key is used automatically.',
           'The app verifies every hash before writing and backs up replaced files.',
           'Press ? for the complete command reference.',
         ], 'info');
@@ -2429,7 +2442,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         } else {
           const passphrase = buffer;
           setBuffer('');
-          void doMigrationImport(passphrase);
+          void doMigrationImport(migrationSource, passphrase);
         }
       } else if (key.backspace || key.delete) {
         setBuffer((value) => value.slice(0, -1));
@@ -2940,7 +2953,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           <Text wrap="wrap">Path: <Text color="green">{buffer}</Text><Text>▎</Text></Text>
           <Box marginTop={1} flexDirection="column">
             <Text dimColor>Type, paste, or drag one file/folder into this terminal.</Text>
-            <Text dimColor>A Coder migration folder is detected automatically · external source stays untouched</Text>
+            <Text dimColor>Coder archive + adjacent recovery key are detected automatically</Text>
             <Text dimColor>Enter imports every valid account · Esc returns</Text>
           </Box>
         </Box>
