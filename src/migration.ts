@@ -412,7 +412,7 @@ function sourceForEntry(entry: MigrationEntry): string {
   throw new Error(`Unsupported migration source scope: ${entry.scope}`);
 }
 
-async function* payloadChunks(plan: MigrationPlan): AsyncGenerator<Buffer> {
+async function* payloadChunks(plan: MigrationPlan, options: MigrationSafetyOptions): AsyncGenerator<Buffer> {
   const manifest = Buffer.from(JSON.stringify(plan.manifest), 'utf8');
   if (manifest.length > MAX_MANIFEST_BYTES) throw new Error('Migration manifest is unexpectedly large.');
   const length = Buffer.allocUnsafe(4);
@@ -421,6 +421,7 @@ async function* payloadChunks(plan: MigrationPlan): AsyncGenerator<Buffer> {
   yield length;
   yield manifest;
   const buffer = Buffer.allocUnsafe(IO_CHUNK_BYTES);
+  let lastProviderCheckAt = Date.now();
   for (const entry of plan.manifest.entries) {
     const source = sourceForEntry(entry);
     const fd = fs.openSync(source, 'r');
@@ -428,6 +429,10 @@ async function* payloadChunks(plan: MigrationPlan): AsyncGenerator<Buffer> {
     let total = 0;
     try {
       for (;;) {
+        if (Date.now() - lastProviderCheckAt >= 30_000) {
+          assertProvidersQuiescent('migration export in progress', options);
+          lastProviderCheckAt = Date.now();
+        }
         const read = fs.readSync(fd, buffer, 0, buffer.length, null);
         if (!read) break;
         const chunk = Buffer.from(buffer.subarray(0, read));
@@ -580,6 +585,7 @@ async function exportMigrationUnlocked(
   const selected = path.resolve(output);
   const workRoot = migrationWorkRoot();
   const plan = prepareMigration({ includeDesktopRecovery: options.includeDesktopRecovery });
+  assertProvidersQuiescent('migration export after inventory', options);
   const salt = crypto.randomBytes(16);
   const iv = crypto.randomBytes(12);
   const header: PublicHeader = {
@@ -598,8 +604,10 @@ async function exportMigrationUnlocked(
   fs.mkdirSync(path.dirname(selected), { recursive: true, mode: 0o700 });
   try {
     await pipeline(
-      Readable.from(payloadChunks(plan)),
-      createBrotliCompress({ params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 6 } }),
+      Readable.from(payloadChunks(plan, options)),
+      // Quality 1 keeps the portable archive compact without turning multi-gigabyte
+      // Desktop recovery evidence into a long CPU-bound operation.
+      createBrotliCompress({ params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 1 } }),
       cipher,
       fs.createWriteStream(bodyTemp, { flags: 'wx', mode: 0o600 }),
     );

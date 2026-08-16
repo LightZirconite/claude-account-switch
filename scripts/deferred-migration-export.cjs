@@ -5,11 +5,13 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 
 const RETRY_MS = 30_000;
 const MAX_WAIT_MS = 7 * 24 * 60 * 60 * 1000;
 const CHILD_TIMEOUT_MS = 12 * 60 * 60 * 1000;
+const HEARTBEAT_MS = 10_000;
+const MAX_CAPTURE_BYTES = 16 * 1024 * 1024;
 
 function absoluteField(job, name) {
   const value = job[name];
@@ -78,7 +80,6 @@ function atomicStatus(job, state, extra = {}) {
     state,
     updatedAt: new Date().toISOString(),
     archive: path.basename(job.archive),
-    passphraseFileOnSourceMachine: job.passphraseFile,
     ...extra,
   };
   const temp = `${job.statusFile}.tmp-${process.pid}`;
@@ -86,20 +87,57 @@ function atomicStatus(job, state, extra = {}) {
   fs.renameSync(temp, job.statusFile);
 }
 
-function runCli(job, args) {
+function appendCaptured(current, chunk) {
+  const combined = current + String(chunk);
+  return combined.length <= MAX_CAPTURE_BYTES
+    ? combined
+    : combined.slice(combined.length - MAX_CAPTURE_BYTES);
+}
+
+function runCli(job, args, onHeartbeat, timing = {}) {
   const runtime = [
     '--switch-home', job.switchHome,
     '--claude-config', job.claudeConfig,
     '--codex-home', job.codexHome,
     '--codex-bin', job.codexBin,
   ];
-  return spawnSync(process.execPath, [job.cli, ...args, ...runtime], {
-    cwd: path.resolve(path.dirname(job.cli), '..'),
-    encoding: 'utf8',
-    windowsHide: true,
-    shell: false,
-    timeout: CHILD_TIMEOUT_MS,
-    maxBuffer: 16 * 1024 * 1024,
+  const heartbeatMs = timing.heartbeatMs ?? HEARTBEAT_MS;
+  const timeoutMs = timing.timeoutMs ?? CHILD_TIMEOUT_MS;
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [job.cli, ...args, ...runtime], {
+      cwd: path.resolve(path.dirname(job.cli), '..'),
+      windowsHide: true,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const startedAt = Date.now();
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timedOut = false;
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout = appendCaptured(stdout, chunk); });
+    child.stderr.on('data', (chunk) => { stderr = appendCaptured(stderr, chunk); });
+
+    const heartbeat = setInterval(() => {
+      try { onHeartbeat?.(Date.now() - startedAt); } catch { /* status heartbeat is best-effort */ }
+    }, heartbeatMs);
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
+    const finish = (status, signal, error) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(heartbeat);
+      clearTimeout(timeout);
+      if (error) stderr = appendCaptured(stderr, `\n${error.message}`);
+      if (timedOut) stderr = appendCaptured(stderr, '\nMigration child process timed out.');
+      resolve({ status, signal, stdout, stderr, timedOut });
+    };
+    child.once('error', (error) => finish(null, null, error));
+    child.once('close', (status, signal) => finish(status, signal));
   });
 }
 
@@ -179,11 +217,14 @@ async function main() {
       atomicStatus(job, 'exporting', {
         note: 'The guarded encrypted export is running. Keep Claude and Codex closed until state becomes complete.',
       });
-      const exported = runCli(job, [
+      const exported = await runCli(job, [
         'migration', 'export',
         '--output', job.archive,
         '--passphrase-file', job.passphraseFile,
-      ]);
+      ], (elapsedMs) => atomicStatus(job, 'exporting', {
+        elapsedSeconds: Math.max(1, Math.floor(elapsedMs / 1000)),
+        note: 'The portable Coder folder is being created. Activity is checked every ten seconds; keep Claude and Codex closed.',
+      }));
       if (exported.status === 0 && fs.existsSync(job.archive)) break;
       const diagnostic = `${exported.stdout ?? ''}\n${exported.stderr ?? ''}`;
       const retryReason = retryableExportFailure(diagnostic);
@@ -217,10 +258,14 @@ async function main() {
     }
 
     atomicStatus(job, 'verifying', { sizeBytes: fs.statSync(job.archive).size });
-    const verified = runCli(job, [
+    const verified = await runCli(job, [
       'migration', 'verify', job.archive,
       '--passphrase-file', job.passphraseFile,
-    ]);
+    ], (elapsedMs) => atomicStatus(job, 'verifying', {
+      sizeBytes: fs.statSync(job.archive).size,
+      elapsedSeconds: Math.max(1, Math.floor(elapsedMs / 1000)),
+      note: 'The portable Coder folder is being verified before it is marked ready.',
+    }));
     if (verified.status !== 0) {
       atomicStatus(job, 'failed-verification', {
         sizeBytes: fs.statSync(job.archive).size,
@@ -234,7 +279,7 @@ async function main() {
     atomicStatus(job, 'complete', {
       sizeBytes: fs.statSync(job.archive).size,
       sha256: digest,
-      note: 'Authenticated decryption and every internal file SHA-256 were verified. Keep the recovery key separately.',
+      note: 'The portable Coder folder is fully verified and ready. On the new system, press I and select this folder.',
     });
     cleanupRegistration(job);
   } finally {
@@ -249,4 +294,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { isProviderBusyDiagnostic, retryableExportFailure };
+module.exports = { isProviderBusyDiagnostic, retryableExportFailure, runCli };

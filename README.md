@@ -333,8 +333,11 @@ automatically without displaying or logging it. Otherwise it opens the masked pa
 The TUI authenticates and hashes the complete payload before live writes, creates rollback backups
 for differing existing files, and leaves the external folder untouched.
 
-The archive uses `scrypt` key derivation, AES-256-GCM authenticated encryption, streaming Brotli
-compression and a SHA-256 for every file. Import decrypts and validates the complete archive into a
+The portable folder is intentionally a one-step user workflow: its adjacent key is managed by the
+software and import detects it automatically. Internally, the archive still uses `scrypt` key
+derivation, AES-256-GCM authenticated encryption, fast streaming Brotli compression and a SHA-256
+for every file; this prevents raw account tokens from being left as ordinary files and detects
+corruption without asking the user to handle a separate secret. Import decrypts and validates the complete archive into a
 private temporary payload before touching live data, then streams bounded file ranges into atomic
 target writes without loading large histories into memory. Different existing files are refused by default.
 After inspecting the archive, `--replace-existing` explicitly authorizes transactional replacement;

@@ -2114,13 +2114,12 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         return;
       }
       if (input === 'M') {
-        showMessage('Windows → Linux migration', [
-          'The complete migration is encrypted and authenticated.',
-          '1. node dist/cli.js migration prepare',
-          '2. Close Claude and Codex normally.',
-          '3. node dist/cli.js migration export',
-          'On Linux: press I and paste/drag Coder; its adjacent recovery key is used automatically.',
-          'The app verifies every hash before writing and backs up replaced files.',
+        showMessage('Move everything to another system', [
+          'The result is one portable Coder folder. You do not handle a separate key.',
+          'Export: close Claude and Codex, then run this software with migration export.',
+          'Import: open the software on the new system, press I, and select Coder.',
+          'The software manages its internal protection, verifies every file, and backs up conflicts.',
+          'Long exports keep migration-status.json updated so activity is visible.',
           'Press ? for the complete command reference.',
         ], 'info');
         return;
@@ -3218,7 +3217,7 @@ Usage:
                              Write a new timestamped provider-tagged bundle
   switch.cmd migration prepare          Inventory everything before moving to Linux
   switch.cmd migration export [--output file] [--passphrase-file 0600-file]
-                             Encrypt switcher + Claude/Codex portable state in one archive
+                             Create one verified full-machine migration archive
   switch.cmd migration inspect|verify <archive-or-folder> [--passphrase-file 0600-file]
   switch.cmd migration import <archive-or-folder> [--replace-existing] [--passphrase-file 0600-file]
                              Validate fully, back up conflicts, import atomically, verify

@@ -178,7 +178,7 @@ test('migration rechecks provider processes before publishing or mutating live d
     await assert.rejects(
       exportMigration(passphrase, blockedArchive, {
         ...quiet,
-        claudeProcessInventory: () => (++exportChecks === 1 ? [] : [{ pid: 8101, name: 'claude' }]),
+        claudeProcessInventory: () => (++exportChecks < 3 ? [] : [{ pid: 8101, name: 'claude' }]),
       }),
       /publication boundary/i,
     );
