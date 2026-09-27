@@ -257,6 +257,14 @@ export function systemdExecArgument(value: string): string {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`;
 }
 
+// Directives such as WorkingDirectory= take a literal path: no quoting is
+// parsed, so quotes would become part of the value. Only % needs escaping.
+export function systemdPathValue(value: string): string {
+  if (!value || /\0|[\r\n]/u.test(value)) throw new Error('systemd paths must be non-empty single-line values without NUL bytes.');
+  if (!path.isAbsolute(value)) throw new Error('systemd paths must be absolute.');
+  return value.replace(/%/g, '%%');
+}
+
 function desktopEntryValue(value: string): string {
   return value
     .replace(/\\/g, '\\\\')
@@ -627,7 +635,7 @@ Documentation=https://git.justw.tf/LightZirconite/claude-account-switch
 
 [Service]
 Type=oneshot
-WorkingDirectory=${systemdExecArgument(action.cwd)}
+WorkingDirectory=${systemdPathValue(action.cwd)}
 ExecStart=${execStart}
 NoNewPrivileges=true
 PrivateTmp=true

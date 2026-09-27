@@ -157,6 +157,34 @@ test('an unattributed live Claude rotation is quarantined before another profile
   assert.equal(loadStore().profiles.find((candidate) => candidate.id === recovery?.id)?.claudeAiOauth?.refreshToken, 'live-refresh-r1');
 });
 
+test('an identity-less live Claude login is checkpointed as a recovery profile instead of blocking the switch', () => {
+  resetRoot();
+  const target = profile('target');
+  saveStore(profilesStore([target]));
+
+  // Fresh Linux login: .credentials.json holds a refreshable chain but .claude.json
+  // has no oauthAccount block, and no saved profile owns the refresh token.
+  writeJson(credentialsPath(), {
+    claudeAiOauth: {
+      accessToken: 'live-access-no-identity',
+      refreshToken: 'live-refresh-no-identity',
+      expiresAt: Date.now() + 3_600_000,
+      scopes: ['user:inference'],
+    },
+  });
+  writeJson(claudeJsonPath(), { userID: 'user-no-identity' });
+
+  const reconciled = reconcileStoreWithLive();
+  const recovery = reconciled.profiles.find((candidate) => candidate.id !== target.id);
+  assert.ok(recovery);
+  assert.equal(recovery.claudeAiOauth?.refreshToken, 'live-refresh-no-identity');
+  assert.equal(recovery.accountUuid?.startsWith('pending:'), true);
+  assert.equal(recovery.needsReauth, true);
+  assert.equal(recovery.oauthAccount?.accountUuid, '');
+  assert.equal(reconciled.activeProfileId, recovery.id);
+  assert.equal(applyProfile(reconciled.profiles.find((candidate) => candidate.id === target.id)!, { processInventory: () => [] }).ok, true);
+});
+
 test('provider-proved normal Claude rotation promotes the canonical account and keeps it active', () => {
   resetRoot();
   const active = profile('proved-live-rotation');

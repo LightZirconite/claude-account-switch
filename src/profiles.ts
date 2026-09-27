@@ -521,6 +521,15 @@ function enforceClaudeArchiveMarkers(store: ProfilesStore): void {
     // cleanup crash must not hide the recovered account. Otherwise the marker still
     // suppresses stale pre-deletion snapshots and leaves the tombstone retryable.
     if (restoreCommitted) continue;
+    if (staleProfile && existing?.restoredAt && existing.restoredAt >= existing.deletedAt) {
+      try {
+        fs.rmSync(claudeArchiveMarker(id), { force: true });
+        fs.rmSync(claudeArchiveRestorePendingMarker(id), { force: true });
+      } catch {
+        /* ignore */
+      }
+      continue;
+    }
     if (!existing || Math.max(existing.deletedAt, existing.restoredAt ?? 0) < marker.archivedAt) {
       const archivedProfile = marker.archivedProfile ?? (staleProfile ? withoutClaudeSecret(staleProfile) : undefined);
       store.tombstones = [
@@ -1335,15 +1344,16 @@ export function finalizeClaudeAuthorization(
 
     if (existing) {
       // The checkpoint was a re-authorization of an already-known account. Keep its
-      // canonical id, and archive the superseded pending envelope without presenting it
-      // as a user-restorable deleted account.
-      const archivedAt = Date.now();
-      writeClaudeArchiveMarker(pending.id, archivedAt);
+      // canonical id, and clean up the superseded temporary pending envelope so it does
+      // not accumulate as a zombie folder or dummy tombstone.
       fresh.profiles = fresh.profiles.filter((profile) => profile.id !== pending.id);
-      fresh.tombstones = [
-        ...(fresh.tombstones ?? []).filter((tombstone) => tombstone.id !== pending.id),
-        { id: pending.id, provider: 'claude', deletedAt: archivedAt },
-      ];
+      fresh.tombstones = (fresh.tombstones ?? []).filter((tombstone) => tombstone.id !== pending.id);
+      try {
+        const pendingDir = path.dirname(claudeProfileCredentialsPath(pending.id));
+        if (fs.existsSync(pendingDir)) fs.rmSync(pendingDir, { recursive: true, force: true });
+      } catch {
+        /* ignore non-critical cleanup error */
+      }
     }
   });
   if (!selected) throw new Error('Claude authorization finalization did not commit a profile.');
@@ -1485,12 +1495,32 @@ function reconcileWithLiveSnapshot(store: ProfilesStore, live: LiveAccount): { c
   if (hasRefreshableOauth(live.claudeAiOauth) && !live.oauthAccount) {
     const exactTokenMatches = store.profiles.filter((candidate) =>
       candidate.claudeAiOauth?.refreshToken === live.claudeAiOauth!.refreshToken);
-    if (exactTokenMatches.length !== 1) {
-      throw new Error(
-        exactTokenMatches.length > 1
-          ? 'Multiple Claude profiles own the exact live refresh-token chain. Reconciliation aborted.'
-          : 'Live Claude credentials are present but their account identity is unavailable. Active-account maintenance was aborted.',
-      );
+    if (exactTokenMatches.length > 1) {
+      throw new Error('Multiple Claude profiles own the exact live refresh-token chain. Reconciliation aborted.');
+    }
+    if (exactTokenMatches.length === 0) {
+      // No saved profile owns this chain and the .claude.json identity block is missing
+      // (observed on fresh Linux logins). Durably checkpoint the chain as a recovery
+      // profile instead of aborting, so a switch never strands the outgoing account.
+      const candidate = makeProfile({
+        email: '(authorization recovery)',
+        accountUuid: syntheticClaudeAccountId(live.claudeAiOauth!),
+        organizationUuid: live.organizationUuidRoot?.trim() ?? '',
+        organizationUuidRoot: live.organizationUuidRoot?.trim() || undefined,
+        subscriptionType: subscriptionOf(live.claudeAiOauth),
+        claudeAiOauth: live.claudeAiOauth!,
+        // Never invent an identity: an explicit provider-backed probe/re-authentication
+        // must resolve it before this row can be treated as a known account.
+        oauthAccount: { accountUuid: '' },
+      }, 'Unresolved live Claude authorization');
+      candidate.needsReauth = true;
+      store.profiles.push(candidate);
+      store.activeProfileId = candidate.id;
+      candidate.lastUsedAt ??= Date.now();
+      logger.warn('reconcile: checkpointed identity-less live Claude chain as a recovery profile', {
+        profileId: candidate.id,
+      });
+      return { changed: true, activeId: candidate.id };
     }
     const profile = exactTokenMatches[0];
     profile.claudeAiOauth = live.claudeAiOauth;
@@ -1526,10 +1556,20 @@ function reconcileWithLiveSnapshot(store: ProfilesStore, live: LiveAccount): { c
   if (exactTokenMatches.length + archivedTokenMatches.length > 1) {
     throw new Error('Multiple Claude profiles own the exact live refresh-token chain. Reconciliation aborted before rotation.');
   }
-  const archivedLiveAccount = activeClaudeTombstones.find((tombstone) =>
-    tombstone.archivedProfile?.provider === 'claude'
-      && tombstone.archivedProfile.accountUuid === fields.accountUuid);
   const identityProfile = findByAccountUuid(store, fields.accountUuid);
+  const archivedLiveAccount = !identityProfile
+    ? activeClaudeTombstones.find((tombstone) =>
+        tombstone.archivedProfile?.provider === 'claude'
+          && tombstone.archivedProfile.accountUuid === fields.accountUuid)
+    : undefined;
+  if (identityProfile) {
+    for (const tombstone of (store.tombstones ?? [])) {
+      if (tombstone.id === identityProfile.id
+        || (tombstone.archivedProfile?.provider === 'claude' && tombstone.archivedProfile.accountUuid === identityProfile.accountUuid)) {
+        tombstone.restoredAt = Math.max(tombstone.deletedAt, Date.now());
+      }
+    }
+  }
   const tokenProfile = exactTokenMatches[0];
   const tokenTombstone = archivedTokenMatches[0];
   const identityOwnerId = identityProfile?.id ?? archivedLiveAccount?.id;

@@ -125,6 +125,7 @@ import {
   bestNowCodex,
   effectiveCodexQuota,
   exportAllCodexProfiles,
+  cleanAllCodexProfileHomes,
   exportCodexProfile,
   importCodexFromPath,
   leastLoadedCodex,
@@ -3401,6 +3402,7 @@ async function printClaudeDoctor(): Promise<void> {
 }
 
 async function printCodexDoctor(): Promise<void> {
+  cleanAllCodexProfileHomes();
   const store = loadCodexStore();
   const pending = listPendingCodexHomes();
   let abandoned: ReturnType<typeof listAbandonedCodexLoginArchives> | null = null;
@@ -3952,6 +3954,7 @@ async function main(): Promise<void> {
   if (recoveredPending.length) {
     logger.warn('startup recovered abandoned Codex login sandboxes', { count: recoveredPending.length });
   }
+  cleanAllCodexProfileHomes();
   let codexStore = loadCodexStore();
   try {
     codexStore = (await reconcileLiveCodex()).store;

@@ -6,6 +6,7 @@ import readline from 'node:readline';
 import { logger } from './logger';
 import { atomicWriteFile, ensurePrivateDir } from './atomicFile';
 import { withFileLockSync } from './locks';
+import { codexCredentialsRoot, codexHome } from './paths';
 import type { CodexRateLimitBucket } from './types';
 import pkg from '../package.json';
 
@@ -429,6 +430,69 @@ export function detectCodexVersion(): string {
   }
 }
 
+/** Check if the given directory path is the live shared Codex home (~/.codex). */
+export function isCodexLiveHome(home: string): boolean {
+  try {
+    const live = path.resolve(codexHome());
+    const target = path.resolve(home);
+    if (process.platform === 'win32') {
+      return live.toLowerCase() === target.toLowerCase();
+    }
+    return live === target;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Remove ephemeral app-server artifacts (databases, caches, logs, plugins) from an isolated
+ * profile directory or temporary sandbox. NEVER touches the live shared ~/.codex home.
+ */
+export function cleanCodexIsolatedHome(home: string): void {
+  if (isCodexLiveHome(home)) return;
+  try {
+    if (!fs.existsSync(home)) return;
+    const entries = fs.readdirSync(home, { withFileTypes: true });
+    for (const entry of entries) {
+      const name = entry.name;
+      if (
+        name === 'auth.json' ||
+        name === '.archived.json' ||
+        name === CODEX_LOGIN_HELPER_MARKER ||
+        name === 'abandoned.json' ||
+        name.startsWith('.tmp') ||
+        name.includes('.tmp-') ||
+        name.endsWith('.tmp')
+      ) {
+        continue;
+      }
+      const target = path.join(home, name);
+      try {
+        fs.rmSync(target, { recursive: true, force: true });
+      } catch {
+        /* ignore non-critical cleanup error */
+      }
+    }
+  } catch {
+    /* ignore directory read error */
+  }
+}
+
+/** Clean ephemeral app-server artifacts across all stored isolated Codex profile directories. */
+export function cleanAllCodexProfileHomes(): void {
+  try {
+    const root = codexCredentialsRoot();
+    if (!fs.existsSync(root)) return;
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        cleanCodexIsolatedHome(path.join(root, entry.name));
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 export class CodexAppServerClient {
   private child: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;
@@ -444,6 +508,7 @@ export class CodexAppServerClient {
 
   async start(): Promise<void> {
     if (this.child) return;
+    cleanCodexIsolatedHome(this.home);
     fs.mkdirSync(this.home, { recursive: true, mode: 0o700 });
     const child = spawn(
       findCodexExe(),
@@ -462,7 +527,11 @@ export class CodexAppServerClient {
     });
     child.on('exit', (code) => {
       if (this.stderr.trim()) logger.warn('codex app-server stderr before exit', { stderr: this.stderr.trim() });
-      const err = new Error(`Codex app-server exited (${code ?? 'signal'}).`);
+      const lastStderr = this.stderr.trim()
+        ? this.stderr.trim().split(/\r?\n/).filter(Boolean).pop()?.trim()
+        : null;
+      const detail = lastStderr ? `: ${lastStderr}` : '.';
+      const err = new Error(`Codex app-server exited (${code ?? 'signal'})${detail}`);
       this.failAll(err);
       this.child = null;
     });
@@ -586,6 +655,7 @@ export async function inspectCodexHome(
     clientFactory?: (home: string) => CodexLoginClient;
   } = {},
 ): Promise<CodexInspection> {
+  cleanCodexIsolatedHome(home);
   const client = options.clientFactory?.(home)
     ?? new CodexAppServerClient(home, options.forceFileCredentials ?? true);
   const leaseId = claimCodexAppServerHome(home);
@@ -610,6 +680,7 @@ export async function inspectCodexHome(
       stopped = true;
     } finally {
       if (stopped) clearCodexLoginHelperMarker(home, leaseId);
+      cleanCodexIsolatedHome(home);
     }
   }
 }
@@ -688,6 +759,7 @@ export async function loginCodexHome(
   signal?: AbortSignal,
   options: CodexLoginHomeOptions = {},
 ): Promise<CodexInspection> {
+  cleanCodexIsolatedHome(home);
   const client = options.clientFactory?.(home) ?? new CodexAppServerClient(home);
   const leaseId = claimCodexAppServerHome(home);
   try {
@@ -728,6 +800,7 @@ export async function loginCodexHome(
       stopped = true;
     } finally {
       if (stopped) clearCodexLoginHelperMarker(home, leaseId);
+      cleanCodexIsolatedHome(home);
     }
   }
 }

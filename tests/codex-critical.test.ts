@@ -6,6 +6,8 @@ import test from 'node:test';
 
 import {
   archiveCodexProfile,
+  cleanAllCodexProfileHomes,
+  cleanCodexIsolatedHome,
   importCodexFromPath,
   loadCodexStore,
   readCodexAuth,
@@ -14,7 +16,10 @@ import {
   setActiveCodexProfile,
 } from '../src/codexProfiles';
 import { applyCodexAuthTransaction } from '../src/codexSwitch';
-import { CodexAppServerShutdownError } from '../src/codexAppServer';
+import {
+  CodexAppServerShutdownError,
+  inspectCodexHome,
+} from '../src/codexAppServer';
 import {
   backupsDir,
   codexAuthPath,
@@ -259,3 +264,50 @@ test('refresh-all fails closed when live reconciliation cannot commit', async ()
   assert.deepEqual(fs.readFileSync(parkedPath), parkedBefore);
   assert.deepEqual(fs.readFileSync(codexAuthPath()), liveBefore);
 });
+
+test('cleanCodexIsolatedHome purges stale sqlite and cache files without touching auth.json or live ~/.codex', async () => {
+  resetRoot();
+  const profile = await importAuth(codexAuth('clean-target', 'clean@example.test'));
+  const profileHome = codexProfileHome(profile.id);
+
+  // Simulate extraneous sqlite, cache, and plugin files in the isolated profile directory
+  fs.writeFileSync(path.join(profileHome, 'state_5.sqlite'), 'corrupt-sqlite-content');
+  fs.writeFileSync(path.join(profileHome, 'logs_2.sqlite'), 'corrupt-logs-content');
+  fs.writeFileSync(path.join(profileHome, 'goals_1.sqlite-wal'), 'stale-wal');
+  fs.mkdirSync(path.join(profileHome, 'cache'), { recursive: true });
+  fs.writeFileSync(path.join(profileHome, 'cache', 'junk.json'), '{}');
+
+  // Also simulate legitimate sqlite files in the live codex home
+  const liveSqlite = path.join(process.env.CODEX_HOME!, 'state_5.sqlite');
+  fs.writeFileSync(liveSqlite, 'live-sqlite-database');
+
+  cleanCodexIsolatedHome(profileHome);
+
+  // Isolated profile directory should keep only auth.json
+  const remaining = fs.readdirSync(profileHome);
+  assert.deepEqual(remaining, ['auth.json']);
+  assert.equal(readCodexAuth(profileHome)?.tokens.account_id, 'clean-target');
+
+  // Live codex home must NEVER be cleaned
+  cleanCodexIsolatedHome(process.env.CODEX_HOME!);
+  assert.equal(fs.existsSync(liveSqlite), true);
+  assert.equal(fs.readFileSync(liveSqlite, 'utf8'), 'live-sqlite-database');
+});
+
+test('cleanAllCodexProfileHomes sanitizes all profile directories in credentials root', async () => {
+  resetRoot();
+  const p1 = await importAuth(codexAuth('p1', 'p1@example.test'), 'p1.json');
+  const p2 = await importAuth(codexAuth('p2', 'p2@example.test'), 'p2.json');
+
+  const h1 = codexProfileHome(p1.id);
+  const h2 = codexProfileHome(p2.id);
+
+  fs.writeFileSync(path.join(h1, 'state_5.sqlite'), 'junk1');
+  fs.writeFileSync(path.join(h2, 'memories_1.sqlite'), 'junk2');
+
+  cleanAllCodexProfileHomes();
+
+  assert.deepEqual(fs.readdirSync(h1), ['auth.json']);
+  assert.deepEqual(fs.readdirSync(h2), ['auth.json']);
+});
+

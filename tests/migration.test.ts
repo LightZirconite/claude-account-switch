@@ -23,6 +23,7 @@ const quiet = {
   codexProcessInventory: () => [],
   includeDesktopRecovery: false,
   targetPlatform: 'linux' as const,
+  sourcePlatform: 'win32' as const,
 };
 
 function setHomes(root: string): void {

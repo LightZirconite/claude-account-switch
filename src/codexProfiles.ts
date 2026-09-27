@@ -18,6 +18,8 @@ import { atomicWriteFile, ensurePrivateDir } from './atomicFile';
 import {
   CodexAppServerShutdownError,
   claimCodexAppServerHome,
+  cleanAllCodexProfileHomes,
+  cleanCodexIsolatedHome,
   clearCodexLoginHelperMarker,
   codexLoginHelperRecoveryState,
   inspectCodexHome,
@@ -217,6 +219,7 @@ function assertCodexWorkerMutationDeadline(): void {
 }
 
 function recoverOrphanedCredentialHomes(store: CodexProfilesStore): number {
+  cleanAllCodexProfileHomes();
   let recovered = 0;
   try {
     for (const entry of fs.readdirSync(codexCredentialsRoot(), { withFileTypes: true })) {
@@ -253,7 +256,18 @@ function recoverOrphanedCredentialHomes(store: CodexProfilesStore): number {
 
 function ensureArchiveMarkers(store: CodexProfilesStore): void {
   for (const tombstone of store.tombstones) {
-    if (tombstone.provider !== 'codex' || tombstone.restoredAt && tombstone.restoredAt >= tombstone.deletedAt) continue;
+    if (tombstone.provider !== 'codex' || (tombstone.restoredAt && tombstone.restoredAt >= tombstone.deletedAt)) continue;
+    const activeProfile = store.profiles.find((p) => p.id === tombstone.id
+      || (tombstone.archivedProfile?.provider === 'codex' && p.accountId === tombstone.archivedProfile.accountId));
+    if (activeProfile) {
+      tombstone.restoredAt = Math.max(tombstone.deletedAt, activeProfile.updatedAt ?? Date.now());
+      try {
+        fs.rmSync(codexArchiveMarker(tombstone.id), { force: true });
+      } catch {
+        /* ignore */
+      }
+      continue;
+    }
     if (!fs.existsSync(codexAuthPath(codexProfileHome(tombstone.id))) || fs.existsSync(codexArchiveMarker(tombstone.id))) continue;
     try {
       atomicWriteFile(codexArchiveMarker(tombstone.id), `${JSON.stringify({
@@ -911,6 +925,7 @@ function writeProfileAuth(profileId: string, auth: CodexAuthFile): void {
     atomicWriteFile(codexAuthPath(home), `${JSON.stringify(auth, null, 2)}\n`);
   } finally {
     clearCodexLoginHelperMarker(home, leaseId);
+    cleanCodexIsolatedHome(home);
   }
 }
 
@@ -1041,11 +1056,23 @@ export async function reconcileLiveCodexUnlocked(
   if (effectiveIdentity && !/^\(unknown/i.test(fileIdentity) && fileIdentity !== effectiveIdentity) {
     throw new Error('Codex effective credentials could not be proven to match the file-backed account.');
   }
-  const archived = loadCodexStore().tombstones.find((tombstone) =>
-    tombstone.provider === 'codex'
-      && tombstone.archivedProfile?.provider === 'codex'
-      && tombstone.archivedProfile.accountId === auth.tokens.account_id
-      && (!tombstone.restoredAt || tombstone.deletedAt > tombstone.restoredAt));
+  const currentStore = loadCodexStore();
+  const existingLiveProfile = currentStore.profiles.find((p) => p.accountId === auth.tokens.account_id);
+  const archived = !existingLiveProfile
+    ? currentStore.tombstones.find((tombstone) =>
+        tombstone.provider === 'codex'
+          && tombstone.archivedProfile?.provider === 'codex'
+          && tombstone.archivedProfile.accountId === auth.tokens.account_id
+          && (!tombstone.restoredAt || tombstone.deletedAt > tombstone.restoredAt))
+    : undefined;
+  if (existingLiveProfile) {
+    for (const tombstone of currentStore.tombstones) {
+      if (tombstone.id === existingLiveProfile.id
+        || (tombstone.archivedProfile?.provider === 'codex' && tombstone.archivedProfile.accountId === auth.tokens.account_id)) {
+        tombstone.restoredAt = Math.max(tombstone.deletedAt, Date.now());
+      }
+    }
+  }
   if (archived) {
     const current = loadCodexStore();
     const store = current.activeProfileId
@@ -1780,3 +1807,5 @@ export function scanCodexImportDir(): string[] {
 export function codexCredentialRootForDoctor(): string {
   return codexCredentialsRoot();
 }
+
+export { cleanAllCodexProfileHomes, cleanCodexIsolatedHome } from './codexAppServer';

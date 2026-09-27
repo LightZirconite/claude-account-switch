@@ -267,6 +267,7 @@ test('Linux systemd user units are no-shell, persistent, and preserve literal pe
   assert.match(units.service, /PrivateTmp=true/);
   assert.match(units.service, /ExecStart="\/opt\/Node Runtime\/bin\/node"/);
   assert.match(units.service, /100%%/);
+  assert.match(units.service, /^WorkingDirectory=\/opt\/Switch 100%%$/m);
   assert.doesNotMatch(units.service, /\/bin\/(?:ba)?sh|sh -c/);
   assert.match(units.timer, /OnCalendar=\*-\*-\* 00,06,12,18:00:00/);
   assert.match(units.timer, /Persistent=true/);

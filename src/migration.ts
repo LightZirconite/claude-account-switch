@@ -147,7 +147,7 @@ function hashFile(file: string): string {
   }
 }
 
-function excludedPath(scope: MigrationScope, relative: string, recovery: boolean): string | null {
+function excludedPath(scope: MigrationScope, relative: string, recovery: boolean, sourcePlatform: NodeJS.Platform): string | null {
   const parts = normalizeArchivePath(relative).split('/');
   const first = parts[0]?.toLowerCase();
   const base = parts.at(-1)?.toLowerCase() ?? '';
@@ -157,7 +157,7 @@ function excludedPath(scope: MigrationScope, relative: string, recovery: boolean
   if (scope === 'switch' && first === 'exports' && base.endsWith('.ccswitch-migration')) {
     return 'previous encrypted migration archive is not recursively nested inside the new archive';
   }
-  if (scope === 'switch' && process.platform === 'win32' && first === 'desktop') {
+  if (scope === 'switch' && sourcePlatform === 'win32' && first === 'desktop') {
     return 'Windows Claude Desktop captures are archived separately as recovery-only evidence';
   }
   if (scope === 'claude' && first === '.claude.json') {
@@ -209,7 +209,7 @@ function accountHealth(): MigrationAccountHealth[] {
   return [...claude, ...codex];
 }
 
-function migrationRoots(exclusions: MigrationManifest['exclusions'], includeDesktopRecovery: boolean): SourceRoot[] {
+function migrationRoots(exclusions: MigrationManifest['exclusions'], includeDesktopRecovery: boolean, sourcePlatform: NodeJS.Platform): SourceRoot[] {
   const roots: SourceRoot[] = [
     { scope: 'switch', root: dataDir(), prefix: '', description: 'Switcher profiles, credential envelopes, backups, tombstones, imports and logs', restore: 'live' },
     { scope: 'claude', root: claudeConfigDir(), prefix: '', description: 'Claude Code settings, sessions, projects, plugins, memories and live credential file', restore: 'live' },
@@ -217,7 +217,7 @@ function migrationRoots(exclusions: MigrationManifest['exclusions'], includeDesk
   ];
   const metadata = claudeJsonPath();
   roots.push({ scope: 'claude-meta', root: metadata, prefix: path.basename(metadata), description: 'Claude Code root identity/settings metadata', restore: 'live', singleFile: true });
-  if (process.platform === 'win32' && includeDesktopRecovery) {
+  if (sourcePlatform === 'win32' && includeDesktopRecovery) {
     roots.push({
       scope: 'recovery',
       root: path.join(dataDir(), 'desktop'),
@@ -258,6 +258,7 @@ function scanSource(
   entries: MigrationEntry[],
   exclusions: MigrationManifest['exclusions'],
   portabilityWarnings: MigrationManifest['portabilityWarnings'],
+  sourcePlatform: NodeJS.Platform,
 ): void {
   if (!fs.existsSync(root.root)) return;
   const rootStat = fs.lstatSync(root.root);
@@ -277,7 +278,7 @@ function scanSource(
     }
     let scope = root.scope;
     let selectedArchivePath = archivePath;
-    if (process.platform === 'win32'
+    if (sourcePlatform === 'win32'
       && (root.scope === 'claude' || root.scope === 'codex')
       && /\.(?:bat|cmd|dll|exe|ps1)$/iu.test(archivePath)) {
       scope = 'recovery';
@@ -288,7 +289,7 @@ function scanSource(
         reason: 'Windows-only executable/script archived as recovery-only evidence instead of being applied on Linux',
       });
     }
-    if (process.platform === 'win32'
+    if (sourcePlatform === 'win32'
       && (root.scope === 'claude' || root.scope === 'codex' || root.scope === 'claude-meta')
       && /(?:^|\/)(?:config\.toml|settings\.json|\.claude\.json|claude_desktop_config\.json|\.mcp\.json|mcp\.json)$/iu.test(archivePath)
       && stat.size <= 8 * 1024 * 1024) {
@@ -319,7 +320,7 @@ function scanSource(
     for (const child of children) {
       const childRelative = relative ? path.join(relative, child.name) : child.name;
       const archivePath = normalizeArchivePath(root.prefix ? path.join(root.prefix, childRelative) : childRelative);
-      const reason = excludedPath(root.scope, childRelative, root.restore === 'recovery-only');
+      const reason = excludedPath(root.scope, childRelative, root.restore === 'recovery-only', sourcePlatform);
       if (reason) {
         exclusions.push({ scope: root.scope, path: archivePath, reason });
         continue;
@@ -337,12 +338,13 @@ function scanSource(
   walk(root.root, '');
 }
 
-export function prepareMigration(options: { includeDesktopRecovery?: boolean } = {}): MigrationPlan {
+export function prepareMigration(options: { includeDesktopRecovery?: boolean; sourcePlatform?: NodeJS.Platform } = {}): MigrationPlan {
+  const sourcePlatform = options.sourcePlatform ?? process.platform;
   const exclusions: MigrationManifest['exclusions'] = [];
   const portabilityWarnings: MigrationManifest['portabilityWarnings'] = [];
   const entries: MigrationEntry[] = [];
-  const roots = migrationRoots(exclusions, options.includeDesktopRecovery !== false);
-  for (const root of roots) scanSource(root, entries, exclusions, portabilityWarnings);
+  const roots = migrationRoots(exclusions, options.includeDesktopRecovery !== false, sourcePlatform);
+  for (const root of roots) scanSource(root, entries, exclusions, portabilityWarnings, sourcePlatform);
   entries.sort((a, b) => `${a.scope}/${a.path}`.localeCompare(`${b.scope}/${b.path}`));
   const accounts = accountHealth();
   const warnings = accounts
@@ -355,12 +357,12 @@ export function prepareMigration(options: { includeDesktopRecovery?: boolean } =
       archiveId: crypto.randomUUID(),
       createdAt: new Date().toISOString(),
       source: {
-        platform: process.platform,
+        platform: sourcePlatform,
         arch: process.arch,
         node: process.version,
         switcher: pkg.version,
-        claudeCli: toolVersion(process.platform === 'win32' ? 'claude.exe' : 'claude'),
-        codexCli: toolVersion(process.platform === 'win32' ? 'codex.exe' : 'codex'),
+        claudeCli: toolVersion(sourcePlatform === 'win32' ? 'claude.exe' : 'claude'),
+        codexCli: toolVersion(sourcePlatform === 'win32' ? 'codex.exe' : 'codex'),
       },
       entries,
       exclusions,
@@ -584,7 +586,7 @@ async function exportMigrationUnlocked(
   validatePassphrase(passphrase);
   const selected = path.resolve(output);
   const workRoot = migrationWorkRoot();
-  const plan = prepareMigration({ includeDesktopRecovery: options.includeDesktopRecovery });
+  const plan = prepareMigration({ includeDesktopRecovery: options.includeDesktopRecovery, sourcePlatform: options.sourcePlatform });
   assertProvidersQuiescent('migration export after inventory', options);
   const salt = crypto.randomBytes(16);
   const iv = crypto.randomBytes(12);
@@ -611,7 +613,7 @@ async function exportMigrationUnlocked(
       cipher,
       fs.createWriteStream(bodyTemp, { flags: 'wx', mode: 0o600 }),
     );
-    const rechecked = prepareMigration({ includeDesktopRecovery: options.includeDesktopRecovery });
+    const rechecked = prepareMigration({ includeDesktopRecovery: options.includeDesktopRecovery, sourcePlatform: options.sourcePlatform });
     const consistencyProjection = (value: MigrationPlan): string => JSON.stringify({
       entries: value.manifest.entries,
       exclusions: value.manifest.exclusions,
@@ -639,6 +641,8 @@ interface MigrationSafetyOptions {
   includeDesktopRecovery?: boolean;
   /** Test seam for cross-OS import policy; production always uses process.platform. */
   targetPlatform?: NodeJS.Platform;
+  /** Test seam for cross-OS export classification; production always uses process.platform. */
+  sourcePlatform?: NodeJS.Platform;
 }
 
 function assertProvidersQuiescent(operation: string, options: MigrationSafetyOptions): void {
