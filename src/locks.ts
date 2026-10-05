@@ -6,6 +6,7 @@ import { dataDir, ensureDataDirs } from './paths';
 const DEFAULT_STALE_MS = 5 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 60 * 1000;
 const POLL_MS = 100;
+const OWNERLESS_GRACE_MS = 5_000;
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -85,14 +86,15 @@ function tryAcquire(name: string, staleMs: number): HeldLock | null {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   try {
     fs.mkdirSync(p);
-    fs.writeFileSync(path.join(p, 'owner.json'), JSON.stringify({ pid: process.pid, ownerId, at: Date.now(), name }) + '\n', 'utf8');
-    return { path: p, ownerId };
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
     try {
       const stat = fs.statSync(p);
       const age = Date.now() - stat.mtimeMs;
       const owner = readOwner(p);
+      // An acquirer creates the directory before writing owner.json. A young directory
+      // without readable ownership is that window, not evidence of a crash.
+      if (!owner && age <= OWNERLESS_GRACE_MS) return null;
       if (age > staleMs || !owner || !processAlive(owner.pid)) {
         // Never unlink a stale-looking lock here. Another waiter may already have
         // removed/reacquired it after this process observed the old owner, and an
@@ -105,6 +107,19 @@ function tryAcquire(name: string, staleMs: number): HeldLock | null {
     }
     return null;
   }
+  try {
+    fs.writeFileSync(path.join(p, 'owner.json'), JSON.stringify({ pid: process.pid, ownerId, at: Date.now(), name }) + '\n', 'utf8');
+  } catch (error) {
+    // This process created the directory and nobody else can own it yet. Leaving it
+    // ownerless would block every later acquirer until manual cleanup.
+    try {
+      fs.rmSync(p, { recursive: true, force: true });
+    } catch {
+      /* preserve the original failure */
+    }
+    throw error;
+  }
+  return { path: p, ownerId };
 }
 
 /**
