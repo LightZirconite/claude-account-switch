@@ -173,6 +173,8 @@ import {
   quotaColumnPresentation,
   quotaMeter,
 } from './presentation';
+import { MOTION, type FlashTone } from './motion';
+import { CursorMark, RevealMark, Spinner, SwitchFlashMark } from './motionComponents';
 import {
   archiveImportedSources,
   discoverCodexImportFiles,
@@ -268,18 +270,17 @@ const CLAUDE_ORANGE = '#D97757'; // Claude brand coral/orange
 // Current Windows Codex app manifest uses this royal-blue brand background.
 const CODEX_BLUE = '#3143FF';
 
-function motionIsAllowed(): boolean {
-  return Boolean(process.stdout.isTTY)
-    && process.env.CI !== 'true'
-    && process.env.TERM !== 'dumb'
-    && process.env.NO_ANIMATION !== '1'
-    && process.env.REDUCE_MOTION !== '1';
+interface SwitchFlash {
+  provider: ProviderId;
+  profileId: string;
+  tone: FlashTone;
+  id: number;
 }
 
 function useMotionFrame(enabled: boolean): number {
   const [frame, setFrame] = useState(0);
   useEffect(() => {
-    if (!enabled || !motionIsAllowed()) {
+    if (!enabled || !MOTION.animate) {
       setFrame(0);
       return undefined;
     }
@@ -321,22 +322,6 @@ const ColumnRule = () => <Text color="#3F3F46">{'│ '}</Text>;
 const Divider = ({ width, color = 'gray' as string }: { width: number; color?: string }) => (
   <Text color={color}>{'─'.repeat(Math.max(1, width))}</Text>
 );
-
-// A tiny animated spinner (no extra dependency).
-const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-function Spinner({ label, color = 'cyanBright' as string }: { label?: string; color?: string }) {
-  const [i, setI] = useState(0);
-  useEffect(() => {
-    const t = setInterval(() => setI((x) => (x + 1) % SPINNER_FRAMES.length), 80);
-    return () => clearInterval(t);
-  }, []);
-  return (
-    <Text color={color}>
-      {SPINNER_FRAMES[i]}
-      {label ? ` ${label}` : ''}
-    </Text>
-  );
-}
 
 // Track the terminal width so the UI fills the available space and reflows on resize.
 function currentTerminalSize(): { cols: number; rows: number } {
@@ -573,6 +558,13 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const [newVersion, setNewVersion] = useState<string | null>(null);
   const [setupReport, setSetupReport] = useState<InstallReport | null>(null);
   const [message, setMessage] = useState<MessageState | null>(null);
+  const [switchFlash, setSwitchFlash] = useState<SwitchFlash | null>(null);
+  const switchFlashSeq = useRef(0);
+  const flashSwitchResult = useCallback((flashProvider: ProviderId, profileId: string, flashTone: FlashTone) => {
+    switchFlashSeq.current += 1;
+    setSwitchFlash({ provider: flashProvider, profileId, tone: flashTone, id: switchFlashSeq.current });
+  }, []);
+  const clearSwitchFlash = useCallback(() => setSwitchFlash(null), []);
   const authRef = useRef<ManualAuth | null>(null);
   // React state updates are asynchronous. This ref closes the tiny Enter -> Esc race
   // immediately, before the one-shot token exchange can be misreported as cancelled.
@@ -882,12 +874,14 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       reloadCodexStore();
       setPendingCodexSwitch(null);
       setBusy(null);
+      flashSwitchResult('codex', target.id, result.ok ? 'success' : 'error');
       showMessage(result.ok ? `Switched Codex to ${target.label}` : 'Codex switch failed', [redactText(result.message)], result.ok ? 'success' : 'error');
     } catch (e) {
       setBusy(null);
+      flashSwitchResult('codex', target.id, 'error');
       showMessage('Codex switch failed', [redactText(e)], 'error');
     }
-  }, [reloadCodexStore, showMessage]);
+  }, [flashSwitchResult, reloadCodexStore, showMessage]);
 
   const exportSelectedCodex = useCallback(async () => {
     if (!codexSelected) return;
@@ -1297,6 +1291,12 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
 
   const doSwitch = useCallback(
     async (requestedTarget: Profile) => {
+      // Every outcome also flashes the target row once the list is visible again;
+      // 'info' outcomes (blocked before any write) leave the row untouched.
+      const showSwitchResult = (title: string, resultLines: string[], resultTone: Tone) => {
+        if (resultTone !== 'info') flashSwitchResult('claude', requestedTarget.id, resultTone);
+        showMessage(title, resultLines, resultTone);
+      };
       setMode('list');
       setBusy(`Switching to ${requestedTarget.label}…`);
       try {
@@ -1310,7 +1310,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         const running = findClaudeProcesses();
         if (running.length) {
           setBusy(null);
-          showMessage(
+          showSwitchResult(
             'Switch blocked',
             [
               `Close Claude normally first (${running.length} process${running.length === 1 ? '' : 'es'} still running).`,
@@ -1322,7 +1322,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         }
       } catch (error) {
         setBusy(null);
-        showMessage('Switch blocked', [redactText(error), 'No credentials were changed.'], 'error');
+        showSwitchResult('Switch blocked', [redactText(error), 'No credentials were changed.'], 'error');
         return;
       }
 
@@ -1347,7 +1347,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         } catch (e) {
           logger.error('reconcile before switch failed', e);
           setBusy(null);
-          showMessage(
+          showSwitchResult(
             'Switch blocked',
             ['Could not durably save the outgoing account. The live login was left unchanged.', redactText(e)],
             'error',
@@ -1365,7 +1365,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         }
         if (!hasFreshToken || target.needsReauth) {
           setBusy(null);
-          showMessage('Switch failed', ['This account login has expired. Re-add it with "a" before switching.'], 'error');
+          showSwitchResult('Switch failed', ['This account login has expired. Re-add it with "a" before switching.'], 'error');
           return;
         }
         // ensureFreshToken may have rotated the target and persisted a newer generation.
@@ -1375,7 +1375,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           const runningBeforeWrite = findClaudeProcesses();
           if (runningBeforeWrite.length) {
             setBusy(null);
-            showMessage(
+            showSwitchResult(
               'Switch blocked',
               [
                 `Claude started while the target was being prepared (${runningBeforeWrite.length} process${runningBeforeWrite.length === 1 ? '' : 'es'} detected).`,
@@ -1387,7 +1387,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           }
         } catch (error) {
           setBusy(null);
-          showMessage('Switch blocked', [redactText(error), 'No live credentials were changed.'], 'error');
+          showSwitchResult('Switch blocked', [redactText(error), 'No live credentials were changed.'], 'error');
           return;
         }
         const res = applyProfile(target);
@@ -1398,7 +1398,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
             : res.rollback === 'failed'
               ? `Automatic rollback failed. Manual recovery is required${res.backupDir ? ` from ${res.backupDir}` : ''}.`
               : 'The live Claude CLI login was not changed.';
-          showMessage(res.rollback === 'failed' ? 'Switch failed — manual recovery required' : 'Switch failed', [res.error ?? 'unknown error', recovery], 'error');
+          showSwitchResult(res.rollback === 'failed' ? 'Switch failed — manual recovery required' : 'Switch failed', [res.error ?? 'unknown error', recovery], 'error');
           return;
         }
         claudeBackupDir = res.backupDir;
@@ -1422,7 +1422,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       if (processRace && target.desktopSnapshotDir) {
         if (!claudeBackupDir) {
           setBusy(null);
-          showMessage('Desktop switch blocked', [processRace, 'No Desktop or CLI credentials were changed.'], 'error');
+          showSwitchResult('Desktop switch blocked', [processRace, 'No Desktop or CLI credentials were changed.'], 'error');
           return;
         }
         try {
@@ -1430,14 +1430,14 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           storeRef.current = partial;
           setStore(partial);
           setBusy(null);
-          showMessage(
+          showSwitchResult(
             'Partial switch — close Claude before retrying',
             [processRace, `Claude CLI remains safely authenticated as ${target.email}.`, 'Claude Desktop was not modified.'],
             'error',
           );
         } catch (error) {
           setBusy(null);
-          showMessage(
+          showSwitchResult(
             'Partial switch — manual recovery required',
             [processRace, 'The CLI target is live, Desktop was not modified, and the active metadata commit failed.', redactText(error)],
             'error',
@@ -1478,7 +1478,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
             recoveryLines.push('The Claude CLI login was not changed.');
           }
           setBusy(null);
-          showMessage(
+          showSwitchResult(
             manualRecovery ? 'Switch failed — manual recovery required' : 'Desktop switch failed',
             recoveryLines,
             'error',
@@ -1520,7 +1520,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
           }
         }
         setBusy(null);
-        showMessage(
+        showSwitchResult(
           rollbackErrors.length ? 'Metadata commit failed — manual recovery required' : 'Metadata commit failed',
           [
             String((commitError as Error).message ?? commitError),
@@ -1536,7 +1536,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       storeRef.current = next;
       setStore(next);
       setBusy(null);
-      showMessage(
+      showSwitchResult(
         `Switched to ${target.label}`,
         [...lines, '', 'This switcher stays open — no web login needed.'].filter(Boolean),
         'success',
@@ -1546,14 +1546,14 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       } catch (error) {
         logger.error('Claude switch transaction failed', error, { targetId: requestedTarget.id });
         setBusy(null);
-        showMessage(
+        showSwitchResult(
           'Switch transaction failed',
           [redactText(error), 'Inspect the retained backups and log before retrying.'],
           'error',
         );
       }
     },
-    [onRotate, refreshClaudePlanProjection, showMessage],
+    [flashSwitchResult, onRotate, refreshClaudePlanProjection, showMessage],
   );
 
   const beginSwitch = useCallback(
@@ -2540,7 +2540,6 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const compactTable = W < 96;
   const leftW = Math.min(30, Math.max(22, Math.floor((W - 4) * 0.29)));
   const activeGlyph = motionFrame % 4 === 2 ? '◉' : '●';
-  const cursorGlyph = motionFrame % 2 === 0 ? '❯ ' : '› ';
   const claudeBest = bestNow(profiles, store.activeProfileId);
   const codexBest = bestNowCodex(codexProfiles, codexStore.activeProfileId);
   const codexSelectedQuota = codexSelected ? effectiveCodexQuota(codexSelected) : null;
@@ -2750,7 +2749,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       ) : mode === 'message' && message ? (
         <Box width={W} flexDirection="column" borderStyle="round" borderColor={tone} paddingX={1}>
           <Text bold color={tone}>
-            {message.tone === 'success' ? '✓ ' : message.tone === 'error' ? '✗ ' : ''}
+            {message.tone === 'info' ? null : <RevealMark key={message.title} tone={message.tone} color={tone} />}
             {message.title}
           </Text>
           {message.lines.map((l, i) => (
@@ -2847,7 +2846,9 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
             <Text>
               Code: <Text color="green">{buffer ? `<pasted ${buffer.length} characters>` : '(paste authorization code here)'}</Text>
             </Text>
-            {addBusy ? <Spinner label="Validating Claude authorization…" /> : null}
+            {addBusy
+              ? <Spinner label="Validating Claude authorization…" />
+              : <Spinner label="Waiting for the authorization code…" color={CLAUDE_ORANGE} />}
             <Text dimColor>
               {addBusy
                 ? 'Authorization submitted · waiting for a durable result (Esc cannot cancel now)'
@@ -3003,9 +3004,11 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                 const quota = effectiveCodexQuota(profile);
                 return (
                   <Text key={profile.id} backgroundColor={isCursor ? '#1A1A1D' : i % 2 ? '#101010' : undefined}>
-                    <Text color={CODEX_BLUE} bold>{isCursor ? cursorGlyph : '  '}</Text>
+                    {isCursor ? <CursorMark color={CODEX_BLUE} idleFrame={motionFrame} /> : <Text>{'  '}</Text>}
                     {codexTableLayout.showIndex ? <Text dimColor>{formatAccountOrdinal(i, codexTableLayout.indexWidth)}{' '}</Text> : null}
-                    <Text color={profile.needsReauth ? 'red' : isActive ? 'green' : 'gray'}>{profile.needsReauth ? '⚠' : isActive ? activeGlyph : '○'}{' '}</Text>
+                    {switchFlash?.provider === 'codex' && switchFlash.profileId === profile.id
+                      ? <Text><SwitchFlashMark key={switchFlash.id} tone={switchFlash.tone} onDone={clearSwitchFlash} />{' '}</Text>
+                      : <Text color={profile.needsReauth ? 'red' : isActive ? 'green' : 'gray'}>{profile.needsReauth ? '⚠' : isActive ? activeGlyph : '○'}{' '}</Text>}
                     {compactTable ? (
                       <>
                         <Text bold={isCursor} color={profile.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(profile.label, profile.email, !!profile.importedSession), codexTableLayout.accountWidth)}</Text>
@@ -3092,13 +3095,15 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
                 const linked = [hasCliAuth(p) ? 'CLI' : null, p.desktopSnapshotDir ? 'DSK' : null].filter(Boolean).join('+');
                 return (
                   <Text key={p.id} backgroundColor={isCursor ? '#1A1A1D' : i % 2 ? '#101010' : undefined}>
-                    <Text color="cyanBright" bold>
-                      {isCursor ? cursorGlyph : '  '}
-                    </Text>
+                    {isCursor ? <CursorMark color="cyanBright" idleFrame={motionFrame} /> : <Text>{'  '}</Text>}
                     {claudeTableLayout.showIndex ? <Text dimColor>{formatAccountOrdinal(i, claudeTableLayout.indexWidth)}{' '}</Text> : null}
-                    <Text color={p.needsReauth ? 'red' : isActive ? 'green' : 'gray'}>
-                      {p.needsReauth ? '⚠' : isActive ? activeGlyph : '○'}{' '}
-                    </Text>
+                    {switchFlash?.provider === 'claude' && switchFlash.profileId === p.id ? (
+                      <Text><SwitchFlashMark key={switchFlash.id} tone={switchFlash.tone} onDone={clearSwitchFlash} />{' '}</Text>
+                    ) : (
+                      <Text color={p.needsReauth ? 'red' : isActive ? 'green' : 'gray'}>
+                        {p.needsReauth ? '⚠' : isActive ? activeGlyph : '○'}{' '}
+                      </Text>
+                    )}
                     {compactTable ? (
                       <>
                         <Text bold={isCursor} color={p.needsReauth ? 'red' : isCursor ? 'white' : undefined}>{pad(accountListLabel(p.label, p.email, !!p.importedSession), claudeTableLayout.accountWidth)}</Text>

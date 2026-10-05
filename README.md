@@ -103,9 +103,17 @@ The TUI removes duplicate label/email columns, numbers and separates dense accou
 keeps only essential hints in the footer. Press `?` for the complete nine-page reference:
 navigation, quota decisions, accounts, imports, exports, contextual controls, every public CLI
 command, and safety rules. Arrows, PageUp/PageDown or j/k change pages; 1-9 jumps directly to a
-category, while every list shortcut remains available without entering a submenu. One
-low-frequency animation clock drives the provider mascot, active marker and selection cursor.
-Set `NO_ANIMATION=1` or `REDUCE_MOTION=1` to render every decorative element statically.
+category, while every list shortcut remains available without entering a submenu.
+
+Motion is small and identical for Claude and Codex. One low-frequency clock drives the
+provider mascot and active marker. Waiting states (login, quota refresh, switching, import
+and migration) show a spinner; quota refreshes also show a fixed-width `n/m` progress bar.
+A newly selected row's cursor arrives as `›` and settles to `❯`. After a switch, the result
+title reveals `✓`/`✗`, and the target row's marker flashes once when the list reappears.
+Every animated cell has a fixed width, owns its own timer and stops it on unmount. Motion is
+off when stdout is not a TTY, `TERM=dumb`, `CI` is set, `NO_COLOR` is non-empty, or
+`NO_ANIMATION=1` / `REDUCE_MOTION=1`; feedback is then shown with static glyphs. Classic
+Windows console host and the Linux virtual console use an ASCII spinner.
 An unobtrusive `⧉` beside an account means its login session was imported from another
 machine; the selected-account panel and help explain the concurrent-machine tradeoff.
 
