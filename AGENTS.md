@@ -98,6 +98,9 @@
   atomic, idempotent and tested against corrupt, stale and intentionally deleted entries.
 - Before changing authentication behaviour, verify the current official provider
   documentation and add a regression test for the reported failure mode.
+- `VERIFIED_TOOL_VERSIONS` in `src/toolVersions.ts` is the only record of the Claude Code and
+  Codex CLI releases the switcher was audited against. Bump it only after re-checking credential
+  files, OAuth endpoints/scopes, the Codex app-server schema and process names for that release.
 
 ## Secrets
 

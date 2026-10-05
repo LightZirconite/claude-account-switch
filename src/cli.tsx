@@ -94,7 +94,8 @@ import {
   keepTokenAlive,
   leastLoaded,
 } from './usage';
-import { findClaudeProcesses, detectClaudeVersion, type ProcInfo } from './processes';
+import { findClaudeProcesses, detectClaudeVersion, readClaudeVersionOutput, type ProcInfo } from './processes';
+import { checkToolVersion, describeToolVersion, readVersionOutput, type ToolVersionCheck } from './toolVersions';
 import {
   installAll,
   uninstallAll,
@@ -146,6 +147,7 @@ import {
   CodexLoginCancelledError,
   codexRedirectUriFromAuthUrl,
   detectCodexVersion,
+  findCodexExe,
   inspectCodexHome,
   submitCodexCallback as forwardCodexCallback,
 } from './codexAppServer';
@@ -467,6 +469,15 @@ function HeroQuotaLine({
   );
 }
 
+function ToolVersionNotice({ check }: { check?: ToolVersionCheck }) {
+  if (!check?.warning) return null;
+  return (
+    <Text color="yellow" wrap="truncate-end">
+      ⚠ {check.tool === 'claude' ? 'Claude Code' : 'Codex CLI'} {check.installed} is newer than verified {check.verified} · run switch.cmd doctor {check.tool}
+    </Text>
+  );
+}
+
 // A fixed 12-char cell. Mixed-duration columns spend four characters on the
 // provider window label and shrink only the decorative bar, never the percentage.
 function UsageCell({
@@ -572,6 +583,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   const [busy, setBusy] = useState<string | null>(null);
   const motionFrame = useMotionFrame(mode === 'list' && !busy);
   const [newVersion, setNewVersion] = useState<string | null>(null);
+  const [toolVersionWarnings, setToolVersionWarnings] = useState<Partial<Record<'claude' | 'codex', ToolVersionCheck>>>({});
   const [setupReport, setSetupReport] = useState<InstallReport | null>(null);
   const [message, setMessage] = useState<MessageState | null>(null);
   const authRef = useRef<ManualAuth | null>(null);
@@ -1153,6 +1165,24 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       .catch(() => {});
   }, []);
 
+  // Warn once per launch when an official CLI is newer than the release this switcher
+  // was verified against. Async and best-effort: a missing CLI is reported by doctor.
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all([
+      readVersionOutput(findClaudeExe()).then((output) => checkToolVersion('claude', output)),
+      readVersionOutput(findCodexExe()).then((output) => checkToolVersion('codex', output)),
+    ]).then((checks) => {
+      if (cancelled) return;
+      const warnings: Partial<Record<'claude' | 'codex', ToolVersionCheck>> = {};
+      for (const check of checks) if (check.warning) warnings[check.tool] = check;
+      setToolVersionWarnings(warnings);
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Auto-clear transient status notifications after 5 seconds.
   useEffect(() => {
     if (!status) return;
@@ -1674,6 +1704,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         refreshToken: tokens.refreshToken,
         expiresAt: tokens.expiresAt,
         scopes: tokens.scopes ?? DEFAULT_SCOPES.split(' '),
+        ...(tokens.refreshTokenExpiresAt ? { refreshTokenExpiresAt: tokens.refreshTokenExpiresAt } : {}),
       });
       checkpointedProfile = checkpoint.profile;
       storeRef.current = checkpoint.store;
@@ -2625,6 +2656,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
             <Text dimColor>{profiles.length} accounts · AGPL</Text>
           </Box>
           {newVersion ? <Text color="yellow">Update available: v{newVersion}</Text> : null}
+          <ToolVersionNotice check={toolVersionWarnings.claude} />
           {compactHero ? (
             <Box marginTop={1} flexDirection="column">
               <Text wrap="truncate-end"><Text dimColor>active  </Text>{active ? <><Text color="green">{activeGlyph} </Text><Text bold>{accountListLabel(active.label, active.email, !!active.importedSession)}</Text>{' '}<Text color={planColor(active.subscriptionType)}>{formatPlanLabel(active.subscriptionType)}</Text></> : <Text dimColor>none</Text>}</Text>
@@ -2671,6 +2703,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
             <Text dimColor>{codexProfiles.length} accounts · AGPL</Text>
           </Box>
           {newVersion ? <Text color="yellow">Update available: v{newVersion}</Text> : null}
+          <ToolVersionNotice check={toolVersionWarnings.codex} />
           {compactHero ? (
             <Box marginTop={1} flexDirection="column">
               <Text wrap="truncate-end"><Text dimColor>active  </Text>{codexActive ? <><Text color="green">{activeGlyph} </Text><Text bold>{accountListLabel(codexActive.label, codexActive.email, !!codexActive.importedSession)}</Text>{' '}<Text color={planColor(codexActive.planType)}>{formatPlanLabel(codexActive.planType)}</Text></> : <Text dimColor>none</Text>}</Text>
@@ -3336,7 +3369,13 @@ async function printClaudeDoctor(): Promise<void> {
   const store = loadStore();
   const liveAuthRecovery = inspectClaudeLiveAuthRecovery();
   console.log(`Claude provider`);
-  console.log(`Claude Code version: ${liveAuthRecovery.pending ? 'withheld while live-auth recovery is pending' : detectClaudeVersion()}`);
+  if (liveAuthRecovery.pending) {
+    console.log('Claude Code version: withheld while live-auth recovery is pending');
+  } else {
+    const versionCheck = checkToolVersion('claude', readClaudeVersionOutput());
+    console.log(`Claude Code version: ${describeToolVersion(versionCheck)}`);
+    if (versionCheck.warning) console.log(`  WARNING: ${versionCheck.warning}`);
+  }
   console.log(`Profiles: ${store.profiles.length}`);
   console.log(`Restorable archives: ${(store.tombstones ?? []).filter((t) => t.archivedProfile?.provider === 'claude' && (!t.restoredAt || t.deletedAt > t.restoredAt)).length}`);
   console.log(`Active profile id: ${store.activeProfileId ?? '(none)'}`);
@@ -3424,7 +3463,9 @@ async function printCodexDoctor(): Promise<void> {
     abandonedError = redactText(error);
   }
   console.log(`Codex`);
-  console.log(`Codex version: ${detectCodexVersion()}`);
+  const versionCheck = checkToolVersion('codex', detectCodexVersion());
+  console.log(`Codex version: ${describeToolVersion(versionCheck)}`);
+  if (versionCheck.warning) console.log(`  WARNING: ${versionCheck.warning}`);
   console.log(`Profiles: ${store.profiles.length}`);
   console.log(`Restorable archives: ${store.tombstones.filter((t) => t.archivedProfile?.provider === 'codex' && (!t.restoredAt || t.deletedAt > t.restoredAt)).length}`);
   console.log(`Active profile id: ${store.activeProfileId ?? '(none)'}`);

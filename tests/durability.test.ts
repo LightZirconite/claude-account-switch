@@ -1460,6 +1460,42 @@ test('a server-rotated Claude token survives metadata corruption in its credenti
   assert.equal(envelope.claudeAiOauth.refreshToken, 'rotated-refresh-r2');
 });
 
+test('a Claude rotation persists the provider-reported login expiry with the new refresh token', async () => {
+  resetRoot();
+  const active = profile('login-expiry-active');
+  const account = profile('login-expiry-parked');
+  account.claudeAiOauth!.expiresAt = Date.now() - 1;
+  saveStore(profilesStore([active, account]));
+  assert.equal(applyProfile(active, { processInventory: () => [] }).ok, true);
+
+  const originalFetch = globalThis.fetch;
+  const before = Date.now();
+  globalThis.fetch = (async (input) => {
+    if (String(input).includes('/v1/oauth/token')) {
+      return new Response(JSON.stringify({
+        access_token: 'expiry-access-r2',
+        refresh_token: 'expiry-refresh-r2',
+        expires_in: 3600,
+        refresh_token_expires_in: 30 * 86_400,
+        scope: 'user:inference',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ five_hour: null, seven_day: null }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    assert.equal((await fetchUsage(account, 'test', { force: true })).status, 'ok');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const envelope = JSON.parse(fs.readFileSync(claudeProfileCredentialsPath(account.id), 'utf8')) as {
+    claudeAiOauth: { refreshToken: string; refreshTokenExpiresAt?: number };
+  };
+  assert.equal(envelope.claudeAiOauth.refreshToken, 'expiry-refresh-r2');
+  const expiry = envelope.claudeAiOauth.refreshTokenExpiresAt ?? 0;
+  assert.ok(expiry >= before + 30 * 86_400_000 && expiry <= Date.now() + 30 * 86_400_000);
+});
+
 test('a switch-time token check joins an in-flight hover rotation before cooldown', async () => {
   resetRoot();
   const active = profile('single-flight-active');

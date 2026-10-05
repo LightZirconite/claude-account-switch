@@ -524,9 +524,9 @@ test('a Codex tombstone blocks stale resurrection and provider cursors stay inde
 
 test('portable login URLs support remote Claude authorization and a validated Codex callback', () => {
   const claude = new URL(buildManualAuth().url);
-  assert.equal(claude.hostname, 'claude.ai');
+  assert.equal(claude.hostname, 'claude.com');
   assert.equal(claude.searchParams.get('code'), 'true');
-  assert.equal(claude.searchParams.get('redirect_uri'), 'https://console.anthropic.com/oauth/code/callback');
+  assert.equal(claude.searchParams.get('redirect_uri'), 'https://platform.claude.com/oauth/code/callback');
 
   const expected = 'http://localhost:1455/auth/callback';
   const authUrl = `https://auth.openai.com/authorize?redirect_uri=${encodeURIComponent(expected)}`;

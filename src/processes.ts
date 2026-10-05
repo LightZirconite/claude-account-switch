@@ -4,6 +4,7 @@
 import { execFileSync } from 'node:child_process';
 import { logger } from './logger';
 import { findClaudeExe } from './paths';
+import { parseToolVersion, VERIFIED_TOOL_VERSIONS } from './toolVersions';
 
 export interface ProcInfo {
   pid: number;
@@ -74,12 +75,16 @@ function findClaudeUnix(namePattern: RegExp): ProcInfo[] {
   }
 }
 
-export function detectClaudeVersion(): string {
+/** Raw `claude --version` output, or null when the official CLI cannot be run. */
+export function readClaudeVersionOutput(): string | null {
   try {
-    const out = execFileSync(findClaudeExe(), ['--version'], { encoding: 'utf8', timeout: 10_000 });
-    const m = out.match(/(\d+\.\d+\.\d+)/);
-    return m ? m[1] : '2.1.201';
+    return execFileSync(findClaudeExe(), ['--version'], { encoding: 'utf8', timeout: 10_000, windowsHide: true });
   } catch {
-    return '2.1.201';
+    return null;
   }
+}
+
+/** Version used for provider request headers; falls back to the verified release. */
+export function detectClaudeVersion(): string {
+  return parseToolVersion(readClaudeVersionOutput()) ?? VERIFIED_TOOL_VERSIONS.claude;
 }

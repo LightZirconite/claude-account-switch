@@ -347,6 +347,7 @@ function rotatedClaudeOauth(current: ClaudeAiOauth, refreshed: TokenSet): Claude
     refreshToken: refreshed.refreshToken,
     expiresAt: refreshed.expiresAt,
     ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
+    ...(refreshed.refreshTokenExpiresAt ? { refreshTokenExpiresAt: refreshed.refreshTokenExpiresAt } : {}),
   };
 }
 
@@ -641,6 +642,7 @@ async function ensureAccessToken(
           lockedOauth.accessToken = refreshed.accessToken;
           lockedOauth.refreshToken = refreshed.refreshToken;
           lockedOauth.expiresAt = refreshed.expiresAt;
+          if (refreshed.refreshTokenExpiresAt) lockedOauth.refreshTokenExpiresAt = refreshed.refreshTokenExpiresAt;
           profile.needsReauth = false;
 
           // Persist the rotated refresh token before releasing the cross-process lock and

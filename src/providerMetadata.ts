@@ -36,9 +36,20 @@ export function formatPlanLabel(value?: string | null): string {
     case 'team':
       return 'TEAM';
     case 'business':
+    // The Codex app-server PlanType enum (verified 0.153.4) exposes self-serve and
+    // contract-specific variants of the same customer-facing tiers.
+    case 'self-serve-business-prolite':
+    case 'self-serve-business-usage-based':
       return 'BUSINESS';
     case 'enterprise':
+    case 'ent26':
+    case 'enterprise-cbp-automation':
+    case 'enterprise-cbp-usage-based':
       return 'ENTERPRISE';
+    case 'edu':
+      return 'EDU';
+    case 'unknown':
+      return '—';
     default:
       return plan.replace(/-/g, ' ').toUpperCase();
   }

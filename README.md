@@ -111,10 +111,17 @@ machine; the selected-account panel and help explain the concurrent-machine trad
 
 Codex plan labels prefer the effective entitlement returned by
 `account/rateLimits/read` over `account/read`, because the account projection can lag after
-an upgrade. OpenAI's internal `prolite` value is displayed as the customer-facing `PRO` plan;
-the raw provider value remains available in `doctor codex` for diagnostics. Claude plan labels
+an upgrade. OpenAI's internal `prolite` value is displayed as the customer-facing `PRO` plan,
+and the self-serve/contract variants (`self_serve_business_*`, `ent26`, `enterprise_cbp_*`) as
+`BUSINESS` or `ENTERPRISE`; the raw provider value remains available in `doctor codex` for
+diagnostics. Claude plan labels
 come from the official `claude auth status --json` projection or the validated read-only
 provider profile returned for an imported access token.
+
+Each release is verified against specific Claude Code and Codex CLI versions, recorded in
+`VERIFIED_TOOL_VERSIONS` (`src/toolVersions.ts`). When an installed CLI is newer, the TUI shows a
+yellow notice under that provider's header and `doctor claude` / `doctor codex` print a warning.
+A newer CLI is not blocked; the notice only says the switcher has not been re-verified for it.
 
 Codex quota columns are derived from the rolling windows actually returned by the official App
 Server instead of assuming that both counters always exist. OpenAI currently documents a shared

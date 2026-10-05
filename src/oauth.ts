@@ -9,11 +9,22 @@ import { logger } from './logger';
 import { parseTree, findNodeAtLocation, getNodeValue } from 'jsonc-parser';
 import { hasRefreshableOauth, type ClaudeAiOauth, type OauthAccount } from './types';
 
+// Mirrors the official Claude Code production OAuth configuration (verified against the
+// release in VERIFIED_TOOL_VERSIONS.claude): claude.ai sign-in is authorized on claude.com,
+// while the manual paste-code callback and token endpoint moved to platform.claude.com.
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-export const AUTHORIZE_URL = 'https://claude.ai/oauth/authorize';
-export const MANUAL_REDIRECT = 'https://console.anthropic.com/oauth/code/callback';
-export const DEFAULT_SCOPES = 'org:create_api_key user:profile user:inference';
-const TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
+export const AUTHORIZE_URL = 'https://claude.com/cai/oauth/authorize';
+export const MANUAL_REDIRECT = 'https://platform.claude.com/oauth/code/callback';
+export const DEFAULT_SCOPES = [
+  'org:create_api_key',
+  'user:profile',
+  'user:inference',
+  'user:sessions:claude_code',
+  'user:mcp_servers',
+  'user:file_upload',
+  'user:plugins',
+].join(' ');
+export const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 
 function base64url(buffer: Buffer): string {
   return buffer.toString('base64url');
@@ -48,6 +59,8 @@ export interface TokenSet {
   refreshToken: string;
   expiresAt: number;
   scopes?: string[];
+  /** Absolute refresh-token (login) expiry when the provider returns one. */
+  refreshTokenExpiresAt?: number;
 }
 
 async function postToken(body: Record<string, string>): Promise<TokenSet> {
@@ -95,12 +108,20 @@ async function postToken(body: Record<string, string>): Promise<TokenSet> {
   if (typeof d.scope === 'string') scopes = d.scope.split(/\s+/).filter(Boolean);
   else if (Array.isArray(d.scope) && d.scope.every((scope) => typeof scope === 'string')) scopes = d.scope;
   else if (d.scope !== undefined) throw new Error('OAuth token endpoint returned an invalid scope projection. Existing credentials were preserved.');
+  // Newer token responses also report the refresh-token lifetime. It is optional and
+  // informational, so an unusable value is ignored rather than failing a rotation whose
+  // new refresh token must still be persisted.
+  const refreshExpiresIn = d.refresh_token_expires_in;
+  const refreshTokenExpiresAt = typeof refreshExpiresIn === 'number' && Number.isFinite(refreshExpiresIn) && refreshExpiresIn > 0
+    ? Date.now() + refreshExpiresIn * 1000
+    : undefined;
   logger.info('oauth: token exchange ok');
   return {
     accessToken,
     refreshToken: refreshTokenValue,
     expiresAt: Date.now() + expiresIn * 1000,
     scopes,
+    ...(refreshTokenExpiresAt ? { refreshTokenExpiresAt } : {}),
   };
 }
 
@@ -184,6 +205,7 @@ export function primeIdentity(
     refreshToken: tokens.refreshToken,
     expiresAt: tokens.expiresAt,
     scopes: tokens.scopes ?? scopes.split(' '),
+    ...(tokens.refreshTokenExpiresAt ? { refreshTokenExpiresAt: tokens.refreshTokenExpiresAt } : {}),
   };
   let identity: PrimedIdentity = { claudeAiOauth, oauthAccount: { accountUuid: '' } };
   let removeTemporaryHome = true;
