@@ -67,7 +67,19 @@ async function postToken(body: Record<string, string>): Promise<TokenSet> {
     logger.warn('oauth: token endpoint failed', { status: res.status, reason });
     throw new Error(`OAuth token request failed (HTTP ${res.status}, ${reason}).`);
   }
-  const d = (await res.json()) as Record<string, unknown>;
+  // A captive portal or proxy can answer 200 with HTML or a bare JSON scalar. Report
+  // that as a provider failure instead of a parser/TypeError with no actionable context.
+  let parsed: unknown;
+  try {
+    parsed = await res.json();
+  } catch {
+    parsed = null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    logger.warn('oauth: token endpoint returned a non-object body', { status: res.status });
+    throw new Error('OAuth token endpoint returned an unreadable response. Existing credentials were preserved.');
+  }
+  const d = parsed as Record<string, unknown>;
   const accessToken = typeof d.access_token === 'string' ? d.access_token.trim() : '';
   const returnedRefresh = typeof d.refresh_token === 'string' ? d.refresh_token.trim() : '';
   const previousRefresh = body.grant_type === 'refresh_token' ? body.refresh_token?.trim() : '';
