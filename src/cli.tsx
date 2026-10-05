@@ -158,6 +158,7 @@ import {
   restoreLatestCodexLiveBackup,
 } from './codexSwitch';
 import { moveCursor, switchProviderTab, viewportFor } from './navigation';
+import { guardInputHandler, reloadOrKeep } from './tuiGuards';
 import { type BestNowDecision } from './scheduling';
 import { readClaudeAuthStatus } from './claudeStatus';
 import { formatPlanLabel } from './providerMetadata';
@@ -814,7 +815,9 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
         return next;
       } catch (e) {
         codexRefreshWasCancelledRef.current = controller.signal.aborted;
-        const current = loadCodexStore();
+        const current = reloadOrKeep(loadCodexStore, codexStoreRef.current, (reloadError) => {
+          logger.error('Codex store reload after failed refresh failed', reloadError);
+        });
         codexStoreRef.current = current;
         setCodexStore(current);
         setStatus(controller.signal.aborted
@@ -1109,7 +1112,9 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
     const t = setTimeout(() => {
       void (async () => {
         if (codexUsageRefreshRef.current) return;
-        const current = loadCodexStore();
+        const current = reloadOrKeep(loadCodexStore, codexStoreRef.current, (error) => {
+          logger.error('Codex cursor preview could not reload the store', error);
+        });
         const profile = current.profiles.find((candidate) => candidate.id === selectedId);
         if (!profile || profile.needsReauth) return;
         try {
@@ -1275,7 +1280,9 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       } catch (error) {
         claudeRefreshWasCancelledRef.current = controller.signal.aborted;
         logger.error('manual usage refresh failed', error);
-        const current = loadStore();
+        const current = reloadOrKeep(loadStore, storeRef.current, (reloadError) => {
+          logger.error('Claude store reload after failed refresh failed', reloadError);
+        });
         storeRef.current = current;
         setStore(current);
         setStatus(controller.signal.aborted
@@ -2074,7 +2081,7 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
   }, [store, showMessage]);
 
   // ---------- input handling ----------
-  useInput((input, key) => {
+  useInput(guardInputHandler((input, key) => {
     const isEnter = !!key.return || input === '\r' || input === '\n';
 
     if (mode === 'list') {
@@ -2530,7 +2537,11 @@ function App({ initialStore, initialCodexStore, claudeVersion }: AppProps) {
       }
       return;
     }
-  });
+  }, (error) => {
+    logger.error('keyboard action failed', error, { mode });
+    setMode('list');
+    setStatus(`Action failed: ${redactText(error)}`);
+  }));
 
   // ---------- rendering ----------
   const tone = message?.tone === 'success' ? 'green' : message?.tone === 'error' ? 'red' : 'cyan';
